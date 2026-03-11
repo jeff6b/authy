@@ -2075,12 +2075,12 @@ HTML_TEMPLATE = """
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     """Serve the frontend HTML"""
-    return HTMLTemplate
+    return HTML_TEMPLATE
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def catch_all(full_path: str):
     """Catch all routes to serve frontend for client-side routing"""
-    return HTMLTemplate
+    return HTML_TEMPLATE
 
 # ========== RUN ==========
 if __name__ == "__main__":

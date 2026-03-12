@@ -929,102 +929,124 @@ return {{
         }
 
 # ========== PUBLIC API ENDPOINTS ==========
+# ========== PUBLIC API ENDPOINTS ==========
 @app.post("/api/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest, req: Request):
     """Lua clients call this - checks if kicked"""
+    print(f"💓 Heartbeat received for key: {request.key}")
+    
     if not db.pool:
+        print("❌ Database not available")
         return HeartbeatResponse(
             valid=False, 
             status="error", 
             message="Database not available"
         )
     
-    async with db.pool.acquire() as conn:
-        key_info = await conn.fetchrow(
-            """
-            SELECT k.*, s.name as script_name, s.script_type, s.config
-            FROM keys k
-            JOIN scripts s ON k.script_id = s.id
-            WHERE k.key = $1
-            """,
-            request.key
-        )
-        
-        if not key_info:
-            return HeartbeatResponse(
-                valid=False, 
-                status="invalid", 
-                message="Key not found"
+    try:
+        async with db.pool.acquire() as conn:
+            key_info = await conn.fetchrow(
+                """
+                SELECT k.*, s.name as script_name, s.script_type, s.config
+                FROM keys k
+                JOIN scripts s ON k.script_id = s.id
+                WHERE k.key = $1
+                """,
+                request.key
             )
-        
-        key_info = dict(key_info)
-        
-        # Check if kicked
-        if key_info['kicked']:
-            return HeartbeatResponse(
-                valid=False,
-                status="kicked",
-                message="You have been kicked from this script",
-                kicked=True
-            )
-        
-        # Check if expired
-        if key_info['expires_at'] < datetime.now():
+            
+            if not key_info:
+                print(f"❌ Key not found: {request.key}")
+                return HeartbeatResponse(
+                    valid=False, 
+                    status="invalid", 
+                    message="Key not found"
+                )
+            
+            key_info = dict(key_info)
+            print(f"✅ Key found: {key_info['key']}, kicked: {key_info['kicked']}")
+            
+            # Check if kicked
+            if key_info['kicked']:
+                print(f"❌ Key is kicked: {request.key}")
+                return HeartbeatResponse(
+                    valid=False,
+                    status="kicked",
+                    message="You have been kicked from this script",
+                    kicked=True
+                )
+            
+            # Check if expired
+            if key_info['expires_at'] < datetime.now():
+                print(f"❌ Key expired: {request.key}")
+                await conn.execute(
+                    "UPDATE keys SET status = 'expired' WHERE id = $1",
+                    key_info['id']
+                )
+                return HeartbeatResponse(
+                    valid=False, 
+                    status="expired", 
+                    message="Key expired"
+                )
+            
+            # Check if suspended
+            if key_info['status'] != 'active':
+                print(f"❌ Key {key_info['status']}: {request.key}")
+                return HeartbeatResponse(
+                    valid=False, 
+                    status=key_info['status'], 
+                    message=f"Key {key_info['status']}"
+                )
+            
+            # HWID binding
+            client_ip = req.client.host if req.client else "unknown"
+            
+            if not key_info['hwid']:
+                print(f"🔑 Binding HWID for key: {request.key}")
+                await conn.execute(
+                    "UPDATE keys SET hwid = $1, last_heartbeat = CURRENT_TIMESTAMP WHERE id = $2",
+                    request.hwid, key_info['id']
+                )
+            elif key_info['hwid'] != request.hwid:
+                print(f"❌ HWID mismatch for key: {request.key}")
+                return HeartbeatResponse(
+                    valid=False, 
+                    status="hwid_mismatch", 
+                    message="Invalid HWID"
+                )
+            else:
+                await conn.execute(
+                    "UPDATE keys SET last_heartbeat = CURRENT_TIMESTAMP WHERE id = $1",
+                    key_info['id']
+                )
+            
+            # Log heartbeat
             await conn.execute(
-                "UPDATE keys SET status = 'expired' WHERE id = $1",
-                key_info['id']
+                "INSERT INTO heartbeat_logs (key_id, hwid, ip_address) VALUES ($1, $2, $3)",
+                key_info['id'], request.hwid, client_ip
             )
+            
+            days_left = (key_info['expires_at'] - datetime.now()).days if key_info['expires_at'] > datetime.now() else 0
+            
+            print(f"✅ Heartbeat successful for key: {request.key}")
             return HeartbeatResponse(
-                valid=False, 
-                status="expired", 
-                message="Key expired"
+                valid=True, 
+                status="active", 
+                message=f"Valid - {days_left} days remaining",
+                script_name=key_info['script_name'],
+                script_type=key_info['script_type'],
+                config=key_info['config'],
+                kicked=False,
+                expires_at=key_info['expires_at'].isoformat()
             )
-        
-        # Check if suspended
-        if key_info['status'] != 'active':
-            return HeartbeatResponse(
-                valid=False, 
-                status=key_info['status'], 
-                message=f"Key {key_info['status']}"
-            )
-        
-        # HWID binding
-        client_ip = req.client.host if req.client else "unknown"
-        
-        if not key_info['hwid']:
-            await conn.execute(
-                "UPDATE keys SET hwid = $1, last_heartbeat = CURRENT_TIMESTAMP WHERE id = $2",
-                request.hwid, key_info['id']
-            )
-        elif key_info['hwid'] != request.hwid:
-            return HeartbeatResponse(
-                valid=False, 
-                status="hwid_mismatch", 
-                message="Invalid HWID"
-            )
-        else:
-            await conn.execute(
-                "UPDATE keys SET last_heartbeat = CURRENT_TIMESTAMP WHERE id = $1",
-                key_info['id']
-            )
-        
-        # Log heartbeat
-        await conn.execute(
-            "INSERT INTO heartbeat_logs (key_id, hwid, ip_address) VALUES ($1, $2, $3)",
-            key_info['id'], request.hwid, client_ip
-        )
-        
-        days_left = (key_info['expires_at'] - datetime.now()).days if key_info['expires_at'] > datetime.now() else 0
-        
+    except Exception as e:
+        print(f"❌ Heartbeat error: {e}")
+        import traceback
+        traceback.print_exc()
         return HeartbeatResponse(
-            valid=True, 
-            status="active", 
-            message=f"Valid - {days_left} days remaining",
-            script_name=key_info['script_name'],
-            script_type=key_info['script_type'],
-            config=key_info['config'],
-            kicked=False,
-            expires_at=key_info['expires_at'].isoformat()
+            valid=False,
+            status="error",
+            message=f"Server error: {str(e)}"
         )
 
 @app.post("/api/validate")

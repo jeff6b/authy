@@ -417,33 +417,70 @@ async def validate_key(request: HeartbeatRequest):
 # ========== AUTH ENDPOINTS ==========
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user: UserCreate):
-    """Register a new user"""
+    """Register a new user with detailed error logging"""
+    print(f"📝 Register attempt for username: {user.username}, email: {user.email}")
+    
+    # Check database pool
     if not db.pool:
+        print("❌ Database pool is None!")
         raise HTTPException(status_code=503, detail="Database not available")
     
-    async with db.pool.acquire() as conn:
-        # Check if user exists
-        existing = await conn.fetchval(
-            "SELECT id FROM users WHERE username = $1 OR email = $2",
-            user.username, user.email
-        )
-        
-        if existing:
-            raise HTTPException(status_code=400, detail="Username or email already taken")
-        
-        # Create user
-        hashed = pwd_context.hash(user.password)
-        api_key = secrets.token_urlsafe(32)
-        
-        user_id = await conn.fetchval(
-            "INSERT INTO users (username, password_hash, email, api_key) VALUES ($1, $2, $3, $4) RETURNING id",
-            user.username, hashed, user.email, api_key
-        )
-        
-        # Create token
-        token = create_access_token({"sub": user.username, "id": user_id})
-        
-        return {"access_token": token, "token_type": "bearer"}
+    try:
+        async with db.pool.acquire() as conn:
+            print("✅ Acquired database connection")
+            
+            # Check if user exists
+            try:
+                existing = await conn.fetchval(
+                    "SELECT id FROM users WHERE username = $1 OR email = $2",
+                    user.username, user.email
+                )
+                print(f"🔍 Existing user check result: {existing}")
+            except Exception as e:
+                print(f"❌ Error checking existing user: {e}")
+                raise HTTPException(status_code=500, detail=f"Database query error: {str(e)}")
+            
+            if existing:
+                print("⚠️ Username or email already taken")
+                raise HTTPException(status_code=400, detail="Username or email already taken")
+            
+            # Create user
+            try:
+                hashed = pwd_context.hash(user.password)
+                print("✅ Password hashed")
+                
+                api_key = secrets.token_urlsafe(32)
+                print(f"✅ API key generated: {api_key[:8]}...")
+                
+                user_id = await conn.fetchval(
+                    "INSERT INTO users (username, password_hash, email, api_key) VALUES ($1, $2, $3, $4) RETURNING id",
+                    user.username, hashed, user.email, api_key
+                )
+                print(f"✅ User created with ID: {user_id}")
+                
+            except Exception as e:
+                print(f"❌ Error creating user: {e}")
+                raise HTTPException(status_code=500, detail=f"User creation error: {str(e)}")
+            
+            # Create token
+            try:
+                token = create_access_token({"sub": user.username, "id": user_id})
+                print("✅ JWT token created")
+            except Exception as e:
+                print(f"❌ Error creating token: {e}")
+                raise HTTPException(status_code=500, detail=f"Token creation error: {str(e)}")
+            
+            print(f"✅ Registration successful for {user.username}")
+            return {"access_token": token, "token_type": "bearer"}
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected error in register: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user: UserLogin):

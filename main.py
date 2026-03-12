@@ -392,6 +392,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     return current_user
 
 # ========== SCRIPT MANAGEMENT ==========
+# ========== SCRIPT MANAGEMENT ==========
 @app.post("/api/scripts/create")
 async def create_script(
     script_data: ScriptCreate,
@@ -399,6 +400,7 @@ async def create_script(
 ):
     """Create a new script with type differentiation"""
     print(f"📝 Creating script: {script_data.name} for user {current_user['id']}")
+    print(f"📝 Script data: {script_data}")
     
     if not db.pool:
         print("❌ Database not available")
@@ -416,10 +418,18 @@ async def create_script(
                 print(f"❌ Script name already exists: {script_data.name}")
                 raise HTTPException(status_code=400, detail="Script name already exists")
             
+            # Convert config dict to JSON string for PostgreSQL
+            config_json = '{}'  # Default empty JSON object
+            if script_data.config:
+                import json
+                config_json = json.dumps(script_data.config)
+            
+            print(f"📝 Config JSON: {config_json}")
+            
             # Insert new script
             script_id = await conn.fetchval(
-                "INSERT INTO scripts (name, script_type, user_id, config) VALUES ($1, $2, $3, $4) RETURNING id",
-                script_data.name, script_data.script_type, current_user['id'], script_data.config or {}
+                "INSERT INTO scripts (name, script_type, user_id, config) VALUES ($1, $2, $3, $4::jsonb) RETURNING id",
+                script_data.name, script_data.script_type, current_user['id'], config_json
             )
             
             print(f"✅ Script created with ID: {script_id}")
@@ -433,6 +443,8 @@ async def create_script(
         raise
     except Exception as e:
         print(f"❌ Script creation error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Script creation failed: {str(e)}")
 
 @app.get("/api/scripts")

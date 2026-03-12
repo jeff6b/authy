@@ -466,6 +466,15 @@ async def register(user: UserCreate):
         print("❌ Database pool is None!")
         raise HTTPException(status_code=503, detail="Database not available")
     
+    # Check password length for bcrypt (max 72 bytes)
+    if len(user.password.encode('utf-8')) > 72:
+        print("⚠️ Password too long, truncating to 72 bytes")
+        # Truncate password to 72 bytes
+        password_bytes = user.password.encode('utf-8')[:72]
+        password = password_bytes.decode('utf-8', errors='ignore')
+    else:
+        password = user.password
+    
     try:
         async with db.pool.acquire() as conn:
             print("✅ Acquired database connection")
@@ -487,8 +496,8 @@ async def register(user: UserCreate):
             
             # Create user
             try:
-                hashed = pwd_context.hash(user.password)
-                print("✅ Password hashed")
+                hashed = pwd_context.hash(password)
+                print("✅ Password hashed successfully")
                 
                 api_key = secrets.token_urlsafe(32)
                 print(f"✅ API key generated: {api_key[:8]}...")
@@ -522,25 +531,6 @@ async def register(user: UserCreate):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.post("/api/auth/login", response_model=TokenResponse)
-async def login(user: UserLogin):
-    """Login user"""
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    async with db.pool.acquire() as conn:
-        db_user = await conn.fetchrow(
-            "SELECT * FROM users WHERE username = $1",
-            user.username
-        )
-        
-        if not db_user or not pwd_context.verify(user.password, db_user['password_hash']):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        
-        token = create_access_token({"sub": user.username, "id": db_user['id']})
-        
-        return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/api/user/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):

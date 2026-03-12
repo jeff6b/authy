@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError, jwt
@@ -1343,6 +1343,31 @@ HOMEPAGE_TEMPLATE = """
       text-decoration: underline;
     }
     .terms a:hover { color: #aaa; }
+    
+    .toast {
+      position: fixed;
+      bottom: 30px;
+      right: 30px;
+      background: rgba(21, 23, 30, 0.95);
+      backdrop-filter: blur(16px);
+      border: 1px solid #2a2f3a;
+      border-radius: 12px;
+      padding: 15px 25px;
+      color: white;
+      transform: translateX(400px);
+      transition: transform 0.3s ease;
+      z-index: 3000;
+    }
+    .toast.show {
+      transform: translateX(0);
+    }
+    .toast.success {
+      border-left: 4px solid #4a90e2;
+    }
+    .toast.error {
+      border-left: 4px solid #ff4b4b;
+    }
+    
     @media (max-width:768px){
       .navbar{flex-wrap:wrap;height:auto;padding:12px 15px;justify-content:center;gap:1rem;}
       .nav-menu{order:2;width:100%;justify-content:center;margin:8px 0;}
@@ -1452,32 +1477,6 @@ HOMEPAGE_TEMPLATE = """
       <span id="toastMessage">Notification</span>
     </div>
   </div>
-
-  <style>
-    .toast {
-      position: fixed;
-      bottom: 30px;
-      right: 30px;
-      background: rgba(21, 23, 30, 0.95);
-      backdrop-filter: blur(16px);
-      border: 1px solid #2a2f3a;
-      border-radius: 12px;
-      padding: 15px 25px;
-      color: white;
-      transform: translateX(400px);
-      transition: transform 0.3s ease;
-      z-index: 3000;
-    }
-    .toast.show {
-      transform: translateX(0);
-    }
-    .toast.success {
-      border-left: 4px solid #4a90e2;
-    }
-    .toast.error {
-      border-left: 4px solid #ff4b4b;
-    }
-  </style>
 
   <script>
     const API_BASE = window.location.origin;
@@ -1625,10 +1624,7 @@ HOMEPAGE_TEMPLATE = """
 </html>
 """
 
-# ========== DASHBOARD TEMPLATE (Full dashboard from previous response) ==========
-# For brevity, I'm referencing that the full dashboard HTML from previous response goes here
-# In your actual implementation, paste the ENTIRE dashboard HTML from the previous response here
-
+# ========== DASHBOARD TEMPLATE (Full working dashboard) ==========
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1636,11 +1632,1589 @@ DASHBOARD_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Authy Dashboard</title>
-    <!-- Full dashboard HTML from previous response goes here -->
-    <!-- Paste the ENTIRE dashboard HTML that I provided in the previous response -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0A0C10;
+            --bg-secondary: #12141A;
+            --bg-tertiary: #1A1E26;
+            --accent-primary: #3B82F6;
+            --accent-secondary: #6366F1;
+            --accent-success: #10B981;
+            --accent-warning: #F59E0B;
+            --accent-danger: #EF4444;
+            --text-primary: #FFFFFF;
+            --text-secondary: #9CA3AF;
+            --text-muted: #6B7280;
+            --border-color: #2A2F3A;
+            --gradient-primary: linear-gradient(135deg, #3B82F6 0%, #6366F1 100%);
+            --gradient-success: linear-gradient(135deg, #10B981 0%, #059669 100%);
+            --gradient-warning: linear-gradient(135deg, #F59E0B 0%, #D97706 100%);
+            --gradient-danger: linear-gradient(135deg, #EF4444 0%, #DC2626 100%);
+            --shadow-sm: 0 2px 4px rgba(0,0,0,0.1);
+            --shadow-md: 0 4px 6px rgba(0,0,0,0.1);
+            --shadow-lg: 0 10px 15px rgba(0,0,0,0.2);
+            --shadow-xl: 0 20px 25px rgba(0,0,0,0.25);
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(circle at 20% 20%, rgba(59, 130, 246, 0.05) 0%, transparent 30%),
+                radial-gradient(circle at 80% 70%, rgba(99, 102, 241, 0.05) 0%, transparent 30%),
+                radial-gradient(circle at 40% 90%, rgba(16, 185, 129, 0.03) 0%, transparent 40%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* Navbar */
+        .navbar {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 1400px;
+            height: 70px;
+            background: rgba(18, 20, 26, 0.8);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 30px;
+            z-index: 1000;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 1.5rem;
+            font-weight: 800;
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo i {
+            font-size: 2rem;
+            color: #3B82F6;
+            -webkit-text-fill-color: initial;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 40px;
+        }
+
+        .nav-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .nav-link:hover {
+            color: var(--text-primary);
+        }
+
+        .nav-link::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: var(--gradient-primary);
+            transition: width 0.3s ease;
+        }
+
+        .nav-link:hover::after {
+            width: 100%;
+        }
+
+        .nav-user {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .user-menu {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .user-menu:hover {
+            border-color: var(--accent-primary);
+        }
+
+        .username {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .btn-logout {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .btn-logout:hover {
+            border-color: var(--accent-danger);
+            color: var(--accent-danger);
+        }
+
+        .main-content {
+            padding: 120px 30px 40px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .dashboard-header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+
+        .dashboard-header h1 span {
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .btn-primary {
+            background: var(--gradient-primary);
+            border: none;
+            padding: 14px 24px;
+            border-radius: 12px;
+            color: white;
+            font-weight: 600;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--accent-primary);
+        }
+
+        .btn-danger {
+            background: var(--gradient-danger);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(239, 68, 68, 0.3);
+        }
+
+        .btn-success {
+            background: var(--gradient-success);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-icon {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+
+        .btn-icon:hover {
+            border-color: var(--accent-primary);
+            color: var(--accent-primary);
+        }
+
+        .btn-icon.danger:hover {
+            border-color: var(--accent-danger);
+            color: var(--accent-danger);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--gradient-primary);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .stat-card:hover::before {
+            opacity: 1;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-xl);
+        }
+
+        .stat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .stat-title {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            font-weight: 500;
+        }
+
+        .stat-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+        }
+
+        .stat-icon.blue {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--accent-primary);
+        }
+
+        .stat-icon.green {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--accent-success);
+        }
+
+        .stat-icon.purple {
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--accent-secondary);
+        }
+
+        .stat-icon.orange {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--accent-warning);
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .stat-change {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .chart-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+        }
+
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .chart-header h3 {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+
+        .chart-container {
+            height: 300px;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .section-header h2 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .scripts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        .script-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            transition: all 0.3s ease;
+        }
+
+        .script-card:hover {
+            border-color: var(--accent-primary);
+            box-shadow: var(--shadow-lg);
+        }
+
+        .script-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .script-name {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+
+        .script-badge {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--accent-primary);
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .script-stats {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            padding: 16px 0;
+            border-top: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .script-stat {
+            flex: 1;
+        }
+
+        .script-stat-label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            margin-bottom: 4px;
+        }
+
+        .script-stat-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+
+        .script-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .script-actions button {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .keys-table-container {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            text-align: left;
+            padding: 16px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 0.9rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        tr:hover td {
+            background: var(--bg-tertiary);
+        }
+
+        .key-cell {
+            font-family: monospace;
+            font-size: 0.95rem;
+            color: var(--accent-primary);
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .status-badge.active {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--accent-success);
+        }
+
+        .status-badge.inactive {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--accent-danger);
+        }
+
+        .status-badge.expired {
+            background: rgba(107, 114, 128, 0.1);
+            color: var(--text-secondary);
+        }
+
+        .status-badge.online {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--accent-primary);
+        }
+
+        .status-badge::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-badge.active::before {
+            background: var(--accent-success);
+        }
+
+        .status-badge.inactive::before {
+            background: var(--accent-danger);
+        }
+
+        .status-badge.expired::before {
+            background: var(--text-secondary);
+        }
+
+        .status-badge.online::before {
+            background: var(--accent-primary);
+        }
+
+        .action-group {
+            display: flex;
+            gap: 6px;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(8px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+        }
+
+        .modal-overlay.show {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            width: 90%;
+            max-width: 500px;
+            animation: modalSlide 0.3s ease;
+        }
+
+        @keyframes modalSlide {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-header {
+            padding: 24px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h3 {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.5rem;
+            cursor: pointer;
+            transition: color 0.3s ease;
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 24px;
+        }
+
+        .modal-footer {
+            padding: 24px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        .loader-preview {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            margin: 20px 0;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .loader-preview pre {
+            color: var(--text-primary);
+            font-family: monospace;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px 24px;
+            transform: translateX(400px);
+            transition: transform 0.3s ease;
+            z-index: 3000;
+            box-shadow: var(--shadow-xl);
+        }
+
+        .toast.show {
+            transform: translateX(0);
+        }
+
+        .toast-content {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .toast.success {
+            border-left: 4px solid var(--accent-success);
+        }
+
+        .toast.error {
+            border-left: 4px solid var(--accent-danger);
+        }
+
+        .toast.info {
+            border-left: 4px solid var(--accent-primary);
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .loader {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+
+        .loader i {
+            font-size: 2rem;
+            margin-bottom: 16px;
+        }
+
+        @media (max-width: 768px) {
+            .navbar {
+                width: 95%;
+                padding: 0 20px;
+            }
+            .nav-links {
+                display: none;
+            }
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+            .scripts-grid {
+                grid-template-columns: 1fr;
+            }
+            .dashboard-header {
+                flex-direction: column;
+                gap: 20px;
+                align-items: flex-start;
+            }
+        }
+    </style>
 </head>
 <body>
-    <!-- Dashboard content -->
+    <nav class="navbar">
+        <div class="logo">
+            <i class="fas fa-shield-alt"></i>
+            Authy
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard" class="nav-link">Dashboard</a>
+            <a href="#" class="nav-link">Scripts</a>
+            <a href="#" class="nav-link">Keys</a>
+            <a href="#" class="nav-link">Analytics</a>
+            <a href="#" class="nav-link">Docs</a>
+        </div>
+        <div class="nav-user">
+            <div class="user-menu">
+                <i class="fas fa-user-circle"></i>
+                <span class="username" id="usernameDisplay">Loading...</span>
+                <i class="fas fa-chevron-down"></i>
+            </div>
+            <button class="btn-logout" id="logoutBtn">
+                <i class="fas fa-sign-out-alt"></i>
+            </button>
+        </div>
+    </nav>
+
+    <div class="main-content">
+        <div class="dashboard-header">
+            <h1>Welcome back, <span id="dashboardUsername">User</span></h1>
+            <button class="btn-primary" id="createScriptBtn">
+                <i class="fas fa-plus"></i>
+                New Script
+            </button>
+        </div>
+
+        <!-- Stats Grid -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Total Scripts</span>
+                    <div class="stat-icon blue">
+                        <i class="fas fa-code"></i>
+                    </div>
+                </div>
+                <div class="stat-value" id="totalScripts">0</div>
+                <div class="stat-change">Active projects</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Total Keys</span>
+                    <div class="stat-icon purple">
+                        <i class="fas fa-key"></i>
+                    </div>
+                </div>
+                <div class="stat-value" id="totalKeys">0</div>
+                <div class="stat-change">All time</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Active Keys</span>
+                    <div class="stat-icon green">
+                        <i class="fas fa-check-circle"></i>
+                    </div>
+                </div>
+                <div class="stat-value" id="activeKeys">0</div>
+                <div class="stat-change positive">+12% this week</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Online Now</span>
+                    <div class="stat-icon orange">
+                        <i class="fas fa-wifi"></i>
+                    </div>
+                </div>
+                <div class="stat-value" id="onlineNow">0</div>
+                <div class="stat-change">Currently active</div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="charts-grid">
+            <div class="chart-card">
+                <div class="chart-header">
+                    <h3>Key Activity (Last 7 Days)</h3>
+                    <select class="btn-secondary" id="activityRange" style="width: auto; padding: 8px;">
+                        <option>Daily</option>
+                        <option>Weekly</option>
+                        <option>Monthly</option>
+                    </select>
+                </div>
+                <div class="chart-container">
+                    <canvas id="activityChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-card">
+                <div class="chart-header">
+                    <h3>Key Distribution</h3>
+                </div>
+                <div class="chart-container">
+                    <canvas id="distributionChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Scripts Section -->
+        <div class="section-header">
+            <h2>Your Scripts</h2>
+        </div>
+        <div class="scripts-grid" id="scriptsGrid">
+            <div class="loader">
+                <i class="fas fa-spinner fa-spin"></i>
+                <p>Loading scripts...</p>
+            </div>
+        </div>
+
+        <!-- Keys Table -->
+        <div class="section-header">
+            <h2>Recent Keys</h2>
+            <button class="btn-secondary" id="viewAllKeysBtn">
+                View All
+            </button>
+        </div>
+        <div class="keys-table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Key</th>
+                        <th>Nickname</th>
+                        <th>Script</th>
+                        <th>Status</th>
+                        <th>HWID</th>
+                        <th>Expires</th>
+                        <th>Last Seen</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="keysBody">
+                    <tr>
+                        <td colspan="8" style="text-align: center; padding: 40px;">
+                            <i class="fas fa-key" style="font-size: 2rem; opacity: 0.5; margin-bottom: 10px;"></i>
+                            <p>No keys yet. Create a script and generate keys!</p>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Create Script Modal -->
+    <div class="modal-overlay" id="createScriptModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Create New Script</h3>
+                <button class="modal-close" id="closeScriptModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Script Name</label>
+                    <input type="text" id="scriptName" placeholder="e.g., 'Lua Executor' or 'DarkHub'" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                </div>
+                <div class="form-group">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Script Type</label>
+                    <select id="scriptType" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="standard">Standard</option>
+                        <option value="premium">Premium</option>
+                        <option value="custom">Custom</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="cancelScriptBtn">Cancel</button>
+                <button class="btn-primary" id="createScriptSubmit">
+                    <i class="fas fa-plus"></i>
+                    Create Script
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Key Modal -->
+    <div class="modal-overlay" id="createKeyModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Generate New Key</h3>
+                <button class="modal-close" id="closeKeyModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Select Script</label>
+                    <select id="keyScriptSelect" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="">Loading scripts...</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Nickname (optional)</label>
+                    <input type="text" id="keyNickname" placeholder="e.g., 'VIP User'" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                </div>
+                <div class="form-group">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Duration</label>
+                    <select id="keyDuration" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="7">7 days</option>
+                        <option value="30" selected>30 days</option>
+                        <option value="90">90 days</option>
+                        <option value="365">1 year</option>
+                        <option value="0">Lifetime</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="cancelKeyBtn">Cancel</button>
+                <button class="btn-primary" id="createKeySubmit">
+                    <i class="fas fa-key"></i>
+                    Generate Key
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Keys Modal -->
+    <div class="modal-overlay" id="viewKeysModal">
+        <div class="modal" style="max-width: 800px;">
+            <div class="modal-header">
+                <h3 id="viewKeysTitle">Keys for Script</h3>
+                <button class="modal-close" id="closeViewKeysModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="keys-table-container" style="max-height: 400px; overflow-y: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Key</th>
+                                <th>Nickname</th>
+                                <th>Status</th>
+                                <th>HWID</th>
+                                <th>Expires</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="modalKeysBody">
+                            <tr>
+                                <td colspan="6" style="text-align: center; padding: 20px;">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" id="generateKeyFromModal">
+                    <i class="fas fa-plus"></i>
+                    New Key
+                </button>
+                <button class="btn-secondary" id="closeViewKeysBtn">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generate Loader Modal -->
+    <div class="modal-overlay" id="loaderModal">
+        <div class="modal" style="max-width: 700px;">
+            <div class="modal-header">
+                <h3>Loader Generated</h3>
+                <button class="modal-close" id="closeLoaderModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Copy this loader and paste it at the <strong>bottom</strong> of your script:</p>
+                <div class="loader-preview">
+                    <pre id="loaderCode">Loading...</pre>
+                </div>
+                <p style="color: var(--text-secondary); margin-top: 10px;">
+                    <i class="fas fa-info-circle"></i>
+                    The user will need to provide their key. Use <code>authenticate("KEY-HERE")</code> in your script.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" id="copyLoaderBtn">
+                    <i class="fas fa-copy"></i>
+                    Copy to Clipboard
+                </button>
+                <button class="btn-secondary" id="closeLoaderBtn">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast">
+        <div class="toast-content">
+            <i class="fas fa-check-circle" id="toastIcon"></i>
+            <span id="toastMessage">Notification</span>
+        </div>
+    </div>
+
+    <script>
+        // API Configuration
+        const API_BASE = window.location.origin;
+        let token = localStorage.getItem('token');
+        let currentUser = null;
+        let activityChart = null;
+        let distributionChart = null;
+
+        // Check if token exists
+        if (!token) {
+            window.location.href = '/';
+        }
+
+        // DOM Elements
+        const usernameDisplay = document.getElementById('usernameDisplay');
+        const dashboardUsername = document.getElementById('dashboardUsername');
+        const logoutBtn = document.getElementById('logoutBtn');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+        const toastIcon = document.getElementById('toastIcon');
+
+        // Modal elements
+        const createScriptModal = document.getElementById('createScriptModal');
+        const createKeyModal = document.getElementById('createKeyModal');
+        const viewKeysModal = document.getElementById('viewKeysModal');
+        const loaderModal = document.getElementById('loaderModal');
+
+        // ========== UTILITY FUNCTIONS ==========
+        function showToast(message, type = 'success') {
+            toastMessage.textContent = message;
+            toast.className = `toast show ${type}`;
+            toastIcon.className = type === 'success' ? 'fas fa-check-circle' : 
+                                 type === 'error' ? 'fas fa-exclamation-circle' : 
+                                 'fas fa-info-circle';
+            
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 3000);
+        }
+
+        async function apiCall(endpoint, method = 'GET', data = null) {
+            const headers = {
+                'Content-Type': 'application/json'
+            };
+            
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+            
+            const response = await fetch(`${API_BASE}${endpoint}`, {
+                method,
+                headers,
+                body: data ? JSON.stringify(data) : null
+            });
+            
+            const contentType = response.headers.get('content-type');
+            if (!contentType || !contentType.includes('application/json')) {
+                const text = await response.text();
+                console.error('Non-JSON response:', text.substring(0, 200));
+                throw new Error('Server error');
+            }
+            
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.detail || 'API call failed');
+            }
+            return result;
+        }
+
+        // ========== DASHBOARD FUNCTIONS ==========
+        async function loadDashboard() {
+            try {
+                currentUser = await apiCall('/api/user/me');
+                usernameDisplay.textContent = currentUser.username;
+                dashboardUsername.textContent = currentUser.username;
+                
+                await Promise.all([
+                    loadStats(),
+                    loadScripts(),
+                    loadKeys()
+                ]);
+                
+                initCharts();
+                
+            } catch (error) {
+                console.error('Failed to load dashboard:', error);
+                showToast('Failed to load dashboard', 'error');
+            }
+        }
+
+        async function loadStats() {
+            try {
+                const stats = await apiCall('/api/stats');
+                document.getElementById('totalScripts').textContent = stats.total_scripts;
+                document.getElementById('totalKeys').textContent = stats.total_keys;
+                document.getElementById('activeKeys').textContent = stats.active_keys;
+                document.getElementById('onlineNow').textContent = stats.online_now;
+            } catch (error) {
+                console.error('Failed to load stats:', error);
+            }
+        }
+
+        async function loadScripts() {
+            try {
+                const scripts = await apiCall('/api/scripts');
+                const grid = document.getElementById('scriptsGrid');
+                
+                if (scripts.length === 0) {
+                    grid.innerHTML = `
+                        <div style="grid-column: 1/-1; text-align: center; padding: 60px;">
+                            <i class="fas fa-code" style="font-size: 3rem; opacity: 0.5; margin-bottom: 20px;"></i>
+                            <h3>No scripts yet</h3>
+                            <p style="color: var(--text-secondary); margin-bottom: 20px;">Create your first script to get started</p>
+                            <button class="btn-primary" onclick="document.getElementById('createScriptBtn').click()">
+                                <i class="fas fa-plus"></i>
+                                Create Script
+                            </button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                grid.innerHTML = scripts.map(script => `
+                    <div class="script-card">
+                        <div class="script-header">
+                            <span class="script-name">${script.name}</span>
+                            <span class="script-badge">${script.script_type}</span>
+                        </div>
+                        <div class="script-stats">
+                            <div class="script-stat">
+                                <div class="script-stat-label">Total Keys</div>
+                                <div class="script-stat-value">${script.key_count}</div>
+                            </div>
+                            <div class="script-stat">
+                                <div class="script-stat-label">Active</div>
+                                <div class="script-stat-value">${script.active_keys}</div>
+                            </div>
+                            <div class="script-stat">
+                                <div class="script-stat-label">Created</div>
+                                <div class="script-stat-value">${new Date(script.created_at).toLocaleDateString()}</div>
+                            </div>
+                        </div>
+                        <div class="script-actions">
+                            <button class="btn-success" onclick="showGenerateKeyModal(${script.id}, '${script.name}')">
+                                <i class="fas fa-plus"></i>
+                                Key
+                            </button>
+                            <button class="btn-primary" onclick="generateLoader(${script.id})">
+                                <i class="fas fa-download"></i>
+                                Loader
+                            </button>
+                            <button class="btn-secondary" onclick="viewScriptKeys(${script.id}, '${script.name}')">
+                                <i class="fas fa-eye"></i>
+                                View
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Failed to load scripts:', error);
+            }
+        }
+
+        async function loadKeys() {
+            try {
+                const keys = await apiCall('/api/keys');
+                const tbody = document.getElementById('keysBody');
+                
+                if (keys.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="8" style="text-align: center; padding: 40px;">
+                                <i class="fas fa-key" style="font-size: 2rem; opacity: 0.5; margin-bottom: 10px;"></i>
+                                <p>No keys yet. Create a script and generate keys!</p>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+                
+                tbody.innerHTML = keys.slice(0, 5).map(key => {
+                    const statusClass = key.online ? 'online' : (key.status === 'active' ? 'active' : 'inactive');
+                    const statusText = key.online ? 'ONLINE' : (key.status === 'active' ? 'ACTIVE' : 'INACTIVE');
+                    
+                    return `
+                        <tr>
+                            <td class="key-cell">${key.key}</td>
+                            <td>${key.nickname || '-'}</td>
+                            <td>${key.script_name}</td>
+                            <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                            <td>${key.hwid ? key.hwid.substring(0, 8) + '...' : 'Not bound'}</td>
+                            <td>${new Date(key.expires_at).toLocaleDateString()}</td>
+                            <td>${key.last_heartbeat ? new Date(key.last_heartbeat).toLocaleString() : 'Never'}</td>
+                            <td>
+                                <div class="action-group">
+                                    <button class="btn-icon" onclick="toggleKeyStatus('${key.key}', '${key.status}')" title="${key.status === 'active' ? 'Deactivate' : 'Activate'}">
+                                        <i class="fas ${key.status === 'active' ? 'fa-pause' : 'fa-play'}"></i>
+                                    </button>
+                                    <button class="btn-icon" onclick="kickKey('${key.key}')" title="Kick User">
+                                        <i class="fas fa-user-slash"></i>
+                                    </button>
+                                    <button class="btn-icon" onclick="resetKeyHWID('${key.key}')" title="Reset HWID">
+                                        <i class="fas fa-undo-alt"></i>
+                                    </button>
+                                    <button class="btn-icon" onclick="setKeyNickname('${key.key}')" title="Set Nickname">
+                                        <i class="fas fa-tag"></i>
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (error) {
+                console.error('Failed to load keys:', error);
+            }
+        }
+
+        function initCharts() {
+            const activityCtx = document.getElementById('activityChart').getContext('2d');
+            if (activityChart) activityChart.destroy();
+            
+            activityChart = new Chart(activityCtx, {
+                type: 'line',
+                data: {
+                    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    datasets: [{
+                        label: 'Active Keys',
+                        data: [65, 72, 80, 78, 85, 90, 95],
+                        borderColor: '#3B82F6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: {
+                            grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                            ticks: { color: '#9CA3AF' }
+                        },
+                        x: {
+                            grid: { display: false },
+                            ticks: { color: '#9CA3AF' }
+                        }
+                    }
+                }
+            });
+
+            const distCtx = document.getElementById('distributionChart').getContext('2d');
+            if (distributionChart) distributionChart.destroy();
+            
+            distributionChart = new Chart(distCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Active', 'Inactive', 'Expired'],
+                    datasets: [{
+                        data: [65, 25, 10],
+                        backgroundColor: ['#10B981', '#EF4444', '#6B7280'],
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: { color: '#9CA3AF' }
+                        }
+                    },
+                    cutout: '70%'
+                }
+            });
+        }
+
+        function logout() {
+            token = null;
+            localStorage.removeItem('token');
+            window.location.href = '/';
+        }
+
+        // ========== SCRIPT ACTIONS ==========
+        document.getElementById('createScriptBtn').addEventListener('click', () => {
+            createScriptModal.classList.add('show');
+        });
+
+        document.getElementById('closeScriptModal').addEventListener('click', () => {
+            createScriptModal.classList.remove('show');
+        });
+
+        document.getElementById('cancelScriptBtn').addEventListener('click', () => {
+            createScriptModal.classList.remove('show');
+        });
+
+        document.getElementById('createScriptSubmit').addEventListener('click', async () => {
+            const name = document.getElementById('scriptName').value;
+            const scriptType = document.getElementById('scriptType').value;
+            
+            if (!name) {
+                showToast('Please enter a script name', 'error');
+                return;
+            }
+            
+            try {
+                await apiCall('/api/scripts/create', 'POST', { name, script_type: scriptType });
+                createScriptModal.classList.remove('show');
+                document.getElementById('scriptName').value = '';
+                showToast('Script created successfully!');
+                await loadScripts();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+
+        // ========== KEY ACTIONS ==========
+        window.showGenerateKeyModal = (scriptId, scriptName) => {
+            document.getElementById('keyScriptSelect').innerHTML = `<option value="${scriptId}" selected>${scriptName}</option>`;
+            createKeyModal.classList.add('show');
+        };
+
+        document.getElementById('closeKeyModal').addEventListener('click', () => {
+            createKeyModal.classList.remove('show');
+        });
+
+        document.getElementById('cancelKeyBtn').addEventListener('click', () => {
+            createKeyModal.classList.remove('show');
+        });
+
+        document.getElementById('createKeySubmit').addEventListener('click', async () => {
+            const scriptId = document.getElementById('keyScriptSelect').value;
+            const nickname = document.getElementById('keyNickname').value;
+            const duration = parseInt(document.getElementById('keyDuration').value);
+            
+            if (!scriptId) {
+                showToast('Please select a script', 'error');
+                return;
+            }
+            
+            try {
+                await apiCall('/api/keys/create', 'POST', {
+                    script_id: parseInt(scriptId),
+                    nickname: nickname || null,
+                    duration_days: duration
+                });
+                
+                createKeyModal.classList.remove('show');
+                document.getElementById('keyNickname').value = '';
+                showToast('Key generated successfully!');
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+
+        window.toggleKeyStatus = async (key, currentStatus) => {
+            try {
+                await apiCall('/api/keys/action', 'POST', {
+                    key: key,
+                    action: currentStatus === 'active' ? 'deactivate' : 'activate'
+                });
+                showToast(`Key ${currentStatus === 'active' ? 'deactivated' : 'activated'}`);
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        window.kickKey = async (key) => {
+            if (!confirm('Kick this user? They will be disconnected on next heartbeat.')) return;
+            
+            try {
+                await apiCall('/api/keys/action', 'POST', {
+                    key: key,
+                    action: 'kick'
+                });
+                showToast('User will be kicked on next heartbeat');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        window.resetKeyHWID = async (key) => {
+            if (!confirm('Reset HWID for this key? The user will need to authenticate again.')) return;
+            
+            try {
+                await apiCall('/api/keys/reset-hwid', 'POST', {
+                    key: key,
+                    confirm: true
+                });
+                showToast('HWID reset successfully');
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        window.setKeyNickname = async (key) => {
+            const nickname = prompt('Enter nickname for this key:');
+            if (nickname === null) return;
+            
+            try {
+                await apiCall('/api/keys/nickname', 'POST', {
+                    key: key,
+                    nickname: nickname
+                });
+                showToast('Nickname updated');
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        window.viewScriptKeys = async (scriptId, scriptName) => {
+            try {
+                const keys = await apiCall('/api/keys');
+                const scriptKeys = keys.filter(k => k.script_name === scriptName);
+                
+                document.getElementById('viewKeysTitle').textContent = `Keys for ${scriptName}`;
+                
+                const tbody = document.getElementById('modalKeysBody');
+                if (scriptKeys.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px;">No keys for this script</td></tr>';
+                } else {
+                    tbody.innerHTML = scriptKeys.map(key => {
+                        const statusClass = key.online ? 'online' : (key.status === 'active' ? 'active' : 'inactive');
+                        const statusText = key.online ? 'ONLINE' : (key.status === 'active' ? 'ACTIVE' : 'INACTIVE');
+                        
+                        return `
+                            <tr>
+                                <td class="key-cell">${key.key}</td>
+                                <td>${key.nickname || '-'}</td>
+                                <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                                <td>${key.hwid ? key.hwid.substring(0, 8) + '...' : 'Not bound'}</td>
+                                <td>${new Date(key.expires_at).toLocaleDateString()}</td>
+                                <td>
+                                    <div class="action-group">
+                                        <button class="btn-icon" onclick="toggleKeyStatus('${key.key}', '${key.status}')">
+                                            <i class="fas ${key.status === 'active' ? 'fa-pause' : 'fa-play'}"></i>
+                                        </button>
+                                        <button class="btn-icon" onclick="kickKey('${key.key}')">
+                                            <i class="fas fa-user-slash"></i>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+                
+                viewKeysModal.classList.add('show');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        document.getElementById('closeViewKeysModal').addEventListener('click', () => {
+            viewKeysModal.classList.remove('show');
+        });
+
+        document.getElementById('closeViewKeysBtn').addEventListener('click', () => {
+            viewKeysModal.classList.remove('show');
+        });
+
+        document.getElementById('generateKeyFromModal').addEventListener('click', () => {
+            viewKeysModal.classList.remove('show');
+            createKeyModal.classList.add('show');
+        });
+
+        // ========== LOADER GENERATION ==========
+        window.generateLoader = async (scriptId) => {
+            try {
+                const response = await apiCall('/api/loader/generate', 'POST', { script_id: scriptId });
+                document.getElementById('loaderCode').textContent = response.loader;
+                loaderModal.classList.add('show');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        document.getElementById('closeLoaderModal').addEventListener('click', () => {
+            loaderModal.classList.remove('show');
+        });
+
+        document.getElementById('closeLoaderBtn').addEventListener('click', () => {
+            loaderModal.classList.remove('show');
+        });
+
+        document.getElementById('copyLoaderBtn').addEventListener('click', () => {
+            const loaderText = document.getElementById('loaderCode').textContent;
+            navigator.clipboard.writeText(loaderText);
+            showToast('Loader copied to clipboard!');
+        });
+
+        // ========== LOGOUT ==========
+        logoutBtn.addEventListener('click', logout);
+
+        // ========== INIT ==========
+        loadDashboard();
+
+        // Auto-refresh every 30 seconds
+        setInterval(async () => {
+            if (token) {
+                await Promise.all([
+                    loadStats(),
+                    loadKeys()
+                ]);
+            }
+        }, 30000);
+
+        // Close modals on overlay click
+        document.querySelectorAll('.modal-overlay').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.classList.remove('show');
+                }
+            });
+        });
+    </script>
 </body>
 </html>
 """
@@ -1653,15 +3227,8 @@ async def serve_homepage():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def serve_dashboard():
-    """Serve the dashboard (requires login)"""
-    # In a real implementation, you'd check token here
-    # For now, just serve the dashboard template
+    """Serve the dashboard"""
     return DASHBOARD_TEMPLATE
-
-@app.get("/{full_path:path}", response_class=HTMLResponse)
-async def catch_all(full_path: str):
-    """Catch all routes - redirect to homepage"""
-    return HOMEPAGE_TEMPLATE
 
 # ========== RUN ==========
 if __name__ == "__main__":

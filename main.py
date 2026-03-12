@@ -22,7 +22,7 @@ load_dotenv()
 # ========== CONFIGURATION ==========
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ========== DATABASE CONNECTION POOL ==========
 class Database:
@@ -182,7 +182,6 @@ class TokenResponse(BaseModel):
 
 class LicenseCreate(BaseModel):
     duration_days: int = 30
-    max_hwids: int = 1
     note: Optional[str] = None
 
 class LicenseResponse(BaseModel):
@@ -389,8 +388,7 @@ async def create_license(
             VALUES ($1, $2, $3, $4, $5) 
             RETURNING id
             """,
-            key, current_user['id'], expires_at, license_data.note, 
-            license_data.max_hwids * 3
+            key, current_user['id'], expires_at, license_data.note, 3
         )
         
         return LicenseResponse(
@@ -571,1507 +569,1011 @@ async def get_activity(current_user: dict = Depends(get_current_user)):
         
         return result
 
-# ========== FRONTEND (HTML/CSS/JS all in one) ==========
+# ========== FRONTEND (Your New HTML/CSS/JS) ==========
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LuaAuth · Key Management</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        :root {
-            --bg-primary: #0a0a0f;
-            --bg-secondary: #111117;
-            --bg-tertiary: #1a1a24;
-            --accent-blue: #3b82f6;
-            --accent-blue-dark: #2563eb;
-            --accent-purple: #8b5cf6;
-            --accent-green: #10b981;
-            --accent-orange: #f59e0b;
-            --accent-red: #ef4444;
-            --text-primary: #ffffff;
-            --text-secondary: #a0a0b0;
-            --text-muted: #6b6b7c;
-            --border-color: #2a2a35;
-            --glass-bg: rgba(20, 20, 30, 0.7);
-            --glass-border: rgba(255, 255, 255, 0.05);
-            --shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: linear-gradient(135deg, #0a0a0f 0%, #050507 100%);
-            color: var(--text-primary);
-            min-height: 100vh;
-            line-height: 1.5;
-        }
-
-        /* Navigation */
-        .navbar {
-            position: sticky;
-            top: 0;
-            width: 100%;
-            z-index: 1000;
-            transition: all 0.3s ease;
-            background: transparent;
-        }
-
-        .navbar.scrolled {
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            border-bottom: 1px solid var(--glass-border);
-        }
-
-        .nav-container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 1rem 2rem;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .nav-logo {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            font-size: 1.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .nav-logo i {
-            font-size: 1.75rem;
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 2rem;
-        }
-
-        .nav-links a {
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-weight: 500;
-            transition: color 0.3s ease;
-            position: relative;
-        }
-
-        .nav-links a:hover,
-        .nav-links a.active {
-            color: var(--text-primary);
-        }
-
-        .nav-links a::after {
-            content: '';
-            position: absolute;
-            bottom: -4px;
-            left: 0;
-            width: 0;
-            height: 2px;
-            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
-            transition: width 0.3s ease;
-        }
-
-        .nav-links a:hover::after,
-        .nav-links a.active::after {
-            width: 100%;
-        }
-
-        .nav-user {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .user-menu {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            background: var(--glass-bg);
-            backdrop-filter: blur(8px);
-            border: 1px solid var(--glass-border);
-            border-radius: 2rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .user-menu:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .username {
-            font-weight: 500;
-            color: var(--text-primary);
-        }
-
-        .btn-logout {
-            background: transparent;
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.3s ease;
-        }
-
-        .btn-logout:hover {
-            background: var(--accent-red);
-            border-color: var(--accent-red);
-            color: white;
-        }
-
-        .mobile-menu-btn {
-            display: none;
-            background: transparent;
-            border: none;
-            color: var(--text-primary);
-            font-size: 1.5rem;
-            cursor: pointer;
-        }
-
-        /* Auth Container */
-        .auth-container {
-            min-height: calc(100vh - 80px);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 2rem;
-        }
-
-        .auth-card {
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--glass-border);
-            border-radius: 1.5rem;
-            padding: 2.5rem;
-            width: 100%;
-            max-width: 450px;
-            box-shadow: var(--shadow);
-            animation: slideUp 0.5s ease;
-        }
-
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .auth-header {
-            text-align: center;
-            margin-bottom: 2rem;
-        }
-
-        .auth-header i {
-            font-size: 3rem;
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 1rem;
-        }
-
-        .auth-header h2 {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
-        }
-
-        .auth-header p {
-            color: var(--text-secondary);
-        }
-
-        .auth-tabs {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 2rem;
-            background: var(--bg-secondary);
-            padding: 0.5rem;
-            border-radius: 1rem;
-        }
-
-        .tab-btn {
-            flex: 1;
-            padding: 0.75rem;
-            background: transparent;
-            border: none;
-            color: var(--text-secondary);
-            font-weight: 600;
-            cursor: pointer;
-            border-radius: 0.75rem;
-            transition: all 0.3s ease;
-        }
-
-        .tab-btn.active {
-            background: var(--accent-blue);
-            color: white;
-        }
-
-        .auth-form {
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-        }
-
-        .auth-form.hidden {
-            display: none;
-        }
-
-        .form-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .form-group label {
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .form-group input,
-        .form-group select {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 0.75rem;
-            padding: 0.75rem 1rem;
-            color: var(--text-primary);
-            font-size: 1rem;
-            transition: all 0.3s ease;
-        }
-
-        .form-group input:focus,
-        .form-group select:focus {
-            outline: none;
-            border-color: var(--accent-blue);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-            border: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.75rem;
-            color: white;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3);
-        }
-
-        .btn-secondary {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.75rem;
-            color: var(--text-primary);
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .btn-secondary:hover {
-            background: var(--bg-secondary);
-        }
-
-        .btn-danger {
-            background: linear-gradient(135deg, #ef4444, #dc2626);
-            border: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.75rem;
-            color: white;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-
-        .btn-danger:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(239, 68, 68, 0.3);
-        }
-
-        .btn-danger:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-            box-shadow: none;
-        }
-
-        /* Dashboard */
-        .dashboard-container {
-            max-width: 1400px;
-            margin: 2rem auto;
-            padding: 0 2rem;
-        }
-
-        .dashboard-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-        }
-
-        .header-content h1 {
-            font-size: 2.5rem;
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.5rem;
-        }
-
-        .header-content p {
-            color: var(--text-secondary);
-        }
-
-        /* Stats Grid */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .stat-card {
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--glass-border);
-            border-radius: 1.5rem;
-            padding: 1.5rem;
-            display: flex;
-            align-items: center;
-            gap: 1.5rem;
-            transition: transform 0.3s ease;
-        }
-
-        .stat-card:hover {
-            transform: translateY(-4px);
-        }
-
-        .stat-icon {
-            width: 60px;
-            height: 60px;
-            border-radius: 1rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 2rem;
-        }
-
-        .stat-icon.blue {
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.2));
-            color: var(--accent-blue);
-        }
-
-        .stat-icon.green {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.2));
-            color: var(--accent-green);
-        }
-
-        .stat-icon.purple {
-            background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(124, 58, 237, 0.2));
-            color: var(--accent-purple);
-        }
-
-        .stat-icon.orange {
-            background: linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(217, 119, 6, 0.2));
-            color: var(--accent-orange);
-        }
-
-        .stat-info {
-            flex: 1;
-        }
-
-        .stat-label {
-            display: block;
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            margin-bottom: 0.25rem;
-        }
-
-        .stat-value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--text-primary);
-        }
-
-        /* Licenses Section */
-        .licenses-section,
-        .activity-section {
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--glass-border);
-            border-radius: 1.5rem;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1.5rem;
-        }
-
-        .search-box {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 2rem;
-            padding: 0.5rem 1rem;
-        }
-
-        .search-box i {
-            color: var(--text-secondary);
-        }
-
-        .search-box input {
-            background: transparent;
-            border: none;
-            color: var(--text-primary);
-            outline: none;
-            width: 250px;
-        }
-
-        .table-container {
-            overflow-x: auto;
-        }
-
-        .licenses-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .licenses-table th {
-            text-align: left;
-            padding: 1rem;
-            color: var(--text-secondary);
-            font-weight: 500;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .licenses-table td {
-            padding: 1rem;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .licenses-table tr:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .status-badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 2rem;
-            font-size: 0.85rem;
-            font-weight: 500;
-        }
-
-        .status-badge.active {
-            background: rgba(16, 185, 129, 0.2);
-            color: var(--accent-green);
-        }
-
-        .status-badge.expired {
-            background: rgba(239, 68, 68, 0.2);
-            color: var(--accent-red);
-        }
-
-        .status-badge.suspended {
-            background: rgba(245, 158, 11, 0.2);
-            color: var(--accent-orange);
-        }
-
-        .hwid-cell {
-            font-family: monospace;
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-        }
-
-        .actions-cell {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .action-btn {
-            background: transparent;
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            width: 32px;
-            height: 32px;
-            border-radius: 0.5rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .action-btn:hover {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-        }
-
-        .action-btn.reset:hover {
-            background: var(--accent-orange);
-            border-color: var(--accent-orange);
-            color: white;
-        }
-
-        .action-btn.delete:hover {
-            background: var(--accent-red);
-            border-color: var(--accent-red);
-            color: white;
-        }
-
-        /* Activity List */
-        .activity-list {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .activity-item {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            padding: 1rem;
-            background: var(--bg-secondary);
-            border-radius: 1rem;
-            animation: fadeIn 0.5s ease;
-        }
-
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateX(-10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .activity-icon {
-            width: 40px;
-            height: 40px;
-            border-radius: 0.75rem;
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(139, 92, 246, 0.2));
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: var(--accent-blue);
-        }
-
-        .activity-details {
-            flex: 1;
-        }
-
-        .activity-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.25rem;
-        }
-
-        .activity-key {
-            font-weight: 600;
-            color: var(--accent-blue);
-        }
-
-        .activity-time {
-            color: var(--text-muted);
-            font-size: 0.85rem;
-        }
-
-        .activity-hwid {
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            font-family: monospace;
-        }
-
-        /* Modal */
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(4px);
-            z-index: 2000;
-            align-items: center;
-            justify-content: center;
-            animation: fadeIn 0.3s ease;
-        }
-
-        .modal.show {
-            display: flex;
-        }
-
-        .modal-content {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 1.5rem;
-            width: 100%;
-            max-width: 500px;
-            animation: slideUp 0.3s ease;
-        }
-
-        .modal-header {
-            padding: 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .modal-header h3 {
-            font-size: 1.25rem;
-            color: var(--text-primary);
-        }
-
-        .close-btn {
-            background: transparent;
-            border: none;
-            color: var(--text-secondary);
-            font-size: 1.5rem;
-            cursor: pointer;
-            transition: color 0.3s ease;
-        }
-
-        .close-btn:hover {
-            color: var(--text-primary);
-        }
-
-        .modal-body {
-            padding: 1.5rem;
-        }
-
-        .warning-icon {
-            text-align: center;
-            margin-bottom: 1rem;
-        }
-
-        .warning-icon i {
-            font-size: 3rem;
-            color: var(--accent-orange);
-        }
-
-        .warning-text {
-            color: var(--accent-orange);
-            font-size: 0.9rem;
-            margin: 0.5rem 0;
-        }
-
-        .modal-footer {
-            padding: 1.5rem;
-            border-top: 1px solid var(--border-color);
-            display: flex;
-            justify-content: flex-end;
-            gap: 1rem;
-        }
-
-        /* Toast */
-        .toast {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--glass-border);
-            border-radius: 1rem;
-            padding: 1rem 1.5rem;
-            transform: translateX(400px);
-            transition: transform 0.3s ease;
-            z-index: 3000;
-        }
-
-        .toast.show {
-            transform: translateX(0);
-        }
-
-        .toast-content {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .toast-content i {
-            font-size: 1.25rem;
-        }
-
-        .toast.success i {
-            color: var(--accent-green);
-        }
-
-        .toast.error i {
-            color: var(--accent-red);
-        }
-
-        .toast.info i {
-            color: var(--accent-blue);
-        }
-
-        /* Utility Classes */
-        .hidden {
-            display: none !important;
-        }
-
-        .loading-row {
-            text-align: center;
-            padding: 3rem !important;
-            color: var(--text-secondary);
-        }
-
-        .loading-activity {
-            text-align: center;
-            padding: 2rem;
-            color: var(--text-secondary);
-        }
-
-        /* Responsive */
-        @media (max-width: 768px) {
-            .nav-links,
-            .nav-user {
-                display: none;
-            }
-            
-            .mobile-menu-btn {
-                display: block;
-            }
-            
-            .nav-links.show {
-                display: flex;
-                flex-direction: column;
-                position: absolute;
-                top: 100%;
-                left: 0;
-                right: 0;
-                background: var(--glass-bg);
-                backdrop-filter: blur(12px);
-                padding: 1rem;
-                border-bottom: 1px solid var(--glass-border);
-            }
-            
-            .dashboard-header {
-                flex-direction: column;
-                gap: 1rem;
-                text-align: center;
-            }
-            
-            .stats-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .modal-content {
-                margin: 1rem;
-            }
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Authy - Protect Your Lua Scripts</title>
+  <!-- Inter font -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;}
+    html{scroll-behavior:smooth;}
+    body{
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: #15171e;
+      color: #f9fafb;
+      min-height: 100vh;
+      overflow-x: hidden;
+      position: relative;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image:
+        radial-gradient(circle at 2px 2px, #4a90e2 1px, transparent 1px),
+        radial-gradient(circle at 17px 17px, #4a90e2 1px, transparent 1px);
+      background-size: 30px 30px;
+      opacity: 0.07;
+      pointer-events: none;
+      z-index: -1;
+    }
+    .navbar{
+      position:fixed;
+      top:12px;
+      left:5%;
+      right:5%;
+      height:60px;
+      border-radius:16px;
+      box-shadow:0 4px 20px rgba(0,0,0,0.35);
+      background:rgba(21,23,30,0.65);
+      backdrop-filter:blur(16px);
+      -webkit-backdrop-filter:blur(16px);
+      border:1px solid rgba(63,72,90,0.4);
+      z-index:1000;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      padding:0 25px;
+    }
+    .logo {
+      font-size:1.4rem;
+      font-weight:800;
+      color: #4a90e2;
+      letter-spacing:-0.02em;
+    }
+    .nav-menu{
+      display:flex;
+      align-items:center;
+      gap:1.8rem;
+      margin: 0 auto;
+    }
+    .nav-link{
+      color:#b6bcc8;
+      font-size:0.98rem;
+      font-weight:500;
+      text-decoration:none;
+      transition:color 0.25s ease;
+    }
+    .nav-link:hover{
+      color:#4a90e2;
+    }
+    .nav-right{
+      display:flex;
+      align-items:center;
+      gap:1.5rem;
+    }
+    .sign-in {
+      color:#f9fafb;
+      font-size:1rem;
+      font-weight:500;
+      cursor:pointer;
+      transition:color 0.25s ease;
+    }
+    .sign-in:hover{
+      color:#4a90e2;
+    }
+    .sign-up-btn{
+      background:#4a90e2;
+      color:#ffffff;
+      font-size:1rem;
+      font-weight:600;
+      padding:0.6rem 1.1rem;
+      border-radius:8px;
+      border:none;
+      cursor:pointer;
+      transition: all 0.25s ease;
+    }
+    .sign-up-btn:hover{
+      transform:translateY(-1px);
+      background:#60c0ff;
+    }
+    .hero-section{
+      min-height:100vh;
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      align-items:center;
+      text-align:center;
+      padding:0 20px;
+      position:relative;
+      z-index:10;
+    }
+    .hero-text{
+      font-size: clamp(2.8rem, 6.5vw, 4.2rem);
+      font-weight:800;
+      letter-spacing:-0.02em;
+      line-height:1.1;
+      margin-bottom:0.6rem;
+    }
+    .hero-subtitle {
+      font-size: clamp(1.1rem, 3vw, 1.45rem);
+      font-weight: 500;
+      color: #a0a0a0;
+      margin-top: 0.4rem;
+      letter-spacing: -0.01em;
+      max-width: 640px;
+    }
+    .highlight{
+      color:#4a90e2;
+    }
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(10, 12, 22, 0.88);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+    .modal-overlay.show {
+      opacity: 1;
+    }
+    .modal {
+      background: rgba(21, 23, 30, 0.96);
+      backdrop-filter: blur(14px);
+      border-radius: 18px;
+      width: 420px;
+      max-width: 92%;
+      padding: 32px 30px 24px;
+      border: 1px solid #2a2f3a;
+      box-shadow: 0 16px 50px rgba(0,0,0,0.6);
+      position: relative;
+      transform: translateY(20px);
+      opacity: 0;
+      transition: all 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .modal-overlay.show .modal {
+      transform: translateY(0);
+      opacity: 1;
+    }
+    .modal-close {
+      position: absolute;
+      top: 16px;
+      right: 20px;
+      font-size: 1.8rem;
+      color: #555;
+      cursor: pointer;
+      transition: color 0.2s, transform 0.2s;
+    }
+    .modal-close:hover {
+      color: #ccc;
+      transform: rotate(90deg);
+    }
+    .authy-title {
+      font-size: 2.2rem;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: -0.02em;
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .floating-input {
+      position: relative;
+      margin-bottom: 20px;
+      --label-float-top: -1px;
+      --notch-left: 11px;
+      --notch-width: 45px;
+    }
+    .floating-input input {
+      width: 100%;
+      padding: 16px 18px 12px;
+      background: rgba(30,35,45,0.7);
+      border: 1px solid #2a2f3a;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 1.02rem;
+      outline: none;
+      transition: border-color 0.25s ease;
+    }
+    .floating-input input:focus {
+      border-color: #4a90e2;
+    }
+    .floating-input label {
+      position: absolute;
+      top: 50%;
+      left: 18px;
+      transform: translateY(-50%);
+      color: #aaa;
+      font-size: 1rem;
+      pointer-events: none;
+      transition: all 0.25s ease;
+      transform-origin: left center;
+      padding: 0 6px;
+      z-index: 2;
+    }
+    .floating-input input:focus + label,
+    .floating-input input:not(:placeholder-shown) + label {
+      top: var(--label-float-top);
+      left: calc(var(--notch-left) + 2px);
+      font-size: 0.82rem;
+      color: #4a90e2;
+      background: rgba(21, 23, 30, 0.96);
+    }
+    .notch-cover {
+      position: absolute;
+      top: -1px;
+      left: var(--notch-left);
+      height: 2px;
+      background: rgba(21, 23, 30, 0.96);
+      z-index: 1;
+      pointer-events: none;
+      width: 0;
+      transition: width 0.25s ease;
+    }
+    .floating-input input:focus ~ .notch-cover,
+    .floating-input input:not(:placeholder-shown) ~ .notch-cover {
+      width: var(--notch-width);
+    }
+    .login-btn {
+      width: 100%;
+      padding: 15px;
+      background: #ffffff;
+      color: #1a1f2e;
+      font-weight: 600;
+      font-size: 1.05rem;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      box-shadow: 0 5px 18px rgba(0,0,0,0.25);
+    }
+    .login-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.35);
+      background: #f0f0f0;
+    }
+    .terms {
+      margin-top: 24px;
+      font-size: 0.83rem;
+      color: #777;
+      text-align: center;
+    }
+    .terms a {
+      color: #888;
+      text-decoration: underline;
+    }
+    .terms a:hover { color: #aaa; }
+    
+    /* Dashboard Styles */
+    .dashboard {
+      padding: 100px 20px 40px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    
+    .dashboard.hidden {
+      display: none;
+    }
+    
+    .welcome-card {
+      background: rgba(21, 23, 30, 0.8);
+      backdrop-filter: blur(16px);
+      border: 1px solid #2a2f3a;
+      border-radius: 24px;
+      padding: 30px;
+      margin-bottom: 30px;
+    }
+    
+    .welcome-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    
+    .welcome-title {
+      font-size: 2rem;
+      font-weight: 700;
+    }
+    
+    .welcome-title span {
+      color: #4a90e2;
+    }
+    
+    .create-key-btn {
+      background: #4a90e2;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .create-key-btn:hover {
+      transform: translateY(-2px);
+      background: #60c0ff;
+      box-shadow: 0 10px 20px rgba(74, 144, 226, 0.3);
+    }
+    
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+      margin-top: 20px;
+    }
+    
+    .stat-card {
+      background: rgba(30, 35, 45, 0.5);
+      border: 1px solid #2a2f3a;
+      border-radius: 16px;
+      padding: 20px;
+    }
+    
+    .stat-label {
+      color: #a0a0a0;
+      font-size: 0.9rem;
+      margin-bottom: 8px;
+    }
+    
+    .stat-value {
+      font-size: 2rem;
+      font-weight: 700;
+      color: #4a90e2;
+    }
+    
+    .keys-table {
+      background: rgba(21, 23, 30, 0.8);
+      backdrop-filter: blur(16px);
+      border: 1px solid #2a2f3a;
+      border-radius: 24px;
+      padding: 30px;
+      overflow-x: auto;
+    }
+    
+    .keys-table h2 {
+      margin-bottom: 20px;
+      font-size: 1.5rem;
+    }
+    
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    
+    th {
+      text-align: left;
+      padding: 12px;
+      color: #a0a0a0;
+      font-weight: 500;
+      border-bottom: 1px solid #2a2f3a;
+    }
+    
+    td {
+      padding: 12px;
+      border-bottom: 1px solid #2a2f3a;
+    }
+    
+    .key-cell {
+      font-family: monospace;
+      color: #4a90e2;
+    }
+    
+    .status-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+    
+    .status-active {
+      background: rgba(74, 144, 226, 0.2);
+      color: #4a90e2;
+    }
+    
+    .status-expired {
+      background: rgba(255, 75, 75, 0.2);
+      color: #ff4b4b;
+    }
+    
+    .action-btn {
+      background: transparent;
+      border: 1px solid #2a2f3a;
+      color: #a0a0a0;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin: 0 4px;
+    }
+    
+    .action-btn:hover {
+      border-color: #4a90e2;
+      color: #4a90e2;
+    }
+    
+    .action-btn.delete:hover {
+      border-color: #ff4b4b;
+      color: #ff4b4b;
+    }
+    
+    .logout-btn {
+      background: transparent;
+      border: 1px solid #2a2f3a;
+      color: #a0a0a0;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-left: 15px;
+    }
+    
+    .logout-btn:hover {
+      border-color: #ff4b4b;
+      color: #ff4b4b;
+    }
+    
+    .toast {
+      position: fixed;
+      bottom: 30px;
+      right: 30px;
+      background: rgba(21, 23, 30, 0.95);
+      backdrop-filter: blur(16px);
+      border: 1px solid #2a2f3a;
+      border-radius: 12px;
+      padding: 15px 25px;
+      color: white;
+      transform: translateX(400px);
+      transition: transform 0.3s ease;
+      z-index: 3000;
+    }
+    
+    .toast.show {
+      transform: translateX(0);
+    }
+    
+    .toast.success {
+      border-left: 4px solid #4a90e2;
+    }
+    
+    .toast.error {
+      border-left: 4px solid #ff4b4b;
+    }
+    
+    .create-key-modal {
+      width: 400px;
+    }
+    
+    .duration-select {
+      width: 100%;
+      padding: 12px;
+      background: rgba(30,35,45,0.7);
+      border: 1px solid #2a2f3a;
+      border-radius: 12px;
+      color: white;
+      margin: 15px 0;
+    }
+    
+    .note-input {
+      width: 100%;
+      padding: 12px;
+      background: rgba(30,35,45,0.7);
+      border: 1px solid #2a2f3a;
+      border-radius: 12px;
+      color: white;
+      margin: 15px 0;
+    }
+    
+    .hero.hidden {
+      display: none;
+    }
+    
+    @media (max-width:768px){
+      .navbar{flex-wrap:wrap;height:auto;padding:12px 15px;justify-content:center;gap:1rem;}
+      .nav-menu{order:2;width:100%;justify-content:center;margin:8px 0;}
+      .logo{order:1;flex:1;}
+      .nav-right{order:3;width:100%;justify-content:center;}
+      .hero-text{font-size: clamp(2.4rem, 6vw, 3.6rem);}
+      .hero-subtitle{font-size: clamp(1rem, 2.8vw, 1.3rem);}
+      .modal{width:90%;padding:28px 24px;}
+      .authy-title{font-size:1.95rem;}
+      .welcome-header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
+    @media (max-width:480px){
+      .hero-text{font-size: clamp(2rem, 5.5vw, 3rem);}
+      .hero-subtitle{font-size: clamp(0.95rem, 2.6vw, 1.15rem);}
+      .nav-link{font-size:0.95rem;}
+      .sign-up-btn{padding:0.55rem 0.9rem;font-size:0.95rem;}
+      .logo{font-size:1.25rem;}
+      .authy-title{font-size:1.8rem;}
+    }
+  </style>
 </head>
 <body>
-    <!-- Navigation -->
-    <nav class="navbar" id="navbar">
-        <div class="nav-container">
-            <div class="nav-logo">
-                <i class="fas fa-key"></i>
-                <span>LuaAuth</span>
-            </div>
-            <div class="nav-links" id="navLinks">
-                <a href="#" class="active">Dashboard</a>
-                <a href="#">Licenses</a>
-                <a href="#">Activity</a>
-                <a href="#">Docs</a>
-            </div>
-            <div class="nav-user" id="navUser">
-                <div class="user-menu">
-                    <span class="username" id="usernameDisplay">Loading...</span>
-                    <i class="fas fa-chevron-down"></i>
-                </div>
-                <button class="btn-logout" id="logoutBtn">
-                    <i class="fas fa-sign-out-alt"></i>
-                </button>
-            </div>
-            <button class="mobile-menu-btn" id="mobileMenuBtn">
-                <i class="fas fa-bars"></i>
-            </button>
-        </div>
-    </nav>
+  <!-- Navbar -->
+  <nav class="navbar">
+    <div class="logo">Authy</div>
+    <div class="nav-menu">
+      <a href="#" class="nav-link">Docs</a>
+      <a href="#" class="nav-link">Dashboard</a>
+      <a href="#" class="nav-link">Features</a>
+      <a href="#" class="nav-link">Pricing</a>
+      <a href="#" class="nav-link">FAQ</a>
+    </div>
+    <div class="nav-right" id="navRight">
+      <span class="sign-in" id="openLogin">Sign in</span>
+      <button class="sign-up-btn" id="openRegister">Sign up</button>
+    </div>
+  </nav>
 
-    <!-- Auth Container -->
-    <div class="auth-container" id="authContainer">
-        <div class="auth-card">
-            <div class="auth-header">
-                <i class="fas fa-key"></i>
-                <h2>Welcome to LuaAuth</h2>
-                <p>Secure key management for your Lua scripts</p>
-            </div>
-            <div class="auth-tabs">
-                <button class="tab-btn active" id="loginTab">Login</button>
-                <button class="tab-btn" id="registerTab">Register</button>
-            </div>
-            <div class="auth-form" id="loginForm">
-                <div class="form-group">
-                    <label><i class="fas fa-user"></i> Username</label>
-                    <input type="text" id="loginUsername" placeholder="Enter username">
-                </div>
-                <div class="form-group">
-                    <label><i class="fas fa-lock"></i> Password</label>
-                    <input type="password" id="loginPassword" placeholder="Enter password">
-                </div>
-                <button class="btn-primary" id="loginBtn">
-                    <i class="fas fa-sign-in-alt"></i> Login
-                </button>
-            </div>
-            <div class="auth-form hidden" id="registerForm">
-                <div class="form-group">
-                    <label><i class="fas fa-user"></i> Username</label>
-                    <input type="text" id="registerUsername" placeholder="Choose username">
-                </div>
-                <div class="form-group">
-                    <label><i class="fas fa-envelope"></i> Email</label>
-                    <input type="email" id="registerEmail" placeholder="Enter email">
-                </div>
-                <div class="form-group">
-                    <label><i class="fas fa-lock"></i> Password</label>
-                    <input type="password" id="registerPassword" placeholder="Choose password">
-                </div>
-                <button class="btn-primary" id="registerBtn">
-                    <i class="fas fa-user-plus"></i> Register
-                </button>
-            </div>
+  <!-- Hero Section (shown when not logged in) -->
+  <section class="hero-section" id="heroSection">
+    <div class="hero-text">
+      Protect Your Lua <span class="highlight">Scripts</span>
+    </div>
+    <div class="hero-subtitle">
+      The most secure and reliable authentication
+    </div>
+  </section>
+
+  <!-- Dashboard (shown when logged in) -->
+  <div class="dashboard hidden" id="dashboard">
+    <div class="welcome-card">
+      <div class="welcome-header">
+        <h1 class="welcome-title">Welcome back, <span id="username">User</span>!</h1>
+        <div>
+          <button class="create-key-btn" id="createKeyBtn">
+            <i class="fas fa-plus"></i> Create New Key
+          </button>
+          <button class="logout-btn" id="logoutBtn">Logout</button>
         </div>
+      </div>
+      
+      <div class="stats-grid" id="statsGrid">
+        <div class="stat-card">
+          <div class="stat-label">Total Keys</div>
+          <div class="stat-value" id="totalKeys">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Active Keys</div>
+          <div class="stat-value" id="activeKeys">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Online Now</div>
+          <div class="stat-value" id="onlineNow">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Expiring Soon</div>
+          <div class="stat-value" id="expiringSoon">0</div>
+        </div>
+      </div>
     </div>
 
-    <!-- Dashboard Container -->
-    <div class="dashboard-container hidden" id="dashboardContainer">
-        <div class="dashboard-header">
-            <div class="header-content">
-                <h1>Dashboard</h1>
-                <p>Manage your license keys and monitor activity</p>
-            </div>
-            <button class="btn-primary" id="createLicenseBtn">
-                <i class="fas fa-plus"></i> New License
-            </button>
-        </div>
-
-        <!-- Stats Grid -->
-        <div class="stats-grid" id="statsGrid">
-            <div class="stat-card">
-                <div class="stat-icon blue">
-                    <i class="fas fa-key"></i>
-                </div>
-                <div class="stat-info">
-                    <span class="stat-label">Total Licenses</span>
-                    <span class="stat-value" id="totalLicenses">0</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon green">
-                    <i class="fas fa-check-circle"></i>
-                </div>
-                <div class="stat-info">
-                    <span class="stat-label">Active</span>
-                    <span class="stat-value" id="activeLicenses">0</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon purple">
-                    <i class="fas fa-wifi"></i>
-                </div>
-                <div class="stat-info">
-                    <span class="stat-label">Online Now</span>
-                    <span class="stat-value" id="onlineNow">0</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon orange">
-                    <i class="fas fa-clock"></i>
-                </div>
-                <div class="stat-info">
-                    <span class="stat-label">Expiring Soon</span>
-                    <span class="stat-value" id="expiringSoon">0</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Licenses Table -->
-        <div class="licenses-section">
-            <div class="section-header">
-                <h2>Your Licenses</h2>
-                <div class="search-box">
-                    <i class="fas fa-search"></i>
-                    <input type="text" placeholder="Search keys..." id="searchLicenses">
-                </div>
-            </div>
-            <div class="table-container">
-                <table class="licenses-table" id="licensesTable">
-                    <thead>
-                        <tr>
-                            <th>Key</th>
-                            <th>Status</th>
-                            <th>HWID</th>
-                            <th>Expires</th>
-                            <th>Last Seen</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="licensesBody">
-                        <tr>
-                            <td colspan="6" class="loading-row">
-                                <i class="fas fa-spinner fa-spin"></i> Loading licenses...
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- Recent Activity -->
-        <div class="activity-section">
-            <h2>Recent Activity</h2>
-            <div class="activity-list" id="activityList">
-                <div class="loading-activity">
-                    <i class="fas fa-spinner fa-spin"></i> Loading activity...
-                </div>
-            </div>
-        </div>
+    <div class="keys-table">
+      <h2>Your License Keys</h2>
+      <table id="keysTable">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Status</th>
+            <th>HWID</th>
+            <th>Expires</th>
+            <th>Last Seen</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="keysBody">
+          <tr>
+            <td colspan="6" style="text-align: center; padding: 40px; color: #666;">
+              No keys yet. Create your first one!
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
+  </div>
 
-    <!-- Create License Modal -->
-    <div class="modal" id="createLicenseModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Create New License</h3>
-                <button class="close-btn" id="closeModalBtn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="form-group">
-                    <label>Duration (days)</label>
-                    <select id="licenseDuration">
-                        <option value="7">7 days</option>
-                        <option value="30" selected>30 days</option>
-                        <option value="90">90 days</option>
-                        <option value="365">1 year</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Max HWID Resets</label>
-                    <select id="licenseResets">
-                        <option value="1">1 reset</option>
-                        <option value="3" selected>3 resets</option>
-                        <option value="5">5 resets</option>
-                        <option value="10">10 resets</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Note (optional)</label>
-                    <input type="text" id="licenseNote" placeholder="e.g., VIP customer">
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn-secondary" id="cancelModalBtn">Cancel</button>
-                <button class="btn-primary" id="confirmCreateBtn">
-                    <i class="fas fa-plus"></i> Create License
-                </button>
-            </div>
-        </div>
+  <!-- Login Modal -->
+  <div class="modal-overlay" id="loginModal">
+    <div class="modal">
+      <span class="modal-close" id="closeLoginModal">×</span>
+      <h2 class="authy-title">Welcome Back</h2>
+      <div class="floating-input">
+        <input type="text" id="loginUsername" placeholder="">
+        <label for="loginUsername">Username</label>
+        <div class="notch-cover"></div>
+      </div>
+      <div class="floating-input">
+        <input type="password" id="loginPassword" placeholder="">
+        <label for="loginPassword">Password</label>
+        <div class="notch-cover"></div>
+      </div>
+      <button class="login-btn" id="loginSubmit">Log in</button>
+      <div class="terms">
+        Don't have an account? <a href="#" id="switchToRegister">Sign up</a>
+      </div>
     </div>
+  </div>
 
-    <!-- Reset HWID Modal -->
-    <div class="modal" id="resetHWIDModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Reset HWID</h3>
-                <button class="close-btn" id="closeResetModalBtn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="warning-icon">
-                    <i class="fas fa-exclamation-triangle"></i>
-                </div>
-                <p>Are you sure you want to reset the HWID for <strong id="resetKeyDisplay"></strong>?</p>
-                <p class="warning-text">This will unbind the current hardware ID. The user will need to authenticate again.</p>
-                <div class="form-group">
-                    <label>
-                        <input type="checkbox" id="confirmReset">
-                        I understand this action cannot be undone
-                    </label>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn-secondary" id="cancelResetBtn">Cancel</button>
-                <button class="btn-danger" id="confirmResetBtn" disabled>
-                    <i class="fas fa-undo-alt"></i> Reset HWID
-                </button>
-            </div>
-        </div>
+  <!-- Register Modal -->
+  <div class="modal-overlay" id="registerModal">
+    <div class="modal">
+      <span class="modal-close" id="closeRegisterModal">×</span>
+      <h2 class="authy-title">Create Account</h2>
+      <div class="floating-input">
+        <input type="text" id="registerUsername" placeholder="">
+        <label for="registerUsername">Username</label>
+        <div class="notch-cover"></div>
+      </div>
+      <div class="floating-input">
+        <input type="email" id="registerEmail" placeholder="">
+        <label for="registerEmail">Email</label>
+        <div class="notch-cover"></div>
+      </div>
+      <div class="floating-input">
+        <input type="password" id="registerPassword" placeholder="">
+        <label for="registerPassword">Password</label>
+        <div class="notch-cover"></div>
+      </div>
+      <button class="login-btn" id="registerSubmit">Sign up</button>
+      <div class="terms">
+        Already have an account? <a href="#" id="switchToLogin">Sign in</a>
+      </div>
     </div>
+  </div>
 
-    <!-- Toast -->
-    <div class="toast" id="toast">
-        <div class="toast-content">
-            <i class="fas fa-check-circle" id="toastIcon"></i>
-            <span id="toastMessage">Notification</span>
-        </div>
+  <!-- Create Key Modal -->
+  <div class="modal-overlay" id="createKeyModal">
+    <div class="modal create-key-modal">
+      <span class="modal-close" id="closeCreateModal">×</span>
+      <h2 class="authy-title">Create License Key</h2>
+      <select class="duration-select" id="keyDuration">
+        <option value="7">7 days</option>
+        <option value="30" selected>30 days</option>
+        <option value="90">90 days</option>
+        <option value="365">1 year</option>
+      </select>
+      <input type="text" class="note-input" id="keyNote" placeholder="Note (optional)">
+      <button class="login-btn" id="createKeySubmit">Generate Key</button>
     </div>
+  </div>
 
-    <script>
-        // API Configuration
-        const API_BASE_URL = window.location.origin;
+  <!-- Toast Notification -->
+  <div class="toast" id="toast">
+    <span id="toastMessage"></span>
+  </div>
 
-        // State
-        let token = localStorage.getItem('token');
-        let currentUser = null;
+  <script>
+    // API Base URL
+    const API_BASE_URL = window.location.origin;
 
-        // DOM Elements
-        const navbar = document.getElementById('navbar');
-        const authContainer = document.getElementById('authContainer');
-        const dashboardContainer = document.getElementById('dashboardContainer');
-        const loginForm = document.getElementById('loginForm');
-        const registerForm = document.getElementById('registerForm');
-        const loginTab = document.getElementById('loginTab');
-        const registerTab = document.getElementById('registerTab');
-        const loginBtn = document.getElementById('loginBtn');
-        const registerBtn = document.getElementById('registerBtn');
-        const logoutBtn = document.getElementById('logoutBtn');
-        const usernameDisplay = document.getElementById('usernameDisplay');
-        const createLicenseBtn = document.getElementById('createLicenseBtn');
-        const createLicenseModal = document.getElementById('createLicenseModal');
-        const resetHWIDModal = document.getElementById('resetHWIDModal');
-        const toast = document.getElementById('toast');
-        const toastMessage = document.getElementById('toastMessage');
-        const toastIcon = document.getElementById('toastIcon');
+    // State
+    let token = localStorage.getItem('token');
+    let currentUser = null;
 
-        // Scroll effect
-        window.addEventListener('scroll', () => {
-            if (window.scrollY > 50) {
-                navbar.classList.add('scrolled');
-            } else {
-                navbar.classList.remove('scrolled');
-            }
-        });
+    // DOM Elements
+    const heroSection = document.getElementById('heroSection');
+    const dashboard = document.getElementById('dashboard');
+    const navRight = document.getElementById('navRight');
+    const usernameSpan = document.getElementById('username');
+    const openLoginBtn = document.getElementById('openLogin');
+    const openRegisterBtn = document.getElementById('openRegister');
+    const loginModal = document.getElementById('loginModal');
+    const registerModal = document.getElementById('registerModal');
+    const createKeyModal = document.getElementById('createKeyModal');
+    const createKeyBtn = document.getElementById('createKeyBtn');
+    const logoutBtn = document.getElementById('logoutBtn');
+    const toast = document.getElementById('toast');
+    const toastMessage = document.getElementById('toastMessage');
 
-        // Mobile menu
-        document.getElementById('mobileMenuBtn').addEventListener('click', () => {
-            document.getElementById('navLinks').classList.toggle('show');
-        });
+    // Modal close buttons
+    const closeLogin = document.getElementById('closeLoginModal');
+    const closeRegister = document.getElementById('closeRegisterModal');
+    const closeCreate = document.getElementById('closeCreateModal');
 
-        // Tab switching
-        loginTab.addEventListener('click', () => {
-            loginTab.classList.add('active');
-            registerTab.classList.remove('active');
-            loginForm.classList.remove('hidden');
-            registerForm.classList.add('hidden');
-        });
+    // Switch between modals
+    document.getElementById('switchToRegister')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      loginModal.classList.remove('show');
+      setTimeout(() => {
+        loginModal.style.display = 'none';
+        registerModal.style.display = 'flex';
+        setTimeout(() => registerModal.classList.add('show'), 10);
+      }, 300);
+    });
 
-        registerTab.addEventListener('click', () => {
-            registerTab.classList.add('active');
-            loginTab.classList.remove('active');
-            registerForm.classList.remove('hidden');
-            loginForm.classList.add('hidden');
-        });
+    document.getElementById('switchToLogin')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      registerModal.classList.remove('show');
+      setTimeout(() => {
+        registerModal.style.display = 'none';
+        loginModal.style.display = 'flex';
+        setTimeout(() => loginModal.classList.add('show'), 10);
+      }, 300);
+    });
 
-        // Toast
-        function showToast(message, type = 'success') {
-            toastMessage.textContent = message;
-            toast.className = `toast show ${type}`;
-            
-            switch(type) {
-                case 'success':
-                    toastIcon.className = 'fas fa-check-circle';
-                    break;
-                case 'error':
-                    toastIcon.className = 'fas fa-exclamation-circle';
-                    break;
-                case 'info':
-                    toastIcon.className = 'fas fa-info-circle';
-                    break;
-            }
-            
-            setTimeout(() => {
-                toast.classList.remove('show');
-            }, 3000);
+    // Toast function
+    function showToast(message, type = 'success') {
+      toastMessage.textContent = message;
+      toast.className = `toast show ${type}`;
+      setTimeout(() => {
+        toast.classList.remove('show');
+      }, 3000);
+    }
+
+    // API call function
+    async function apiCall(endpoint, method = 'GET', data = null) {
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+      
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const options = {
+        method,
+        headers
+      };
+      
+      if (data) {
+        options.body = JSON.stringify(data);
+      }
+      
+      try {
+        const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
+        const result = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(result.detail || 'API call failed');
         }
+        
+        return result;
+      } catch (error) {
+        showToast(error.message, 'error');
+        throw error;
+      }
+    }
 
-        // API call
-        async function apiCall(endpoint, method = 'GET', data = null) {
-            const headers = {
-                'Content-Type': 'application/json'
-            };
-            
-            if (token) {
-                headers['Authorization'] = `Bearer ${token}`;
-            }
-            
-            const options = {
-                method,
-                headers
-            };
-            
-            if (data) {
-                options.body = JSON.stringify(data);
-            }
-            
-            try {
-                const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
-                const result = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(result.detail || 'API call failed');
-                }
-                
-                return result;
-            } catch (error) {
-                showToast(error.message, 'error');
-                throw error;
-            }
+    // Load user data and dashboard
+    async function loadDashboard() {
+      try {
+        currentUser = await apiCall('/api/user/me');
+        usernameSpan.textContent = currentUser.username;
+        
+        await Promise.all([
+          loadStats(),
+          loadLicenses()
+        ]);
+        
+        heroSection.classList.add('hidden');
+        dashboard.classList.remove('hidden');
+      } catch (error) {
+        console.error('Failed to load dashboard:', error);
+        logout();
+      }
+    }
+
+    // Load stats
+    async function loadStats() {
+      try {
+        const stats = await apiCall('/api/stats');
+        document.getElementById('totalKeys').textContent = stats.total_licenses;
+        document.getElementById('activeKeys').textContent = stats.active_licenses;
+        document.getElementById('onlineNow').textContent = stats.online_now;
+        document.getElementById('expiringSoon').textContent = stats.expiring_soon;
+      } catch (error) {
+        console.error('Failed to load stats:', error);
+      }
+    }
+
+    // Load licenses
+    async function loadLicenses() {
+      try {
+        const licenses = await apiCall('/api/licenses');
+        const tbody = document.getElementById('keysBody');
+        
+        if (licenses.length === 0) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="6" style="text-align: center; padding: 40px; color: #666;">
+                No keys yet. Click "Create New Key" to get started!
+              </td>
+            </tr>
+          `;
+          return;
         }
+        
+        tbody.innerHTML = licenses.map(lic => {
+          const statusClass = lic.status === 'active' ? 'status-active' : 'status-expired';
+          const statusText = lic.online ? '🟢 ONLINE' : (lic.status === 'active' ? 'ACTIVE' : 'EXPIRED');
+          
+          return `
+            <tr>
+              <td class="key-cell">${lic.key}</td>
+              <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+              <td>${lic.hwid ? lic.hwid.substring(0, 8) + '...' : 'Not bound'}</td>
+              <td>${new Date(lic.expires_at).toLocaleDateString()}</td>
+              <td>${lic.last_heartbeat ? new Date(lic.last_heartbeat).toLocaleString() : 'Never'}</td>
+              <td>
+                <button class="action-btn" onclick="resetHWID('${lic.key}')">Reset HWID</button>
+                <button class="action-btn delete" onclick="deleteKey('${lic.key}')">Delete</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      } catch (error) {
+        console.error('Failed to load licenses:', error);
+      }
+    }
 
-        // Login
-        loginBtn.addEventListener('click', async () => {
-            const username = document.getElementById('loginUsername').value;
-            const password = document.getElementById('loginPassword').value;
-            
-            if (!username || !password) {
-                showToast('Please fill in all fields', 'error');
-                return;
-            }
-            
-            try {
-                const result = await apiCall('/api/auth/login', 'POST', { username, password });
-                token = result.access_token;
-                localStorage.setItem('token', token);
-                
-                await loadUserData();
-                showToast('Login successful!');
-                
-                authContainer.classList.add('hidden');
-                dashboardContainer.classList.remove('hidden');
-            } catch (error) {}
-        });
+    // Reset HWID
+    window.resetHWID = async (key) => {
+      if (!confirm(`Are you sure you want to reset HWID for ${key}?`)) return;
+      
+      try {
+        await apiCall('/api/licenses/reset-hwid', 'POST', { key, confirm: true });
+        showToast('HWID reset successfully!');
+        loadLicenses();
+      } catch (error) {}
+    };
 
-        // Register
-        registerBtn.addEventListener('click', async () => {
-            const username = document.getElementById('registerUsername').value;
-            const email = document.getElementById('registerEmail').value;
-            const password = document.getElementById('registerPassword').value;
-            
-            if (!username || !email || !password) {
-                showToast('Please fill in all fields', 'error');
-                return;
-            }
-            
-            try {
-                const result = await apiCall('/api/auth/register', 'POST', { username, email, password });
-                token = result.access_token;
-                localStorage.setItem('token', token);
-                
-                await loadUserData();
-                showToast('Registration successful!');
-                
-                authContainer.classList.add('hidden');
-                dashboardContainer.classList.remove('hidden');
-            } catch (error) {}
-        });
+    // Delete key
+    window.deleteKey = async (key) => {
+      if (!confirm(`Are you sure you want to delete ${key}? This cannot be undone.`)) return;
+      
+      try {
+        await apiCall(`/api/licenses/${key}`, 'DELETE');
+        showToast('Key deleted successfully!');
+        Promise.all([loadStats(), loadLicenses()]);
+      } catch (error) {}
+    };
 
-        // Logout
-        logoutBtn.addEventListener('click', () => {
-            token = null;
-            localStorage.removeItem('token');
-            authContainer.classList.remove('hidden');
-            dashboardContainer.classList.add('hidden');
-            showToast('Logged out successfully');
-        });
+    // Logout function
+    function logout() {
+      token = null;
+      localStorage.removeItem('token');
+      heroSection.classList.remove('hidden');
+      dashboard.classList.add('hidden');
+      showToast('Logged out successfully');
+    }
 
-        // Load user data
-        async function loadUserData() {
-            try {
-                currentUser = await apiCall('/api/user/me');
-                usernameDisplay.textContent = currentUser.username;
-                
-                await Promise.all([
-                    loadStats(),
-                    loadLicenses(),
-                    loadActivity()
-                ]);
-            } catch (error) {
-                logoutBtn.click();
-            }
+    // ========== EVENT LISTENERS ==========
+
+    // Open modals
+    openLoginBtn.addEventListener('click', () => {
+      loginModal.style.display = 'flex';
+      setTimeout(() => loginModal.classList.add('show'), 10);
+    });
+
+    openRegisterBtn.addEventListener('click', () => {
+      registerModal.style.display = 'flex';
+      setTimeout(() => registerModal.classList.add('show'), 10);
+    });
+
+    createKeyBtn?.addEventListener('click', () => {
+      createKeyModal.style.display = 'flex';
+      setTimeout(() => createKeyModal.classList.add('show'), 10);
+    });
+
+    // Close modals
+    closeLogin.addEventListener('click', () => {
+      loginModal.classList.remove('show');
+      setTimeout(() => loginModal.style.display = 'none', 300);
+    });
+
+    closeRegister.addEventListener('click', () => {
+      registerModal.classList.remove('show');
+      setTimeout(() => registerModal.style.display = 'none', 300);
+    });
+
+    closeCreate.addEventListener('click', () => {
+      createKeyModal.classList.remove('show');
+      setTimeout(() => createKeyModal.style.display = 'none', 300);
+    });
+
+    // Close on overlay click
+    [loginModal, registerModal, createKeyModal].forEach(modal => {
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+          modal.classList.remove('show');
+          setTimeout(() => modal.style.display = 'none', 300);
         }
+      });
+    });
 
-        // Load stats
-        async function loadStats() {
-            try {
-                const stats = await apiCall('/api/stats');
-                
-                document.getElementById('totalLicenses').textContent = stats.total_licenses;
-                document.getElementById('activeLicenses').textContent = stats.active_licenses;
-                document.getElementById('onlineNow').textContent = stats.online_now;
-                document.getElementById('expiringSoon').textContent = stats.expiring_soon;
-            } catch (error) {
-                console.error('Failed to load stats:', error);
-            }
-        }
+    // Login submit
+    document.getElementById('loginSubmit').addEventListener('click', async () => {
+      const username = document.getElementById('loginUsername').value;
+      const password = document.getElementById('loginPassword').value;
+      
+      if (!username || !password) {
+        showToast('Please fill in all fields', 'error');
+        return;
+      }
+      
+      try {
+        const result = await apiCall('/api/auth/login', 'POST', { username, password });
+        token = result.access_token;
+        localStorage.setItem('token', token);
+        
+        loginModal.classList.remove('show');
+        setTimeout(() => loginModal.style.display = 'none', 300);
+        
+        await loadDashboard();
+        showToast('Login successful!');
+      } catch (error) {}
+    });
 
-        // Load licenses
-        async function loadLicenses() {
-            try {
-                const licenses = await apiCall('/api/licenses');
-                
-                const tbody = document.getElementById('licensesBody');
-                
-                if (licenses.length === 0) {
-                    tbody.innerHTML = `
-                        <tr>
-                            <td colspan="6" style="text-align: center; padding: 3rem; color: var(--text-secondary);">
-                                <i class="fas fa-key" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
-                                <p>No licenses yet. Create your first one!</p>
-                            </td>
-                        </tr>
-                    `;
-                    return;
-                }
-                
-                tbody.innerHTML = licenses.map(license => {
-                    const statusClass = license.online ? 'active' : license.status;
-                    const statusText = license.online ? 'ONLINE' : (license.status.toUpperCase() || 'OFFLINE');
-                    
-                    return `
-                        <tr>
-                            <td><code style="color: var(--accent-blue);">${license.key}</code></td>
-                            <td>
-                                <span class="status-badge ${statusClass}">
-                                    ${license.online ? '🟢' : '⚫'} ${statusText}
-                                </span>
-                            </td>
-                            <td class="hwid-cell">
-                                ${license.hwid ? license.hwid.substring(0, 8) + '...' : 'Not bound'}
-                            </td>
-                            <td>${new Date(license.expires_at).toLocaleDateString()}</td>
-                            <td>${license.last_heartbeat ? new Date(license.last_heartbeat).toLocaleString() : 'Never'}</td>
-                            <td class="actions-cell">
-                                <button class="action-btn reset" onclick="openResetModal('${license.key}')" title="Reset HWID">
-                                    <i class="fas fa-undo-alt"></i>
-                                </button>
-                                <button class="action-btn delete" onclick="deleteLicense('${license.key}')" title="Delete License">
-                                    <i class="fas fa-trash"></i>
-                                </button>
-                            </td>
-                        </tr>
-                    `;
-                }).join('');
-            } catch (error) {
-                console.error('Failed to load licenses:', error);
-            }
-        }
+    // Register submit
+    document.getElementById('registerSubmit').addEventListener('click', async () => {
+      const username = document.getElementById('registerUsername').value;
+      const email = document.getElementById('registerEmail').value;
+      const password = document.getElementById('registerPassword').value;
+      
+      if (!username || !email || !password) {
+        showToast('Please fill in all fields', 'error');
+        return;
+      }
+      
+      try {
+        const result = await apiCall('/api/auth/register', 'POST', { username, email, password });
+        token = result.access_token;
+        localStorage.setItem('token', token);
+        
+        registerModal.classList.remove('show');
+        setTimeout(() => registerModal.style.display = 'none', 300);
+        
+        await loadDashboard();
+        showToast('Registration successful!');
+      } catch (error) {}
+    });
 
-        // Load activity
-        async function loadActivity() {
-            try {
-                const activity = await apiCall('/api/activity');
-                
-                const activityList = document.getElementById('activityList');
-                
-                if (activity.length === 0) {
-                    activityList.innerHTML = `
-                        <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                            <i class="fas fa-history" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
-                            <p>No activity yet</p>
-                        </div>
-                    `;
-                    return;
-                }
-                
-                activityList.innerHTML = activity.map(item => `
-                    <div class="activity-item">
-                        <div class="activity-icon">
-                            <i class="fas fa-heartbeat"></i>
-                        </div>
-                        <div class="activity-details">
-                            <div class="activity-header">
-                                <span class="activity-key">${item.key}</span>
-                                <span class="activity-time">${new Date(item.timestamp).toLocaleString()}</span>
-                            </div>
-                            <div class="activity-hwid">
-                                <i class="fas fa-microchip"></i> ${item.hwid}
-                                <span style="margin-left: 1rem;"><i class="fas fa-ip"></i> ${item.ip}</span>
-                            </div>
-                        </div>
-                    </div>
-                `).join('');
-            } catch (error) {
-                console.error('Failed to load activity:', error);
-            }
-        }
+    // Create key submit
+    document.getElementById('createKeySubmit').addEventListener('click', async () => {
+      const duration = parseInt(document.getElementById('keyDuration').value);
+      const note = document.getElementById('keyNote').value;
+      
+      try {
+        await apiCall('/api/licenses/create', 'POST', { duration_days: duration, note });
+        
+        createKeyModal.classList.remove('show');
+        setTimeout(() => createKeyModal.style.display = 'none', 300);
+        
+        document.getElementById('keyNote').value = '';
+        await Promise.all([loadStats(), loadLicenses()]);
+        showToast('License key created successfully!');
+      } catch (error) {}
+    });
 
-        // Create license modal
-        createLicenseBtn.addEventListener('click', () => {
-            createLicenseModal.classList.add('show');
-        });
+    // Logout
+    logoutBtn.addEventListener('click', logout);
 
-        document.getElementById('closeModalBtn').addEventListener('click', () => {
-            createLicenseModal.classList.remove('show');
-        });
+    // Check if already logged in
+    if (token) {
+      loadDashboard().catch(() => logout());
+    }
 
-        document.getElementById('cancelModalBtn').addEventListener('click', () => {
-            createLicenseModal.classList.remove('show');
-        });
-
-        document.getElementById('confirmCreateBtn').addEventListener('click', async () => {
-            const duration = parseInt(document.getElementById('licenseDuration').value);
-            const resets = parseInt(document.getElementById('licenseResets').value);
-            const note = document.getElementById('licenseNote').value;
-            
-            try {
-                await apiCall('/api/licenses/create', 'POST', {
-                    duration_days: duration,
-                    max_hwids: resets,
-                    note: note || null
-                });
-                
-                createLicenseModal.classList.remove('show');
-                showToast('License created successfully!');
-                
-                document.getElementById('licenseNote').value = '';
-                
-                await Promise.all([
-                    loadStats(),
-                    loadLicenses()
-                ]);
-            } catch (error) {}
-        });
-
-        // Reset HWID modal
-        window.openResetModal = (key) => {
-            currentResetKey = key;
-            document.getElementById('resetKeyDisplay').textContent = key;
-            document.getElementById('confirmReset').checked = false;
-            document.getElementById('confirmResetBtn').disabled = true;
-            resetHWIDModal.classList.add('show');
-        };
-
-        document.getElementById('closeResetModalBtn').addEventListener('click', () => {
-            resetHWIDModal.classList.remove('show');
-        });
-
-        document.getElementById('cancelResetBtn').addEventListener('click', () => {
-            resetHWIDModal.classList.remove('show');
-        });
-
-        document.getElementById('confirmReset').addEventListener('change', (e) => {
-            document.getElementById('confirmResetBtn').disabled = !e.target.checked;
-        });
-
-        document.getElementById('confirmResetBtn').addEventListener('click', async () => {
-            try {
-                await apiCall('/api/licenses/reset-hwid', 'POST', {
-                    key: currentResetKey,
-                    confirm: true
-                });
-                
-                resetHWIDModal.classList.remove('show');
-                showToast('HWID reset successfully!');
-                
-                await loadLicenses();
-            } catch (error) {}
-        });
-
-        // Delete license
-        window.deleteLicense = async (key) => {
-            if (!confirm(`Are you sure you want to delete license ${key}? This cannot be undone.`)) {
-                return;
-            }
-            
-            try {
-                await apiCall(`/api/licenses/${key}`, 'DELETE');
-                showToast('License deleted successfully!');
-                
-                await Promise.all([
-                    loadStats(),
-                    loadLicenses()
-                ]);
-            } catch (error) {}
-        };
-
-        // Search
-        document.getElementById('searchLicenses').addEventListener('input', (e) => {
-            const searchTerm = e.target.value.toLowerCase();
-            const rows = document.querySelectorAll('#licensesBody tr');
-            
-            rows.forEach(row => {
-                const text = row.textContent.toLowerCase();
-                row.style.display = text.includes(searchTerm) ? '' : 'none';
-            });
-        });
-
-        // Auto-refresh every 30 seconds
-        setInterval(async () => {
-            if (token) {
-                await Promise.all([
-                    loadStats(),
-                    loadLicenses(),
-                    loadActivity()
-                ]);
-            }
-        }, 30000);
-
-        // Check if logged in
-        if (token) {
-            loadUserData().then(() => {
-                authContainer.classList.add('hidden');
-                dashboardContainer.classList.remove('hidden');
-            }).catch(() => {
-                logoutBtn.click();
-            });
-        }
-
-        // Close modals on outside click
-        window.addEventListener('click', (e) => {
-            if (e.target === createLicenseModal) {
-                createLicenseModal.classList.remove('show');
-            }
-            if (e.target === resetHWIDModal) {
-                resetHWIDModal.classList.remove('show');
-            }
-        });
-    </script>
+    // Auto-refresh every 30 seconds
+    setInterval(async () => {
+      if (token && !dashboard.classList.contains('hidden')) {
+        await Promise.all([loadStats(), loadLicenses()]);
+      }
+    }, 30000);
+  </script>
 </body>
 </html>
 """
 
+# ========== FRONTEND ROUTES ==========
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     """Serve the frontend HTML"""
@@ -2079,7 +1581,7 @@ async def serve_frontend():
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def catch_all(full_path: str):
-    """Catch all routes to serve frontend for client-side routing"""
+    """Catch all routes to serve frontend"""
     return HTML_TEMPLATE
 
 # ========== RUN ==========

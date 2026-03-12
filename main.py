@@ -314,6 +314,25 @@ async def debug_db():
             "database_url_exists": bool(DATABASE_URL)
         }
 
+
+@app.get("/api/test-password")
+async def test_password():
+    """Test if password hashing works"""
+    try:
+        test_pass = "testpassword123"
+        hashed = pwd_context.hash(test_pass)
+        verified = pwd_context.verify(test_pass, hashed)
+        return {
+            "hashing_works": True,
+            "hash_preview": hashed[:20] + "...",
+            "verification": verified
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
 @app.get("/api/test-token")
 async def test_token():
     """Test if JWT token creation works"""

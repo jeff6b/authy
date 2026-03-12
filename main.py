@@ -7,11 +7,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 import asyncpg
 from dotenv import load_dotenv
 import uvicorn
@@ -24,23 +23,20 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 DATABASE_URL = os.getenv("DATABASE_URL")
+MASTER_API_KEY = "123"  # Hardcoded for now
 
 print("🚀 Starting Authy application...")
 print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
 print(f"🔑 SECRET_KEY exists: {bool(SECRET_KEY)}")
 
 # ========== PASSWORD HASHING ==========
-# Use direct bcrypt to avoid passlib issues
 def hash_password(password: str) -> str:
-    """Hash password using bcrypt directly"""
-    # Truncate to 72 bytes if needed (bcrypt limit)
     password_bytes = password.encode('utf-8')[:72]
     salt = bcrypt.gensalt(rounds=12)
     hashed = bcrypt.hashpw(password_bytes, salt)
     return hashed.decode('utf-8')
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password using bcrypt directly"""
     try:
         plain_bytes = plain_password.encode('utf-8')[:72]
         hashed_bytes = hashed_password.encode('utf-8')
@@ -63,7 +59,6 @@ class Database:
         self.pool = None
 
     async def connect(self):
-        """Create connection pool with better error handling"""
         print(f"🔌 Attempting to connect to database...")
         
         if not DATABASE_URL:
@@ -78,7 +73,6 @@ class Database:
                 command_timeout=60
             )
             
-            # Test the connection
             async with self.pool.acquire() as conn:
                 await conn.execute("SELECT 1")
                 print("✅ Database connection test successful!")
@@ -92,15 +86,13 @@ class Database:
             return False
 
     async def disconnect(self):
-        """Close connection pool"""
         if self.pool:
             await self.pool.close()
             print("✅ Database disconnected")
 
     async def init_db(self):
-        """Initialize database tables"""
         if not self.pool:
-            print("⚠️  Cannot init DB - no connection pool")
+            print("⚠️ Cannot init DB - no connection pool")
             return
             
         try:
@@ -115,35 +107,47 @@ class Database:
                         password_hash TEXT NOT NULL,
                         email TEXT UNIQUE NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        is_admin BOOLEAN DEFAULT FALSE,
-                        api_key TEXT UNIQUE
+                        is_admin BOOLEAN DEFAULT FALSE
                     )
                 ''')
                 print("✅ Users table ready")
                 
-                # Licenses table
+                # Scripts table
                 await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS licenses (
+                    CREATE TABLE IF NOT EXISTS scripts (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(name, user_id)
+                    )
+                ''')
+                print("✅ Scripts table ready")
+                
+                # Keys table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS keys (
                         id SERIAL PRIMARY KEY,
                         key TEXT UNIQUE NOT NULL,
-                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+                        nickname TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         expires_at TIMESTAMP NOT NULL,
                         last_heartbeat TIMESTAMP,
                         hwid TEXT,
+                        status TEXT DEFAULT 'active',
                         max_hwid_resets INTEGER DEFAULT 3,
                         hwid_resets_used INTEGER DEFAULT 0,
-                        status TEXT DEFAULT 'active',
                         note TEXT
                     )
                 ''')
-                print("✅ Licenses table ready")
+                print("✅ Keys table ready")
                 
                 # Heartbeat logs table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS heartbeat_logs (
                         id SERIAL PRIMARY KEY,
-                        license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+                        key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         hwid TEXT NOT NULL,
                         ip_address TEXT
@@ -161,16 +165,14 @@ db = Database()
 # ========== LIFESPAN HANDLER ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     print("🚀 Starting up...")
     try:
         await db.connect()
     except Exception as e:
-        print(f"⚠️  Startup error: {e}")
+        print(f"⚠️ Startup error: {e}")
     
     yield
     
-    # Shutdown
     print("🛑 Shutting down...")
     await db.disconnect()
 
@@ -178,7 +180,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Authy - Lua Auth System",
     description="Complete authentication system for Lua scripts",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -196,14 +198,12 @@ security = HTTPBearer(auto_error=False)
 
 # ========== HELPER FUNCTIONS ==========
 def create_access_token(data: dict):
-    """Create JWT token"""
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=7)
     to_encode.update({"exp": expire.timestamp()})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def verify_token(token: str):
-    """Verify JWT token"""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
@@ -211,7 +211,6 @@ def verify_token(token: str):
         return None
 
 async def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security)):
-    """Get current user from token"""
     if not auth:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -233,18 +232,18 @@ async def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security
     
     return dict(user)
 
-def generate_license_key():
-    """Generate a unique license key format: LUA-XXXX-XXXX-XXXX"""
+def generate_key():
+    """Generate a unique license key format: AUTHY-XXXX-XXXX-XXXX"""
     parts = []
     for _ in range(3):
         parts.append(uuid.uuid4().hex[:4].upper())
-    return f"LUA-{'-'.join(parts)}"
+    return f"AUTHY-{'-'.join(parts)}"
 
 # ========== PYDANTIC MODELS ==========
 class UserCreate(BaseModel):
     username: str
     password: str
-    email: str
+    api_key: str
 
 class UserLogin(BaseModel):
     username: str
@@ -254,14 +253,34 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str
 
-class LicenseCreate(BaseModel):
-    duration_days: int = 30
-    note: Optional[str] = None
+class ScriptCreate(BaseModel):
+    name: str
 
-class LicenseResponse(BaseModel):
+class ScriptResponse(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    key_count: int
+    active_keys: int
+
+class KeyCreate(BaseModel):
+    script_id: int
+    nickname: Optional[str] = None
+    duration_days: int = 30
+
+class KeyResponse(BaseModel):
     key: str
+    nickname: Optional[str]
     expires_at: str
     status: str
+
+class KeyAction(BaseModel):
+    key: str
+    action: str  # 'activate', 'deactivate', 'kick'
+
+class KeyNickname(BaseModel):
+    key: str
+    nickname: str
 
 class HeartbeatRequest(BaseModel):
     key: str
@@ -277,194 +296,16 @@ class HWIDResetRequest(BaseModel):
     key: str
     confirm: bool = False
 
-# ========== DEBUG ENDPOINTS ==========
-@app.get("/api/debug")
-async def debug_db():
-    """Debug endpoint to check database connection"""
-    try:
-        if not db.pool:
-            return {
-                "status": "error", 
-                "message": "Database pool not initialized",
-                "database_url_exists": bool(DATABASE_URL)
-            }
-        
-        async with db.pool.acquire() as conn:
-            result = await conn.fetchval("SELECT 1")
-            # Check if tables exist
-            tables = await conn.fetch("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-            """)
-            table_list = [t['table_name'] for t in tables]
-            
-            return {
-                "status": "ok", 
-                "message": "Database connected",
-                "test_query": result,
-                "pool_size": db.pool.get_size(),
-                "tables": table_list
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e),
-            "type": type(e).__name__,
-            "database_url_exists": bool(DATABASE_URL)
-        }
-
-@app.get("/api/test-bcrypt")
-async def test_bcrypt():
-    """Test bcrypt directly"""
-    try:
-        password = "test123"
-        hashed = hash_password(password)
-        verified = verify_password(password, hashed)
-        
-        return {
-            "status": "ok",
-            "password": password,
-            "hash_preview": hashed[:30] + "...",
-            "verification": verified,
-            "message": "Bcrypt is working"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "type": type(e).__name__
-        }
-
-# ========== PUBLIC API ENDPOINTS (for Lua clients) ==========
-@app.post("/api/heartbeat", response_model=HeartbeatResponse)
-async def heartbeat(request: HeartbeatRequest, req: Request):
-    """Lua clients call this every 60 seconds"""
-    if not db.pool:
-        return HeartbeatResponse(
-            valid=False, 
-            status="error", 
-            message="Database not available"
-        )
-    
-    async with db.pool.acquire() as conn:
-        # Get license
-        license = await conn.fetchrow(
-            "SELECT * FROM licenses WHERE key = $1",
-            request.key
-        )
-        
-        if not license:
-            return HeartbeatResponse(
-                valid=False, 
-                status="invalid", 
-                message="Key not found"
-            )
-        
-        license = dict(license)
-        expires_at = license['expires_at']
-        
-        # Check if expired
-        if expires_at < datetime.now():
-            await conn.execute(
-                "UPDATE licenses SET status = 'expired' WHERE id = $1",
-                license['id']
-            )
-            return HeartbeatResponse(
-                valid=False, 
-                status="expired", 
-                message="Key expired"
-            )
-        
-        # Check if suspended
-        if license['status'] != 'active':
-            return HeartbeatResponse(
-                valid=False, 
-                status=license['status'], 
-                message=f"Key {license['status']}"
-            )
-        
-        # First time this HWID? If no HWID set, bind it
-        client_ip = req.client.host if req.client else "unknown"
-        
-        if not license['hwid']:
-            await conn.execute(
-                "UPDATE licenses SET hwid = $1, last_heartbeat = CURRENT_TIMESTAMP WHERE id = $2",
-                request.hwid, license['id']
-            )
-        elif license['hwid'] != request.hwid:
-            # Wrong HWID
-            return HeartbeatResponse(
-                valid=False, 
-                status="hwid_mismatch", 
-                message="Invalid HWID"
-            )
-        else:
-            # Update heartbeat
-            await conn.execute(
-                "UPDATE licenses SET last_heartbeat = CURRENT_TIMESTAMP WHERE id = $1",
-                license['id']
-            )
-        
-        # Log the heartbeat
-        await conn.execute(
-            "INSERT INTO heartbeat_logs (license_id, hwid, ip_address) VALUES ($1, $2, $3)",
-            license['id'], request.hwid, client_ip
-        )
-        
-        # Calculate days remaining
-        days_left = (expires_at - datetime.now()).days
-        
-        return HeartbeatResponse(
-            valid=True, 
-            status="active", 
-            message=f"Valid - {days_left} days remaining",
-            expires_at=expires_at.isoformat()
-        )
-
-@app.post("/api/validate")
-async def validate_key(request: HeartbeatRequest):
-    """Simple validation without heartbeat logging"""
-    if not db.pool:
-        return {"valid": False, "reason": "database_error"}
-    
-    async with db.pool.acquire() as conn:
-        license = await conn.fetchrow(
-            "SELECT * FROM licenses WHERE key = $1",
-            request.key
-        )
-        
-        if not license:
-            return {"valid": False, "reason": "not_found"}
-        
-        license = dict(license)
-        
-        if license['expires_at'] < datetime.now():
-            return {"valid": False, "reason": "expired"}
-        
-        if license['status'] != 'active':
-            return {"valid": False, "reason": license['status']}
-        
-        if license['hwid'] and license['hwid'] != request.hwid:
-            return {"valid": False, "reason": "hwid_mismatch"}
-        
-        # If no HWID bound yet, bind it now
-        if not license['hwid']:
-            await conn.execute(
-                "UPDATE licenses SET hwid = $1 WHERE id = $2",
-                request.hwid, license['id']
-            )
-        
-        return {
-            "valid": True, 
-            "expires": license['expires_at'].isoformat()
-        }
-
 # ========== AUTH ENDPOINTS ==========
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user: UserCreate):
-    """Register a new user"""
+    """Register a new user using API key"""
     print(f"📝 Register attempt: {user.username}")
+    
+    # Check API key
+    if user.api_key != MASTER_API_KEY:
+        print(f"❌ Invalid API key: {user.api_key}")
+        raise HTTPException(status_code=401, detail="Invalid API key")
     
     if not db.pool:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -474,19 +315,18 @@ async def register(user: UserCreate):
             # Check if user exists
             existing = await conn.fetchval(
                 "SELECT id FROM users WHERE username = $1 OR email = $2",
-                user.username, user.email
+                user.username, f"{user.username}@placeholder.com"
             )
             
             if existing:
-                raise HTTPException(status_code=400, detail="Username or email already taken")
+                raise HTTPException(status_code=400, detail="Username already taken")
             
-            # Hash password and create user
+            # Create user with placeholder email
             hashed = hash_password(user.password)
-            api_key = secrets.token_urlsafe(32)
             
             user_id = await conn.fetchval(
-                "INSERT INTO users (username, password_hash, email, api_key) VALUES ($1, $2, $3, $4) RETURNING id",
-                user.username, hashed, user.email, api_key
+                "INSERT INTO users (username, password_hash, email) VALUES ($1, $2, $3) RETURNING id",
+                user.username, hashed, f"{user.username}@authy.local"
             )
             
             # Create token
@@ -511,7 +351,6 @@ async def login(user: UserLogin):
     
     try:
         async with db.pool.acquire() as conn:
-            # Get user
             db_user = await conn.fetchrow(
                 "SELECT * FROM users WHERE username = $1",
                 user.username
@@ -521,12 +360,10 @@ async def login(user: UserLogin):
                 print(f"❌ User not found: {user.username}")
                 raise HTTPException(status_code=401, detail="Invalid credentials")
             
-            # Verify password
             if not verify_password(user.password, db_user['password_hash']):
                 print(f"❌ Invalid password for: {user.username}")
                 raise HTTPException(status_code=401, detail="Invalid credentials")
             
-            # Create token
             token = create_access_token({"sub": user.username, "id": db_user['id']})
             
             print(f"✅ Login successful: {user.username}")
@@ -540,139 +377,313 @@ async def login(user: UserLogin):
 
 @app.get("/api/user/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
-    """Get current user info"""
     return current_user
 
-# ========== LICENSE MANAGEMENT ==========
-@app.post("/api/licenses/create", response_model=LicenseResponse)
-async def create_license(
-    license_data: LicenseCreate,
+# ========== SCRIPT MANAGEMENT ==========
+@app.post("/api/scripts/create")
+async def create_script(
+    script_data: ScriptCreate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Create a new license key"""
+    """Create a new script"""
     if not db.pool:
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Generate unique key
-        key = generate_license_key()
-        while await conn.fetchval("SELECT id FROM licenses WHERE key = $1", key):
-            key = generate_license_key()
-        
-        # Create license
-        expires_at = datetime.now() + timedelta(days=license_data.duration_days)
-        await conn.fetchval(
-            """
-            INSERT INTO licenses 
-            (key, user_id, expires_at, note, max_hwid_resets) 
-            VALUES ($1, $2, $3, $4, $5) 
-            RETURNING id
-            """,
-            key, current_user['id'], expires_at, license_data.note, 3
+        # Check if script name already exists for this user
+        existing = await conn.fetchval(
+            "SELECT id FROM scripts WHERE name = $1 AND user_id = $2",
+            script_data.name, current_user['id']
         )
         
-        return LicenseResponse(
-            key=key,
-            expires_at=expires_at.isoformat(),
-            status="active"
+        if existing:
+            raise HTTPException(status_code=400, detail="Script name already exists")
+        
+        script_id = await conn.fetchval(
+            "INSERT INTO scripts (name, user_id) VALUES ($1, $2) RETURNING id",
+            script_data.name, current_user['id']
         )
+        
+        return {
+            "id": script_id,
+            "name": script_data.name,
+            "message": "Script created successfully"
+        }
 
-@app.get("/api/licenses")
-async def get_licenses(current_user: dict = Depends(get_current_user)):
-    """Get all licenses for current user"""
+@app.get("/api/scripts")
+async def get_scripts(current_user: dict = Depends(get_current_user)):
+    """Get all scripts for current user"""
     if not db.pool:
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        licenses = await conn.fetch(
+        scripts = await conn.fetch(
             """
-            SELECT * FROM licenses 
-            WHERE user_id = $1 
-            ORDER BY created_at DESC
+            SELECT s.*, 
+                   COUNT(k.id) as key_count,
+                   COUNT(CASE WHEN k.status = 'active' AND k.expires_at > CURRENT_TIMESTAMP THEN 1 END) as active_keys
+            FROM scripts s
+            LEFT JOIN keys k ON s.id = k.script_id
+            WHERE s.user_id = $1
+            GROUP BY s.id
+            ORDER BY s.created_at DESC
             """,
             current_user['id']
         )
         
         result = []
-        for lic in licenses:
-            lic = dict(lic)
-            # Check if online (heartbeat in last 2 minutes)
-            online = False
-            if lic['last_heartbeat']:
-                online = (datetime.now() - lic['last_heartbeat']).seconds < 120
-            
+        for script in scripts:
             result.append({
-                "key": lic['key'],
-                "created_at": lic['created_at'].isoformat() if lic['created_at'] else None,
-                "expires_at": lic['expires_at'].isoformat() if lic['expires_at'] else None,
-                "last_heartbeat": lic['last_heartbeat'].isoformat() if lic['last_heartbeat'] else None,
-                "hwid": lic['hwid'],
-                "status": lic['status'],
-                "hwid_resets_used": lic['hwid_resets_used'],
-                "max_hwid_resets": lic['max_hwid_resets'],
-                "note": lic['note'],
-                "online": online
+                "id": script['id'],
+                "name": script['name'],
+                "created_at": script['created_at'].isoformat(),
+                "key_count": script['key_count'],
+                "active_keys": script['active_keys']
             })
         
         return result
 
-@app.post("/api/licenses/reset-hwid")
-async def reset_hwid(
-    request: HWIDResetRequest,
+@app.delete("/api/scripts/{script_id}")
+async def delete_script(
+    script_id: int,
     current_user: dict = Depends(get_current_user)
 ):
-    """Reset HWID for a license"""
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    async with db.pool.acquire() as conn:
-        license = await conn.fetchrow(
-            "SELECT * FROM licenses WHERE key = $1 AND user_id = $2",
-            request.key, current_user['id']
-        )
-        
-        if not license:
-            raise HTTPException(status_code=404, detail="License not found")
-        
-        license = dict(license)
-        
-        if license['hwid_resets_used'] >= license['max_hwid_resets']:
-            raise HTTPException(status_code=400, detail="No HWID resets remaining")
-        
-        if not request.confirm:
-            return {
-                "warning": f"This will reset HWID for {request.key}. {license['max_hwid_resets'] - license['hwid_resets_used'] - 1} resets remaining.",
-                "confirm_needed": True
-            }
-        
-        # Reset HWID
-        await conn.execute(
-            "UPDATE licenses SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1 WHERE id = $1",
-            license['id']
-        )
-        
-        return {
-            "success": True,
-            "message": f"HWID reset for {request.key}. {license['max_hwid_resets'] - license['hwid_resets_used'] - 1} resets remaining."
-        }
-
-@app.delete("/api/licenses/{key}")
-async def delete_license(
-    key: str,
-    current_user: dict = Depends(get_current_user)
-):
-    """Delete a license"""
+    """Delete a script and all its keys"""
     if not db.pool:
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
         result = await conn.execute(
-            "DELETE FROM licenses WHERE key = $1 AND user_id = $2",
+            "DELETE FROM scripts WHERE id = $1 AND user_id = $2",
+            script_id, current_user['id']
+        )
+        
+        if result.split()[-1] == "0":
+            raise HTTPException(status_code=404, detail="Script not found")
+        
+        return {"success": True}
+
+# ========== KEY MANAGEMENT ==========
+@app.post("/api/keys/create")
+async def create_key(
+    key_data: KeyCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new key for a script"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        # Verify script belongs to user
+        script = await conn.fetchval(
+            "SELECT id FROM scripts WHERE id = $1 AND user_id = $2",
+            key_data.script_id, current_user['id']
+        )
+        
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        
+        # Generate unique key
+        key = generate_key()
+        while await conn.fetchval("SELECT id FROM keys WHERE key = $1", key):
+            key = generate_key()
+        
+        # Create key
+        expires_at = datetime.now() + timedelta(days=key_data.duration_days)
+        await conn.fetchval(
+            """
+            INSERT INTO keys 
+            (key, script_id, nickname, expires_at, note) 
+            VALUES ($1, $2, $3, $4, $5) 
+            RETURNING id
+            """,
+            key, key_data.script_id, key_data.nickname, expires_at, key_data.nickname
+        )
+        
+        return {
+            "key": key,
+            "nickname": key_data.nickname,
+            "expires_at": expires_at.isoformat(),
+            "status": "active"
+        }
+
+@app.get("/api/keys")
+async def get_keys(current_user: dict = Depends(get_current_user)):
+    """Get all keys for current user"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        keys = await conn.fetch(
+            """
+            SELECT k.*, s.name as script_name
+            FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1
+            ORDER BY k.created_at DESC
+            """,
+            current_user['id']
+        )
+        
+        result = []
+        for key in keys:
+            key = dict(key)
+            online = False
+            if key['last_heartbeat']:
+                online = (datetime.now() - key['last_heartbeat']).seconds < 120
+            
+            result.append({
+                "key": key['key'],
+                "nickname": key['nickname'],
+                "script_name": key['script_name'],
+                "created_at": key['created_at'].isoformat() if key['created_at'] else None,
+                "expires_at": key['expires_at'].isoformat() if key['expires_at'] else None,
+                "last_heartbeat": key['last_heartbeat'].isoformat() if key['last_heartbeat'] else None,
+                "hwid": key['hwid'],
+                "status": key['status'],
+                "online": online,
+                "hwid_resets_used": key['hwid_resets_used'],
+                "max_hwid_resets": key['max_hwid_resets']
+            })
+        
+        return result
+
+@app.post("/api/keys/action")
+async def key_action(
+    action: KeyAction,
+    current_user: dict = Depends(get_current_user)
+):
+    """Activate, deactivate, or kick a key"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        # Verify key belongs to user
+        key_info = await conn.fetchrow(
+            """
+            SELECT k.* FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE k.key = $1 AND s.user_id = $2
+            """,
+            action.key, current_user['id']
+        )
+        
+        if not key_info:
+            raise HTTPException(status_code=404, detail="Key not found")
+        
+        if action.action == "activate":
+            await conn.execute(
+                "UPDATE keys SET status = 'active' WHERE key = $1",
+                action.key
+            )
+            return {"success": True, "message": "Key activated"}
+            
+        elif action.action == "deactivate":
+            await conn.execute(
+                "UPDATE keys SET status = 'suspended' WHERE key = $1",
+                action.key
+            )
+            return {"success": True, "message": "Key deactivated"}
+            
+        elif action.action == "kick":
+            # Just log that they were kicked - next heartbeat will fail
+            return {"success": True, "message": "User will be kicked on next heartbeat"}
+        
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+@app.post("/api/keys/nickname")
+async def set_nickname(
+    nick_data: KeyNickname,
+    current_user: dict = Depends(get_current_user)
+):
+    """Set nickname for a key"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        # Verify key belongs to user
+        key_info = await conn.fetchrow(
+            """
+            SELECT k.* FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE k.key = $1 AND s.user_id = $2
+            """,
+            nick_data.key, current_user['id']
+        )
+        
+        if not key_info:
+            raise HTTPException(status_code=404, detail="Key not found")
+        
+        await conn.execute(
+            "UPDATE keys SET nickname = $1 WHERE key = $2",
+            nick_data.nickname, nick_data.key
+        )
+        
+        return {"success": True, "message": "Nickname updated"}
+
+@app.post("/api/keys/reset-hwid")
+async def reset_hwid(
+    request: HWIDResetRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Reset HWID for a key"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        key_info = await conn.fetchrow(
+            """
+            SELECT k.* FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE k.key = $1 AND s.user_id = $2
+            """,
+            request.key, current_user['id']
+        )
+        
+        if not key_info:
+            raise HTTPException(status_code=404, detail="Key not found")
+        
+        if key_info['hwid_resets_used'] >= key_info['max_hwid_resets']:
+            raise HTTPException(status_code=400, detail="No HWID resets remaining")
+        
+        if not request.confirm:
+            return {
+                "warning": f"This will reset HWID for {request.key}. {key_info['max_hwid_resets'] - key_info['hwid_resets_used'] - 1} resets remaining.",
+                "confirm_needed": True
+            }
+        
+        await conn.execute(
+            "UPDATE keys SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1 WHERE key = $1",
+            request.key
+        )
+        
+        return {
+            "success": True,
+            "message": f"HWID reset for {request.key}. {key_info['max_hwid_resets'] - key_info['hwid_resets_used'] - 1} resets remaining."
+        }
+
+@app.delete("/api/keys/{key}")
+async def delete_key(
+    key: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a key"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM keys 
+            WHERE key = $1 AND script_id IN (
+                SELECT id FROM scripts WHERE user_id = $2
+            )
+            """,
             key, current_user['id']
         )
         
         if result.split()[-1] == "0":
-            raise HTTPException(status_code=404, detail="License not found")
+            raise HTTPException(status_code=404, detail="Key not found")
         
         return {"success": True}
 
@@ -684,894 +695,2196 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Total licenses
-        total = await conn.fetchval(
-            "SELECT COUNT(*) FROM licenses WHERE user_id = $1",
+        # Total scripts
+        total_scripts = await conn.fetchval(
+            "SELECT COUNT(*) FROM scripts WHERE user_id = $1",
             current_user['id']
         )
         
-        # Active licenses
-        active = await conn.fetchval(
+        # Total keys
+        total_keys = await conn.fetchval(
             """
-            SELECT COUNT(*) FROM licenses 
-            WHERE user_id = $1 
-            AND status = 'active' 
-            AND expires_at > CURRENT_TIMESTAMP
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1
+            """,
+            current_user['id']
+        )
+        
+        # Active keys
+        active_keys = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1 
+            AND k.status = 'active' 
+            AND k.expires_at > CURRENT_TIMESTAMP
             """,
             current_user['id']
         )
         
         # Online now
-        online = await conn.fetchval(
+        online_now = await conn.fetchval(
             """
-            SELECT COUNT(*) FROM licenses 
-            WHERE user_id = $1 
-            AND last_heartbeat IS NOT NULL
-            AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_heartbeat)) < 120
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1 
+            AND k.last_heartbeat IS NOT NULL
+            AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - k.last_heartbeat)) < 120
             """,
             current_user['id']
         )
         
         # Expiring soon
-        expiring = await conn.fetchval(
+        expiring_soon = await conn.fetchval(
             """
-            SELECT COUNT(*) FROM licenses 
-            WHERE user_id = $1 
-            AND status = 'active'
-            AND expires_at > CURRENT_TIMESTAMP
-            AND expires_at < CURRENT_TIMESTAMP + INTERVAL '7 days'
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1 
+            AND k.status = 'active'
+            AND k.expires_at > CURRENT_TIMESTAMP
+            AND k.expires_at < CURRENT_TIMESTAMP + INTERVAL '7 days'
             """,
             current_user['id']
         )
         
         return {
-            "total_licenses": total or 0,
-            "active_licenses": active or 0,
-            "online_now": online or 0,
-            "expiring_soon": expiring or 0
+            "total_scripts": total_scripts or 0,
+            "total_keys": total_keys or 0,
+            "active_keys": active_keys or 0,
+            "online_now": online_now or 0,
+            "expiring_soon": expiring_soon or 0
+        }
+
+# ========== LOADER GENERATION ==========
+@app.post("/api/loader/generate")
+async def generate_loader(
+    data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate a loader for a script"""
+    script_id = data.get('script_id')
+    
+    if not script_id:
+        raise HTTPException(status_code=400, detail="Script ID required")
+    
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        # Verify script belongs to user
+        script = await conn.fetchrow(
+            "SELECT * FROM scripts WHERE id = $1 AND user_id = $2",
+            script_id, current_user['id']
+        )
+        
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        
+        # Generate loader code
+        loader = f'''-- =============================================
+-- AUTHY LOADER FOR: {script['name']}
+-- GENERATED: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+-- =============================================
+
+local AUTH_URL = "https://authy-o0pm.onrender.com"
+local API_BASE = AUTH_URL
+
+-- Get HWID using executor's gethwid()
+local function get_hwid()
+    local hwid = gethwid and gethwid()
+    if not hwid then
+        -- Fallback for testing
+        hwid = "TEST-HWID-123456"
+    end
+    return hwid
+end
+
+-- HTTP request function
+local function request_api(endpoint, data)
+    local response = syn and syn.request or http and http.request or request
+    if not response then
+        error("No HTTP request function found")
+    end
+    
+    local result = response({{
+        Url = API_BASE .. endpoint,
+        Method = "POST",
+        Headers = {{
+            ["Content-Type"] = "application/json"
+        }},
+        Body = game:GetService("HttpService"):JSONEncode(data)
+    }})
+    
+    return game:GetService("HttpService"):JSONDecode(result.Body)
+end
+
+-- Validate key function
+local function validate_key(key, hwid)
+    local response = request_api("/api/validate", {{
+        key = key,
+        hwid = hwid
+    }})
+    
+    return response.valid, response
+end
+
+-- Heartbeat function
+local function send_heartbeat(key, hwid)
+    local response = request_api("/api/heartbeat", {{
+        key = key,
+        hwid = hwid
+    }})
+    return response.valid, response
+end
+
+-- Main authentication function
+local function authenticate(key)
+    local hwid = get_hwid()
+    print("🔑 HWID: " .. hwid)
+    
+    -- Validate key
+    local valid, response = validate_key(key, hwid)
+    
+    if not valid then
+        print("❌ Authentication failed: " .. (response.reason or "unknown error"))
+        return false
+    end
+    
+    print("✅ Authentication successful!")
+    if response.expires then
+        print("📅 Expires: " .. response.expires)
+    end
+    
+    -- Start heartbeat loop
+    spawn(function()
+        while wait(60) do
+            local valid, hb_response = send_heartbeat(key, hwid)
+            if not valid then
+                print("❌ License invalidated: " .. (hb_response.message or "unknown"))
+                return
+            end
+            print("💓 Heartbeat OK")
+        end
+    end)
+    
+    return true
+end
+
+-- ========== YOUR SCRIPT BELOW ==========
+-- PASTE YOUR SCRIPT AFTER THIS LINE
+-- The key will be provided by your main script
+
+-- Example:
+-- local success = authenticate("YOUR-KEY-HERE")
+-- if success then
+--     print("🚀 Loading script...")
+--     -- Your actual script code here
+-- end
+
+return {{
+    authenticate = authenticate,
+    get_hwid = get_hwid,
+    validate = validate_key
+}}
+'''
+        
+        return {
+            "loader": loader,
+            "script_name": script['name'],
+            "instructions": "Copy this loader and paste it at the bottom of your script. The user will need to provide their key."
+        }
+
+# ========== PUBLIC API ENDPOINTS ==========
+@app.post("/api/heartbeat", response_model=HeartbeatResponse)
+async def heartbeat(request: HeartbeatRequest, req: Request):
+    """Lua clients call this every 60 seconds"""
+    if not db.pool:
+        return HeartbeatResponse(
+            valid=False, 
+            status="error", 
+            message="Database not available"
+        )
+    
+    async with db.pool.acquire() as conn:
+        # Get key
+        key_info = await conn.fetchrow(
+            "SELECT * FROM keys WHERE key = $1",
+            request.key
+        )
+        
+        if not key_info:
+            return HeartbeatResponse(
+                valid=False, 
+                status="invalid", 
+                message="Key not found"
+            )
+        
+        key_info = dict(key_info)
+        expires_at = key_info['expires_at']
+        
+        # Check if expired
+        if expires_at < datetime.now():
+            await conn.execute(
+                "UPDATE keys SET status = 'expired' WHERE id = $1",
+                key_info['id']
+            )
+            return HeartbeatResponse(
+                valid=False, 
+                status="expired", 
+                message="Key expired"
+            )
+        
+        # Check if suspended
+        if key_info['status'] != 'active':
+            return HeartbeatResponse(
+                valid=False, 
+                status=key_info['status'], 
+                message=f"Key {key_info['status']}"
+            )
+        
+        # HWID binding
+        client_ip = req.client.host if req.client else "unknown"
+        
+        if not key_info['hwid']:
+            await conn.execute(
+                "UPDATE keys SET hwid = $1, last_heartbeat = CURRENT_TIMESTAMP WHERE id = $2",
+                request.hwid, key_info['id']
+            )
+        elif key_info['hwid'] != request.hwid:
+            return HeartbeatResponse(
+                valid=False, 
+                status="hwid_mismatch", 
+                message="Invalid HWID"
+            )
+        else:
+            await conn.execute(
+                "UPDATE keys SET last_heartbeat = CURRENT_TIMESTAMP WHERE id = $1",
+                key_info['id']
+            )
+        
+        # Log heartbeat
+        await conn.execute(
+            "INSERT INTO heartbeat_logs (key_id, hwid, ip_address) VALUES ($1, $2, $3)",
+            key_info['id'], request.hwid, client_ip
+        )
+        
+        days_left = (expires_at - datetime.now()).days
+        
+        return HeartbeatResponse(
+            valid=True, 
+            status="active", 
+            message=f"Valid - {days_left} days remaining",
+            expires_at=expires_at.isoformat()
+        )
+
+@app.post("/api/validate")
+async def validate_key(request: HeartbeatRequest):
+    """Simple validation without heartbeat logging"""
+    if not db.pool:
+        return {"valid": False, "reason": "database_error"}
+    
+    async with db.pool.acquire() as conn:
+        key_info = await conn.fetchrow(
+            "SELECT * FROM keys WHERE key = $1",
+            request.key
+        )
+        
+        if not key_info:
+            return {"valid": False, "reason": "not_found"}
+        
+        key_info = dict(key_info)
+        
+        if key_info['expires_at'] < datetime.now():
+            return {"valid": False, "reason": "expired"}
+        
+        if key_info['status'] != 'active':
+            return {"valid": False, "reason": key_info['status']}
+        
+        if key_info['hwid'] and key_info['hwid'] != request.hwid:
+            return {"valid": False, "reason": "hwid_mismatch"}
+        
+        if not key_info['hwid']:
+            await conn.execute(
+                "UPDATE keys SET hwid = $1 WHERE id = $2",
+                request.hwid, key_info['id']
+            )
+        
+        return {
+            "valid": True, 
+            "expires": key_info['expires_at'].isoformat()
         }
 
 # ========== FRONTEND ==========
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Authy - Protect Your Lua Scripts</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box;}
-    html{scroll-behavior:smooth;}
-    body{
-      font-family: 'Inter', system-ui, -apple-system, sans-serif;
-      background: #15171e;
-      color: #f9fafb;
-      min-height: 100vh;
-      overflow-x: hidden;
-      position: relative;
-    }
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      background-image:
-        radial-gradient(circle at 2px 2px, #4a90e2 1px, transparent 1px),
-        radial-gradient(circle at 17px 17px, #4a90e2 1px, transparent 1px);
-      background-size: 30px 30px;
-      opacity: 0.07;
-      pointer-events: none;
-      z-index: -1;
-    }
-    .navbar{
-      position:fixed;
-      top:12px;
-      left:5%;
-      right:5%;
-      height:60px;
-      border-radius:16px;
-      box-shadow:0 4px 20px rgba(0,0,0,0.35);
-      background:rgba(21,23,30,0.65);
-      backdrop-filter:blur(16px);
-      -webkit-backdrop-filter:blur(16px);
-      border:1px solid rgba(63,72,90,0.4);
-      z-index:1000;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      padding:0 25px;
-    }
-    .logo {
-      font-size:1.4rem;
-      font-weight:800;
-      color: #4a90e2;
-      letter-spacing:-0.02em;
-    }
-    .nav-menu{
-      display:flex;
-      align-items:center;
-      gap:1.8rem;
-      margin: 0 auto;
-    }
-    .nav-link{
-      color:#b6bcc8;
-      font-size:0.98rem;
-      font-weight:500;
-      text-decoration:none;
-      transition:color 0.25s ease;
-    }
-    .nav-link:hover{
-      color:#4a90e2;
-    }
-    .nav-right{
-      display:flex;
-      align-items:center;
-      gap:1.5rem;
-    }
-    .sign-in {
-      color:#f9fafb;
-      font-size:1rem;
-      font-weight:500;
-      cursor:pointer;
-      transition:color 0.25s ease;
-    }
-    .sign-in:hover{
-      color:#4a90e2;
-    }
-    .sign-up-btn{
-      background:#4a90e2;
-      color:#ffffff;
-      font-size:1rem;
-      font-weight:600;
-      padding:0.6rem 1.1rem;
-      border-radius:8px;
-      border:none;
-      cursor:pointer;
-      transition: all 0.25s ease;
-    }
-    .sign-up-btn:hover{
-      transform:translateY(-1px);
-      background:#60c0ff;
-    }
-    .hero-section{
-      min-height:100vh;
-      display:flex;
-      flex-direction:column;
-      justify-content:center;
-      align-items:center;
-      text-align:center;
-      padding:0 20px;
-      position:relative;
-      z-index:10;
-    }
-    .hero-text{
-      font-size: clamp(2.8rem, 6.5vw, 4.2rem);
-      font-weight:800;
-      letter-spacing:-0.02em;
-      line-height:1.1;
-      margin-bottom:0.6rem;
-    }
-    .hero-subtitle {
-      font-size: clamp(1.1rem, 3vw, 1.45rem);
-      font-weight: 500;
-      color: #a0a0a0;
-      margin-top: 0.4rem;
-      letter-spacing: -0.01em;
-      max-width: 640px;
-    }
-    .highlight{
-      color:#4a90e2;
-    }
-    .modal-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(10, 12, 22, 0.88);
-      backdrop-filter: blur(8px);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 2000;
-      opacity: 0;
-      transition: opacity 0.3s ease;
-    }
-    .modal-overlay.show {
-      opacity: 1;
-    }
-    .modal {
-      background: rgba(21, 23, 30, 0.96);
-      backdrop-filter: blur(14px);
-      border-radius: 18px;
-      width: 420px;
-      max-width: 92%;
-      padding: 32px 30px 24px;
-      border: 1px solid #2a2f3a;
-      box-shadow: 0 16px 50px rgba(0,0,0,0.6);
-      position: relative;
-      transform: translateY(20px);
-      opacity: 0;
-      transition: all 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
-    }
-    .modal-overlay.show .modal {
-      transform: translateY(0);
-      opacity: 1;
-    }
-    .modal-close {
-      position: absolute;
-      top: 16px;
-      right: 20px;
-      font-size: 1.8rem;
-      color: #555;
-      cursor: pointer;
-      transition: color 0.2s, transform 0.2s;
-    }
-    .modal-close:hover {
-      color: #ccc;
-      transform: rotate(90deg);
-    }
-    .authy-title {
-      font-size: 2.2rem;
-      font-weight: 800;
-      color: #ffffff;
-      letter-spacing: -0.02em;
-      text-align: center;
-      margin-bottom: 28px;
-    }
-    .floating-input {
-      position: relative;
-      margin-bottom: 20px;
-      --label-float-top: -1px;
-      --notch-left: 11px;
-      --notch-width: 45px;
-    }
-    .floating-input input {
-      width: 100%;
-      padding: 16px 18px 12px;
-      background: rgba(30,35,45,0.7);
-      border: 1px solid #2a2f3a;
-      border-radius: 12px;
-      color: #fff;
-      font-size: 1.02rem;
-      outline: none;
-      transition: border-color 0.25s ease;
-    }
-    .floating-input input:focus {
-      border-color: #4a90e2;
-    }
-    .floating-input label {
-      position: absolute;
-      top: 50%;
-      left: 18px;
-      transform: translateY(-50%);
-      color: #aaa;
-      font-size: 1rem;
-      pointer-events: none;
-      transition: all 0.25s ease;
-      transform-origin: left center;
-      padding: 0 6px;
-      z-index: 2;
-    }
-    .floating-input input:focus + label,
-    .floating-input input:not(:placeholder-shown) + label {
-      top: var(--label-float-top);
-      left: calc(var(--notch-left) + 2px);
-      font-size: 0.82rem;
-      color: #4a90e2;
-      background: rgba(21, 23, 30, 0.96);
-    }
-    .notch-cover {
-      position: absolute;
-      top: -1px;
-      left: var(--notch-left);
-      height: 2px;
-      background: rgba(21, 23, 30, 0.96);
-      z-index: 1;
-      pointer-events: none;
-      width: 0;
-      transition: width 0.25s ease;
-    }
-    .floating-input input:focus ~ .notch-cover,
-    .floating-input input:not(:placeholder-shown) ~ .notch-cover {
-      width: var(--notch-width);
-    }
-    .login-btn {
-      width: 100%;
-      padding: 15px;
-      background: #ffffff;
-      color: #1a1f2e;
-      font-weight: 600;
-      font-size: 1.05rem;
-      border: none;
-      border-radius: 12px;
-      cursor: pointer;
-      transition: all 0.3s ease;
-      box-shadow: 0 5px 18px rgba(0,0,0,0.25);
-    }
-    .login-btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 10px 28px rgba(0,0,0,0.35);
-      background: #f0f0f0;
-    }
-    .terms {
-      margin-top: 24px;
-      font-size: 0.83rem;
-      color: #777;
-      text-align: center;
-    }
-    .terms a {
-      color: #888;
-      text-decoration: underline;
-    }
-    .terms a:hover { color: #aaa; }
-    
-    /* Dashboard Styles */
-    .dashboard {
-      padding: 100px 20px 40px;
-      max-width: 1200px;
-      margin: 0 auto;
-    }
-    
-    .dashboard.hidden {
-      display: none;
-    }
-    
-    .welcome-card {
-      background: rgba(21, 23, 30, 0.8);
-      backdrop-filter: blur(16px);
-      border: 1px solid #2a2f3a;
-      border-radius: 24px;
-      padding: 30px;
-      margin-bottom: 30px;
-    }
-    
-    .welcome-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-      gap: 20px;
-    }
-    
-    .welcome-title {
-      font-size: 2rem;
-      font-weight: 700;
-    }
-    
-    .welcome-title span {
-      color: #4a90e2;
-    }
-    
-    .create-key-btn {
-      background: #4a90e2;
-      color: white;
-      border: none;
-      padding: 12px 24px;
-      border-radius: 12px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.3s ease;
-    }
-    
-    .create-key-btn:hover {
-      transform: translateY(-2px);
-      background: #60c0ff;
-      box-shadow: 0 10px 20px rgba(74, 144, 226, 0.3);
-    }
-    
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 20px;
-      margin-top: 20px;
-    }
-    
-    .stat-card {
-      background: rgba(30, 35, 45, 0.5);
-      border: 1px solid #2a2f3a;
-      border-radius: 16px;
-      padding: 20px;
-    }
-    
-    .stat-label {
-      color: #a0a0a0;
-      font-size: 0.9rem;
-      margin-bottom: 8px;
-    }
-    
-    .stat-value {
-      font-size: 2rem;
-      font-weight: 700;
-      color: #4a90e2;
-    }
-    
-    .keys-table {
-      background: rgba(21, 23, 30, 0.8);
-      backdrop-filter: blur(16px);
-      border: 1px solid #2a2f3a;
-      border-radius: 24px;
-      padding: 30px;
-      overflow-x: auto;
-    }
-    
-    .keys-table h2 {
-      margin-bottom: 20px;
-      font-size: 1.5rem;
-    }
-    
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    
-    th {
-      text-align: left;
-      padding: 12px;
-      color: #a0a0a0;
-      font-weight: 500;
-      border-bottom: 1px solid #2a2f3a;
-    }
-    
-    td {
-      padding: 12px;
-      border-bottom: 1px solid #2a2f3a;
-    }
-    
-    .key-cell {
-      font-family: monospace;
-      color: #4a90e2;
-    }
-    
-    .status-badge {
-      display: inline-block;
-      padding: 4px 12px;
-      border-radius: 20px;
-      font-size: 0.85rem;
-      font-weight: 500;
-    }
-    
-    .status-active {
-      background: rgba(74, 144, 226, 0.2);
-      color: #4a90e2;
-    }
-    
-    .status-expired {
-      background: rgba(255, 75, 75, 0.2);
-      color: #ff4b4b;
-    }
-    
-    .action-btn {
-      background: transparent;
-      border: 1px solid #2a2f3a;
-      color: #a0a0a0;
-      padding: 6px 12px;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      margin: 0 4px;
-    }
-    
-    .action-btn:hover {
-      border-color: #4a90e2;
-      color: #4a90e2;
-    }
-    
-    .action-btn.delete:hover {
-      border-color: #ff4b4b;
-      color: #ff4b4b;
-    }
-    
-    .logout-btn {
-      background: transparent;
-      border: 1px solid #2a2f3a;
-      color: #a0a0a0;
-      padding: 8px 16px;
-      border-radius: 8px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      margin-left: 15px;
-    }
-    
-    .logout-btn:hover {
-      border-color: #ff4b4b;
-      color: #ff4b4b;
-    }
-    
-    .toast {
-      position: fixed;
-      bottom: 30px;
-      right: 30px;
-      background: rgba(21, 23, 30, 0.95);
-      backdrop-filter: blur(16px);
-      border: 1px solid #2a2f3a;
-      border-radius: 12px;
-      padding: 15px 25px;
-      color: white;
-      transform: translateX(400px);
-      transition: transform 0.3s ease;
-      z-index: 3000;
-    }
-    
-    .toast.show {
-      transform: translateX(0);
-    }
-    
-    .toast.success {
-      border-left: 4px solid #4a90e2;
-    }
-    
-    .toast.error {
-      border-left: 4px solid #ff4b4b;
-    }
-    
-    .create-key-modal {
-      width: 400px;
-    }
-    
-    .duration-select {
-      width: 100%;
-      padding: 12px;
-      background: rgba(30,35,45,0.7);
-      border: 1px solid #2a2f3a;
-      border-radius: 12px;
-      color: white;
-      margin: 15px 0;
-    }
-    
-    .note-input {
-      width: 100%;
-      padding: 12px;
-      background: rgba(30,35,45,0.7);
-      border: 1px solid #2a2f3a;
-      border-radius: 12px;
-      color: white;
-      margin: 15px 0;
-    }
-    
-    .hero.hidden {
-      display: none;
-    }
-    
-    @media (max-width:768px){
-      .navbar{flex-wrap:wrap;height:auto;padding:12px 15px;justify-content:center;gap:1rem;}
-      .nav-menu{order:2;width:100%;justify-content:center;margin:8px 0;}
-      .logo{order:1;flex:1;}
-      .nav-right{order:3;width:100%;justify-content:center;}
-      .hero-text{font-size: clamp(2.4rem, 6vw, 3.6rem);}
-      .hero-subtitle{font-size: clamp(1rem, 2.8vw, 1.3rem);}
-      .modal{width:90%;padding:28px 24px;}
-      .authy-title{font-size:1.95rem;}
-      .welcome-header {
-        flex-direction: column;
-        align-items: flex-start;
-      }
-    }
-    @media (max-width:480px){
-      .hero-text{font-size: clamp(2rem, 5.5vw, 3rem);}
-      .hero-subtitle{font-size: clamp(0.95rem, 2.6vw, 1.15rem);}
-      .nav-link{font-size:0.95rem;}
-      .sign-up-btn{padding:0.55rem 0.9rem;font-size:0.95rem;}
-      .logo{font-size:1.25rem;}
-      .authy-title{font-size:1.8rem;}
-    }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authy - Advanced Lua Authentication</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0A0C10;
+            --bg-secondary: #12141A;
+            --bg-tertiary: #1A1E26;
+            --accent-primary: #3B82F6;
+            --accent-secondary: #6366F1;
+            --accent-success: #10B981;
+            --accent-warning: #F59E0B;
+            --accent-danger: #EF4444;
+            --text-primary: #FFFFFF;
+            --text-secondary: #9CA3AF;
+            --text-muted: #6B7280;
+            --border-color: #2A2F3A;
+            --gradient-primary: linear-gradient(135deg, #3B82F6 0%, #6366F1 100%);
+            --gradient-success: linear-gradient(135deg, #10B981 0%, #059669 100%);
+            --gradient-warning: linear-gradient(135deg, #F59E0B 0%, #D97706 100%);
+            --gradient-danger: linear-gradient(135deg, #EF4444 0%, #DC2626 100%);
+            --shadow-sm: 0 2px 4px rgba(0,0,0,0.1);
+            --shadow-md: 0 4px 6px rgba(0,0,0,0.1);
+            --shadow-lg: 0 10px 15px rgba(0,0,0,0.2);
+            --shadow-xl: 0 20px 25px rgba(0,0,0,0.25);
+            --blur-bg: rgba(10, 12, 16, 0.7);
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.5;
+            position: relative;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(circle at 20% 20%, rgba(59, 130, 246, 0.05) 0%, transparent 30%),
+                radial-gradient(circle at 80% 70%, rgba(99, 102, 241, 0.05) 0%, transparent 30%),
+                radial-gradient(circle at 40% 90%, rgba(16, 185, 129, 0.03) 0%, transparent 40%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* Navbar */
+        .navbar {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 1400px;
+            height: 70px;
+            background: rgba(18, 20, 26, 0.8);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 30px;
+            z-index: 1000;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 1.5rem;
+            font-weight: 800;
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo i {
+            font-size: 2rem;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 40px;
+        }
+
+        .nav-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .nav-link:hover {
+            color: var(--text-primary);
+        }
+
+        .nav-link::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: var(--gradient-primary);
+            transition: width 0.3s ease;
+        }
+
+        .nav-link:hover::after {
+            width: 100%;
+        }
+
+        .nav-user {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .user-menu {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .user-menu:hover {
+            border-color: var(--accent-primary);
+        }
+
+        .username {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .btn-logout {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .btn-logout:hover {
+            border-color: var(--accent-danger);
+            color: var(--accent-danger);
+        }
+
+        /* Main Content */
+        .main-content {
+            padding: 120px 30px 40px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Auth Container */
+        .auth-container {
+            min-height: calc(100vh - 200px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .auth-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            padding: 50px;
+            width: 100%;
+            max-width: 480px;
+            box-shadow: var(--shadow-xl);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .auth-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--gradient-primary);
+        }
+
+        .auth-header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .auth-header i {
+            font-size: 3rem;
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 20px;
+        }
+
+        .auth-header h2 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+
+        .auth-header p {
+            color: var(--text-secondary);
+        }
+
+        .auth-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            background: var(--bg-tertiary);
+            padding: 5px;
+            border-radius: 12px;
+        }
+
+        .tab-btn {
+            flex: 1;
+            padding: 12px;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .tab-btn.active {
+            background: var(--accent-primary);
+            color: white;
+        }
+
+        .auth-form {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .auth-form.hidden {
+            display: none;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .form-group label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .form-group input {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 14px 16px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+        }
+
+        .btn-primary {
+            background: var(--gradient-primary);
+            border: none;
+            padding: 14px;
+            border-radius: 12px;
+            color: white;
+            font-weight: 600;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            padding: 12px 24px;
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--accent-primary);
+        }
+
+        .btn-danger {
+            background: var(--gradient-danger);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(239, 68, 68, 0.3);
+        }
+
+        .btn-success {
+            background: var(--gradient-success);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-warning {
+            background: var(--gradient-warning);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(245, 158, 11, 0.3);
+        }
+
+        .btn-icon {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .btn-icon:hover {
+            border-color: var(--accent-primary);
+            color: var(--accent-primary);
+        }
+
+        /* Dashboard */
+        .dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .dashboard-header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+
+        .dashboard-header h1 span {
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--gradient-primary);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .stat-card:hover::before {
+            opacity: 1;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-xl);
+        }
+
+        .stat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .stat-title {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            font-weight: 500;
+        }
+
+        .stat-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+        }
+
+        .stat-icon.blue {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--accent-primary);
+        }
+
+        .stat-icon.green {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--accent-success);
+        }
+
+        .stat-icon.purple {
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--accent-secondary);
+        }
+
+        .stat-icon.orange {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--accent-warning);
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .stat-change {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .stat-change.positive {
+            color: var(--accent-success);
+        }
+
+        .stat-change.negative {
+            color: var(--accent-danger);
+        }
+
+        /* Charts */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .chart-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+        }
+
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .chart-header h3 {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+
+        .chart-container {
+            height: 300px;
+        }
+
+        /* Scripts Section */
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .section-header h2 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .scripts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        .script-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            transition: all 0.3s ease;
+        }
+
+        .script-card:hover {
+            border-color: var(--accent-primary);
+            box-shadow: var(--shadow-lg);
+        }
+
+        .script-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .script-name {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+
+        .script-badge {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--accent-primary);
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .script-stats {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            padding: 16px 0;
+            border-top: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .script-stat {
+            flex: 1;
+        }
+
+        .script-stat-label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            margin-bottom: 4px;
+        }
+
+        .script-stat-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+
+        .script-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .script-actions button {
+            flex: 1;
+        }
+
+        /* Keys Table */
+        .keys-table-container {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            text-align: left;
+            padding: 16px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 0.9rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        tr:hover td {
+            background: var(--bg-tertiary);
+        }
+
+        .key-cell {
+            font-family: monospace;
+            font-size: 0.95rem;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .status-badge.active {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--accent-success);
+        }
+
+        .status-badge.inactive {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--accent-danger);
+        }
+
+        .status-badge.expired {
+            background: rgba(107, 114, 128, 0.1);
+            color: var(--text-secondary);
+        }
+
+        .status-badge.online {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--accent-primary);
+        }
+
+        .status-badge::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-badge.active::before {
+            background: var(--accent-success);
+        }
+
+        .status-badge.inactive::before {
+            background: var(--accent-danger);
+        }
+
+        .status-badge.expired::before {
+            background: var(--text-secondary);
+        }
+
+        .status-badge.online::before {
+            background: var(--accent-primary);
+        }
+
+        .action-group {
+            display: flex;
+            gap: 6px;
+        }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(8px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+        }
+
+        .modal-overlay.show {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            width: 90%;
+            max-width: 500px;
+            animation: modalSlide 0.3s ease;
+        }
+
+        @keyframes modalSlide {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-header {
+            padding: 24px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h3 {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.5rem;
+            cursor: pointer;
+            transition: color 0.3s ease;
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 24px;
+        }
+
+        .modal-footer {
+            padding: 24px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        /* Loader Preview */
+        .loader-preview {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            margin: 20px 0;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .loader-preview pre {
+            color: var(--text-primary);
+            font-family: monospace;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px 24px;
+            transform: translateX(400px);
+            transition: transform 0.3s ease;
+            z-index: 3000;
+            box-shadow: var(--shadow-xl);
+        }
+
+        .toast.show {
+            transform: translateX(0);
+        }
+
+        .toast-content {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .toast.success {
+            border-left: 4px solid var(--accent-success);
+        }
+
+        .toast.error {
+            border-left: 4px solid var(--accent-danger);
+        }
+
+        .toast.info {
+            border-left: 4px solid var(--accent-primary);
+        }
+
+        /* Utility */
+        .hidden {
+            display: none !important;
+        }
+
+        .loader {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+
+        .loader i {
+            font-size: 2rem;
+            margin-bottom: 16px;
+        }
+
+        @media (max-width: 768px) {
+            .navbar {
+                width: 95%;
+                padding: 0 20px;
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .scripts-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .dashboard-header {
+                flex-direction: column;
+                gap: 20px;
+                align-items: flex-start;
+            }
+        }
+    </style>
 </head>
 <body>
-  <!-- Navbar -->
-  <nav class="navbar">
-    <div class="logo">Authy</div>
-    <div class="nav-menu">
-      <a href="#" class="nav-link">Docs</a>
-      <a href="#" class="nav-link">Dashboard</a>
-      <a href="#" class="nav-link">Features</a>
-      <a href="#" class="nav-link">Pricing</a>
-      <a href="#" class="nav-link">FAQ</a>
-    </div>
-    <div class="nav-right" id="navRight">
-      <span class="sign-in" id="openLogin">Sign in</span>
-      <button class="sign-up-btn" id="openRegister">Sign up</button>
-    </div>
-  </nav>
-
-  <!-- Hero Section -->
-  <section class="hero-section" id="heroSection">
-    <div class="hero-text">
-      Protect Your Lua <span class="highlight">Scripts</span>
-    </div>
-    <div class="hero-subtitle">
-      The most secure and reliable authentication
-    </div>
-  </section>
-
-  <!-- Dashboard -->
-  <div class="dashboard hidden" id="dashboard">
-    <div class="welcome-card">
-      <div class="welcome-header">
-        <h1 class="welcome-title">Welcome back, <span id="username">User</span>!</h1>
-        <div>
-          <button class="create-key-btn" id="createKeyBtn">+ Create New Key</button>
-          <button class="logout-btn" id="logoutBtn">Logout</button>
+    <nav class="navbar">
+        <div class="logo">
+            <i class="fas fa-shield-alt"></i>
+            Authy
         </div>
-      </div>
-      
-      <div class="stats-grid" id="statsGrid">
-        <div class="stat-card"><div class="stat-label">Total Keys</div><div class="stat-value" id="totalKeys">0</div></div>
-        <div class="stat-card"><div class="stat-label">Active Keys</div><div class="stat-value" id="activeKeys">0</div></div>
-        <div class="stat-card"><div class="stat-label">Online Now</div><div class="stat-value" id="onlineNow">0</div></div>
-        <div class="stat-card"><div class="stat-label">Expiring Soon</div><div class="stat-value" id="expiringSoon">0</div></div>
-      </div>
+        <div class="nav-links" id="navLinks">
+            <a href="#" class="nav-link">Dashboard</a>
+            <a href="#" class="nav-link">Scripts</a>
+            <a href="#" class="nav-link">Keys</a>
+            <a href="#" class="nav-link">Analytics</a>
+            <a href="#" class="nav-link">Docs</a>
+        </div>
+        <div class="nav-user" id="navUser">
+            <div class="user-menu" id="userMenu">
+                <i class="fas fa-user-circle"></i>
+                <span class="username" id="usernameDisplay">Guest</span>
+                <i class="fas fa-chevron-down"></i>
+            </div>
+            <button class="btn-logout" id="logoutBtn">
+                <i class="fas fa-sign-out-alt"></i>
+            </button>
+        </div>
+    </nav>
+
+    <div class="main-content" id="mainContent">
+        <!-- Auth Container -->
+        <div class="auth-container" id="authContainer">
+            <div class="auth-card">
+                <div class="auth-header">
+                    <i class="fas fa-shield-alt"></i>
+                    <h2>Welcome to Authy</h2>
+                    <p>Advanced Lua Authentication System</p>
+                </div>
+                <div class="auth-tabs">
+                    <button class="tab-btn active" id="loginTab">Login</button>
+                    <button class="tab-btn" id="registerTab">Register</button>
+                </div>
+                <div class="auth-form" id="loginForm">
+                    <div class="form-group">
+                        <label>Username</label>
+                        <input type="text" id="loginUsername" placeholder="Enter your username">
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="loginPassword" placeholder="Enter your password">
+                    </div>
+                    <button class="btn-primary" id="loginBtn">
+                        <i class="fas fa-sign-in-alt"></i>
+                        Login
+                    </button>
+                </div>
+                <div class="auth-form hidden" id="registerForm">
+                    <div class="form-group">
+                        <label>Username</label>
+                        <input type="text" id="registerUsername" placeholder="Choose a username">
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="registerPassword" placeholder="Choose a password">
+                    </div>
+                    <div class="form-group">
+                        <label>API Key</label>
+                        <input type="password" id="registerApiKey" placeholder="Enter API key">
+                    </div>
+                    <button class="btn-primary" id="registerBtn">
+                        <i class="fas fa-user-plus"></i>
+                        Register
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dashboard Container -->
+        <div class="dashboard-container hidden" id="dashboardContainer">
+            <div class="dashboard-header">
+                <h1>Welcome back, <span id="dashboardUsername">User</span></h1>
+                <button class="btn-primary" id="createScriptBtn">
+                    <i class="fas fa-plus"></i>
+                    New Script
+                </button>
+            </div>
+
+            <!-- Stats Grid -->
+            <div class="stats-grid" id="statsGrid">
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-title">Total Scripts</span>
+                        <div class="stat-icon blue">
+                            <i class="fas fa-code"></i>
+                        </div>
+                    </div>
+                    <div class="stat-value" id="totalScripts">0</div>
+                    <div class="stat-change">Active projects</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-title">Total Keys</span>
+                        <div class="stat-icon purple">
+                            <i class="fas fa-key"></i>
+                        </div>
+                    </div>
+                    <div class="stat-value" id="totalKeys">0</div>
+                    <div class="stat-change">All time</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-title">Active Keys</span>
+                        <div class="stat-icon green">
+                            <i class="fas fa-check-circle"></i>
+                        </div>
+                    </div>
+                    <div class="stat-value" id="activeKeys">0</div>
+                    <div class="stat-change positive">+12% this week</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-title">Online Now</span>
+                        <div class="stat-icon orange">
+                            <i class="fas fa-wifi"></i>
+                        </div>
+                    </div>
+                    <div class="stat-value" id="onlineNow">0</div>
+                    <div class="stat-change">Currently active</div>
+                </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <h3>Key Activity (Last 7 Days)</h3>
+                        <select class="btn-secondary" id="activityRange" style="width: auto; padding: 8px;">
+                            <option>Daily</option>
+                            <option>Weekly</option>
+                            <option>Monthly</option>
+                        </select>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="activityChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <h3>Key Distribution</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="distributionChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Scripts Section -->
+            <div class="section-header">
+                <h2>Your Scripts</h2>
+            </div>
+            <div class="scripts-grid" id="scriptsGrid">
+                <div class="loader">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    <p>Loading scripts...</p>
+                </div>
+            </div>
+
+            <!-- Keys Table -->
+            <div class="section-header">
+                <h2>Recent Keys</h2>
+                <button class="btn-secondary" id="viewAllKeysBtn">
+                    View All
+                </button>
+            </div>
+            <div class="keys-table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Key</th>
+                            <th>Nickname</th>
+                            <th>Script</th>
+                            <th>Status</th>
+                            <th>HWID</th>
+                            <th>Expires</th>
+                            <th>Last Seen</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="keysBody">
+                        <tr>
+                            <td colspan="8" style="text-align: center; padding: 40px;">
+                                <i class="fas fa-key" style="font-size: 2rem; opacity: 0.5; margin-bottom: 10px;"></i>
+                                <p>No keys yet. Create a script and generate keys!</p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 
-    <div class="keys-table">
-      <h2>Your License Keys</h2>
-      <table id="keysTable">
-        <thead><tr><th>Key</th><th>Status</th><th>HWID</th><th>Expires</th><th>Last Seen</th><th>Actions</th></tr></thead>
-        <tbody id="keysBody"><tr><td colspan="6" style="text-align:center;padding:40px;color:#666;">No keys yet. Create your first one!</td></tr></tbody>
-      </table>
+    <!-- Create Script Modal -->
+    <div class="modal-overlay" id="createScriptModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Create New Script</h3>
+                <button class="modal-close" id="closeScriptModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Script Name</label>
+                    <input type="text" id="scriptName" placeholder="e.g., 'Lua Executor' or 'DarkHub'">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="cancelScriptBtn">Cancel</button>
+                <button class="btn-primary" id="createScriptSubmit">
+                    <i class="fas fa-plus"></i>
+                    Create Script
+                </button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <!-- Login Modal -->
-  <div class="modal-overlay" id="loginModal">
-    <div class="modal">
-      <span class="modal-close" id="closeLoginModal">×</span>
-      <h2 class="authy-title">Welcome Back</h2>
-      <div class="floating-input"><input type="text" id="loginUsername" placeholder=""><label>Username</label><div class="notch-cover"></div></div>
-      <div class="floating-input"><input type="password" id="loginPassword" placeholder=""><label>Password</label><div class="notch-cover"></div></div>
-      <button class="login-btn" id="loginSubmit">Log in</button>
-      <div class="terms">Don't have an account? <a href="#" id="switchToRegister">Sign up</a></div>
+    <!-- Create Key Modal -->
+    <div class="modal-overlay" id="createKeyModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Generate New Key</h3>
+                <button class="modal-close" id="closeKeyModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Select Script</label>
+                    <select id="keyScriptSelect" class="btn-secondary" style="width: 100%; padding: 12px;">
+                        <option value="">Loading scripts...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Nickname (optional)</label>
+                    <input type="text" id="keyNickname" placeholder="e.g., 'VIP User' or 'Test Key'">
+                </div>
+                <div class="form-group">
+                    <label>Duration</label>
+                    <select id="keyDuration" class="btn-secondary" style="width: 100%; padding: 12px;">
+                        <option value="7">7 days</option>
+                        <option value="30" selected>30 days</option>
+                        <option value="90">90 days</option>
+                        <option value="365">1 year</option>
+                        <option value="0">Lifetime</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="cancelKeyBtn">Cancel</button>
+                <button class="btn-primary" id="createKeySubmit">
+                    <i class="fas fa-key"></i>
+                    Generate Key
+                </button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <!-- Register Modal -->
-  <div class="modal-overlay" id="registerModal">
-    <div class="modal">
-      <span class="modal-close" id="closeRegisterModal">×</span>
-      <h2 class="authy-title">Create Account</h2>
-      <div class="floating-input"><input type="text" id="registerUsername" placeholder=""><label>Username</label><div class="notch-cover"></div></div>
-      <div class="floating-input"><input type="email" id="registerEmail" placeholder=""><label>Email</label><div class="notch-cover"></div></div>
-      <div class="floating-input"><input type="password" id="registerPassword" placeholder=""><label>Password</label><div class="notch-cover"></div></div>
-      <button class="login-btn" id="registerSubmit">Sign up</button>
-      <div class="terms">Already have an account? <a href="#" id="switchToLogin">Sign in</a></div>
+    <!-- View Keys Modal -->
+    <div class="modal-overlay" id="viewKeysModal">
+        <div class="modal" style="max-width: 800px;">
+            <div class="modal-header">
+                <h3 id="viewKeysTitle">Keys for Script</h3>
+                <button class="modal-close" id="closeViewKeysModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="keys-table-container" style="max-height: 400px; overflow-y: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Key</th>
+                                <th>Nickname</th>
+                                <th>Status</th>
+                                <th>HWID</th>
+                                <th>Expires</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="modalKeysBody">
+                            <tr>
+                                <td colspan="6" style="text-align: center; padding: 20px;">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" id="generateKeyFromModal">
+                    <i class="fas fa-plus"></i>
+                    New Key
+                </button>
+                <button class="btn-secondary" id="closeViewKeysBtn">Close</button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <!-- Create Key Modal -->
-  <div class="modal-overlay" id="createKeyModal">
-    <div class="modal create-key-modal">
-      <span class="modal-close" id="closeCreateModal">×</span>
-      <h2 class="authy-title">Create License Key</h2>
-      <select class="duration-select" id="keyDuration"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">1 year</option></select>
-      <input type="text" class="note-input" id="keyNote" placeholder="Note (optional)">
-      <button class="login-btn" id="createKeySubmit">Generate Key</button>
+    <!-- Generate Loader Modal -->
+    <div class="modal-overlay" id="loaderModal">
+        <div class="modal" style="max-width: 700px;">
+            <div class="modal-header">
+                <h3>Loader Generated</h3>
+                <button class="modal-close" id="closeLoaderModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Copy this loader and paste it at the <strong>bottom</strong> of your script:</p>
+                <div class="loader-preview">
+                    <pre id="loaderCode">Loading...</pre>
+                </div>
+                <p class="text-secondary" style="margin-top: 10px;">
+                    <i class="fas fa-info-circle"></i>
+                    The user will need to provide their key. Use <code>authenticate("KEY-HERE")</code> in your script.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" id="copyLoaderBtn">
+                    <i class="fas fa-copy"></i>
+                    Copy to Clipboard
+                </button>
+                <button class="btn-secondary" id="closeLoaderBtn">Close</button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <!-- Toast -->
-  <div class="toast" id="toast"><span id="toastMessage"></span></div>
+    <!-- Toast -->
+    <div class="toast" id="toast">
+        <div class="toast-content">
+            <i class="fas fa-check-circle" id="toastIcon"></i>
+            <span id="toastMessage">Notification</span>
+        </div>
+    </div>
 
-  <script>
-    const API_BASE_URL = window.location.origin;
-    let token = localStorage.getItem('token');
-    let currentUser = null;
+    <script src="https://kit.fontawesome.com/your-kit.js" crossorigin="anonymous"></script>
+    <script>
+        // API Configuration
+        const API_BASE = window.location.origin;
+        let token = localStorage.getItem('token');
+        let currentUser = null;
+        let activityChart = null;
+        let distributionChart = null;
 
-    const heroSection = document.getElementById('heroSection');
-    const dashboard = document.getElementById('dashboard');
-    const usernameSpan = document.getElementById('username');
-    const toast = document.getElementById('toast');
-    const toastMessage = document.getElementById('toastMessage');
+        // DOM Elements
+        const authContainer = document.getElementById('authContainer');
+        const dashboardContainer = document.getElementById('dashboardContainer');
+        const usernameDisplay = document.getElementById('usernameDisplay');
+        const dashboardUsername = document.getElementById('dashboardUsername');
+        const logoutBtn = document.getElementById('logoutBtn');
+        const loginTab = document.getElementById('loginTab');
+        const registerTab = document.getElementById('registerTab');
+        const loginForm = document.getElementById('loginForm');
+        const registerForm = document.getElementById('registerForm');
+        const loginBtn = document.getElementById('loginBtn');
+        const registerBtn = document.getElementById('registerBtn');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+        const toastIcon = document.getElementById('toastIcon');
 
-    function showToast(message, type = 'success') {
-      toastMessage.textContent = message;
-      toast.className = `toast show ${type}`;
-      setTimeout(() => toast.classList.remove('show'), 3000);
-    }
+        // Modal elements
+        const createScriptModal = document.getElementById('createScriptModal');
+        const createKeyModal = document.getElementById('createKeyModal');
+        const viewKeysModal = document.getElementById('viewKeysModal');
+        const loaderModal = document.getElementById('loaderModal');
 
-    async function apiCall(endpoint, method = 'GET', data = null) {
-      const headers = {'Content-Type': 'application/json'};
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-      
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-        method, headers,
-        body: data ? JSON.stringify(data) : null
-      });
-      
-      const contentType = response.headers.get('content-type');
-      if (!contentType || !contentType.includes('application/json')) {
-        const text = await response.text();
-        throw new Error('Server error - check console');
-      }
-      
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || 'API call failed');
-      return result;
-    }
+        // ========== UTILITY FUNCTIONS ==========
+        function showToast(message, type = 'success') {
+            toastMessage.textContent = message;
+            toast.className = `toast show ${type}`;
+            toastIcon.className = type === 'success' ? 'fas fa-check-circle' : 
+                                 type === 'error' ? 'fas fa-exclamation-circle' : 
+                                 'fas fa-info-circle';
+            
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 3000);
+        }
 
-    async function loadDashboard() {
-      try {
-        currentUser = await apiCall('/api/user/me');
-        usernameSpan.textContent = currentUser.username;
-        await Promise.all([loadStats(), loadLicenses()]);
-        heroSection.classList.add('hidden');
-        dashboard.classList.remove('hidden');
-      } catch { logout(); }
-    }
+        async function apiCall(endpoint, method = 'GET', data = null) {
+            const headers = {
+                'Content-Type': 'application/json'
+            };
+            
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+            
+            const response = await fetch(`${API_BASE}${endpoint}`, {
+                method,
+                headers,
+                body: data ? JSON.stringify(data) : null
+            });
+            
+            const contentType = response.headers.get('content-type');
+            if (!contentType || !contentType.includes('application/json')) {
+                const text = await response.text();
+                console.error('Non-JSON response:', text.substring(0, 200));
+                throw new Error('Server error');
+            }
+            
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.detail || 'API call failed');
+            }
+            return result;
+        }
 
-    async function loadStats() {
-      const stats = await apiCall('/api/stats');
-      document.getElementById('totalKeys').textContent = stats.total_licenses;
-      document.getElementById('activeKeys').textContent = stats.active_licenses;
-      document.getElementById('onlineNow').textContent = stats.online_now;
-      document.getElementById('expiringSoon').textContent = stats.expiring_soon;
-    }
+        // ========== AUTH FUNCTIONS ==========
+        async function loadDashboard() {
+            try {
+                currentUser = await apiCall('/api/user/me');
+                usernameDisplay.textContent = currentUser.username;
+                dashboardUsername.textContent = currentUser.username;
+                
+                await Promise.all([
+                    loadStats(),
+                    loadScripts(),
+                    loadKeys()
+                ]);
+                
+                initCharts();
+                
+                authContainer.classList.add('hidden');
+                dashboardContainer.classList.remove('hidden');
+            } catch (error) {
+                console.error('Failed to load dashboard:', error);
+                logout();
+            }
+        }
 
-    async function loadLicenses() {
-      const licenses = await apiCall('/api/licenses');
-      const tbody = document.getElementById('keysBody');
-      if (licenses.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:#666;">No keys yet. Click "Create New Key" to get started!</td></tr>';
-        return;
-      }
-      tbody.innerHTML = licenses.map(lic => {
-        const statusClass = lic.status === 'active' ? 'status-active' : 'status-expired';
-        const statusText = lic.online ? '🟢 ONLINE' : (lic.status === 'active' ? 'ACTIVE' : 'EXPIRED');
-        return `<tr><td class="key-cell">${lic.key}</td><td><span class="status-badge ${statusClass}">${statusText}</span></td><td>${lic.hwid ? lic.hwid.substring(0,8)+'...' : 'Not bound'}</td><td>${new Date(lic.expires_at).toLocaleDateString()}</td><td>${lic.last_heartbeat ? new Date(lic.last_heartbeat).toLocaleString() : 'Never'}</td><td><button class="action-btn" onclick="resetHWID('${lic.key}')">Reset HWID</button><button class="action-btn delete" onclick="deleteKey('${lic.key}')">Delete</button></td></tr>`;
-      }).join('');
-    }
+        async function loadStats() {
+            try {
+                const stats = await apiCall('/api/stats');
+                document.getElementById('totalScripts').textContent = stats.total_scripts;
+                document.getElementById('totalKeys').textContent = stats.total_keys;
+                document.getElementById('activeKeys').textContent = stats.active_keys;
+                document.getElementById('onlineNow').textContent = stats.online_now;
+            } catch (error) {
+                console.error('Failed to load stats:', error);
+            }
+        }
 
-    window.resetHWID = async (key) => {
-      if (!confirm(`Reset HWID for ${key}?`)) return;
-      await apiCall('/api/licenses/reset-hwid', 'POST', { key, confirm: true });
-      showToast('HWID reset successfully!');
-      loadLicenses();
-    };
+        async function loadScripts() {
+            try {
+                const scripts = await apiCall('/api/scripts');
+                const grid = document.getElementById('scriptsGrid');
+                
+                if (scripts.length === 0) {
+                    grid.innerHTML = `
+                        <div style="grid-column: 1/-1; text-align: center; padding: 60px;">
+                            <i class="fas fa-code" style="font-size: 3rem; opacity: 0.5; margin-bottom: 20px;"></i>
+                            <h3>No scripts yet</h3>
+                            <p style="color: var(--text-secondary); margin-bottom: 20px;">Create your first script to get started</p>
+                            <button class="btn-primary" onclick="document.getElementById('createScriptBtn').click()">
+                                <i class="fas fa-plus"></i>
+                                Create Script
+                            </button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                grid.innerHTML = scripts.map(script => `
+                    <div class="script-card">
+                        <div class="script-header">
+                            <span class="script-name">${script.name}</span>
+                            <span class="script-badge">ID: ${script.id}</span>
+                        </div>
+                        <div class="script-stats">
+                            <div class="script-stat">
+                                <div class="script-stat-label">Total Keys</div>
+                                <div class="script-stat-value">${script.key_count}</div>
+                            </div>
+                            <div class="script-stat">
+                                <div class="script-stat-label">Active</div>
+                                <div class="script-stat-value">${script.active_keys}</div>
+                            </div>
+                            <div class="script-stat">
+                                <div class="script-stat-label">Created</div>
+                                <div class="script-stat-value">${new Date(script.created_at).toLocaleDateString()}</div>
+                            </div>
+                        </div>
+                        <div class="script-actions">
+                            <button class="btn-success" onclick="showGenerateKeyModal(${script.id}, '${script.name}')">
+                                <i class="fas fa-plus"></i>
+                                Key
+                            </button>
+                            <button class="btn-primary" onclick="generateLoader(${script.id})">
+                                <i class="fas fa-download"></i>
+                                Loader
+                            </button>
+                            <button class="btn-secondary" onclick="viewScriptKeys(${script.id}, '${script.name}')">
+                                <i class="fas fa-eye"></i>
+                                View
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Failed to load scripts:', error);
+            }
+        }
 
-    window.deleteKey = async (key) => {
-      if (!confirm(`Delete ${key}?`)) return;
-      await apiCall(`/api/licenses/${key}`, 'DELETE');
-      showToast('Key deleted successfully!');
-      Promise.all([loadStats(), loadLicenses()]);
-    };
+        async function loadKeys() {
+            try {
+                const keys = await apiCall('/api/keys');
+                const tbody = document.getElementById('keysBody');
+                
+                if (keys.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="8" style="text-align: center; padding: 40px;">
+                                <i class="fas fa-key" style="font-size: 2rem; opacity: 0.5; margin-bottom: 10px;"></i>
+                                <p>No keys yet. Create a script and generate keys!</p>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+                
+                tbody.innerHTML = keys.slice(0, 5).map(key => {
+                    const statusClass = key.online ? 'online' : (key.status === 'active' ? 'active' : 'inactive');
+                    const statusText = key.online ? 'ONLINE' : (key.status === 'active' ? 'ACTIVE' : 'INACTIVE');
+                    
+                    return `
+                        <tr>
+                            <td class="key-cell">${key.key}</td>
+                            <td>${key.nickname || '-'}</td>
+                            <td>${key.script_name}</td>
+                            <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                            <td>${key.hwid ? key.hwid.substring(0, 8) + '...' : 'Not bound'}</td>
+                            <td>${new Date(key.expires_at).toLocaleDateString()}</td>
+                            <td>${key.last_heartbeat ? new Date(key.last_heartbeat).toLocaleString() : 'Never'}</td>
+                            <td>
+                                <div class="action-group">
+                                    <button class="btn-icon" onclick="toggleKeyStatus('${key.key}', '${key.status}')" title="${key.status === 'active' ? 'Deactivate' : 'Activate'}">
+                                        <i class="fas ${key.status === 'active' ? 'fa-pause' : 'fa-play'}"></i>
+                                    </button>
+                                    <button class="btn-icon" onclick="kickKey('${key.key}')" title="Kick User">
+                                        <i class="fas fa-user-slash"></i>
+                                    </button>
+                                    <button class="btn-icon" onclick="resetKeyHWID('${key.key}')" title="Reset HWID">
+                                        <i class="fas fa-undo-alt"></i>
+                                    </button>
+                                    <button class="btn-icon" onclick="setKeyNickname('${key.key}')" title="Set Nickname">
+                                        <i class="fas fa-tag"></i>
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (error) {
+                console.error('Failed to load keys:', error);
+            }
+        }
 
-    function logout() {
-      token = null;
-      localStorage.removeItem('token');
-      heroSection.classList.remove('hidden');
-      dashboard.classList.add('hidden');
-      showToast('Logged out successfully');
-    }
+        function initCharts() {
+            // Activity Chart
+            const activityCtx = document.getElementById('activityChart').getContext('2d');
+            if (activityChart) activityChart.destroy();
+            
+            activityChart = new Chart(activityCtx, {
+                type: 'line',
+                data: {
+                    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    datasets: [{
+                        label: 'Active Keys',
+                        data: [65, 72, 80, 78, 85, 90, 95],
+                        borderColor: '#3B82F6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    },
+                    scales: {
+                        y: {
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.05)'
+                            },
+                            ticks: {
+                                color: '#9CA3AF'
+                            }
+                        },
+                        x: {
+                            grid: {
+                                display: false
+                            },
+                            ticks: {
+                                color: '#9CA3AF'
+                            }
+                        }
+                    }
+                }
+            });
 
-    // Modal handlers
-    const modals = {
-      login: document.getElementById('loginModal'),
-      register: document.getElementById('registerModal'),
-      create: document.getElementById('createKeyModal')
-    };
+            // Distribution Chart
+            const distCtx = document.getElementById('distributionChart').getContext('2d');
+            if (distributionChart) distributionChart.destroy();
+            
+            distributionChart = new Chart(distCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Active', 'Inactive', 'Expired'],
+                    datasets: [{
+                        data: [65, 25, 10],
+                        backgroundColor: [
+                            '#10B981',
+                            '#EF4444',
+                            '#6B7280'
+                        ],
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: '#9CA3AF'
+                            }
+                        }
+                    },
+                    cutout: '70%'
+                }
+            });
+        }
 
-    document.getElementById('openLogin').onclick = () => {
-      modals.login.style.display = 'flex';
-      setTimeout(() => modals.login.classList.add('show'), 10);
-    };
+        function logout() {
+            token = null;
+            localStorage.removeItem('token');
+            authContainer.classList.remove('hidden');
+            dashboardContainer.classList.add('hidden');
+            showToast('Logged out successfully');
+        }
 
-    document.getElementById('openRegister').onclick = () => {
-      modals.register.style.display = 'flex';
-      setTimeout(() => modals.register.classList.add('show'), 10);
-    };
+        // ========== SCRIPT ACTIONS ==========
+        document.getElementById('createScriptBtn').addEventListener('click', () => {
+            createScriptModal.classList.add('show');
+        });
 
-    document.getElementById('createKeyBtn').onclick = () => {
-      modals.create.style.display = 'flex';
-      setTimeout(() => modals.create.classList.add('show'), 10);
-    };
+        document.getElementById('closeScriptModal').addEventListener('click', () => {
+            createScriptModal.classList.remove('show');
+        });
 
-    // Close handlers
-    document.getElementById('closeLoginModal').onclick = () => {
-      modals.login.classList.remove('show');
-      setTimeout(() => modals.login.style.display = 'none', 300);
-    };
+        document.getElementById('cancelScriptBtn').addEventListener('click', () => {
+            createScriptModal.classList.remove('show');
+        });
 
-    document.getElementById('closeRegisterModal').onclick = () => {
-      modals.register.classList.remove('show');
-      setTimeout(() => modals.register.style.display = 'none', 300);
-    };
+        document.getElementById('createScriptSubmit').addEventListener('click', async () => {
+            const name = document.getElementById('scriptName').value;
+            
+            if (!name) {
+                showToast('Please enter a script name', 'error');
+                return;
+            }
+            
+            try {
+                await apiCall('/api/scripts/create', 'POST', { name });
+                createScriptModal.classList.remove('show');
+                document.getElementById('scriptName').value = '';
+                showToast('Script created successfully!');
+                await loadScripts();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
 
-    document.getElementById('closeCreateModal').onclick = () => {
-      modals.create.classList.remove('show');
-      setTimeout(() => modals.create.style.display = 'none', 300);
-    };
+        // ========== KEY ACTIONS ==========
+        window.showGenerateKeyModal = (scriptId, scriptName) => {
+            document.getElementById('keyScriptSelect').innerHTML = `<option value="${scriptId}" selected>${scriptName}</option>`;
+            createKeyModal.classList.add('show');
+        };
 
-    // Switch between modals
-    document.getElementById('switchToRegister').onclick = (e) => {
-      e.preventDefault();
-      modals.login.classList.remove('show');
-      setTimeout(() => {
-        modals.login.style.display = 'none';
-        modals.register.style.display = 'flex';
-        setTimeout(() => modals.register.classList.add('show'), 10);
-      }, 300);
-    };
+        document.getElementById('closeKeyModal').addEventListener('click', () => {
+            createKeyModal.classList.remove('show');
+        });
 
-    document.getElementById('switchToLogin').onclick = (e) => {
-      e.preventDefault();
-      modals.register.classList.remove('show');
-      setTimeout(() => {
-        modals.register.style.display = 'none';
-        modals.login.style.display = 'flex';
-        setTimeout(() => modals.login.classList.add('show'), 10);
-      }, 300);
-    };
+        document.getElementById('cancelKeyBtn').addEventListener('click', () => {
+            createKeyModal.classList.remove('show');
+        });
 
-    // Login submit
-    document.getElementById('loginSubmit').onclick = async () => {
-      const username = document.getElementById('loginUsername').value;
-      const password = document.getElementById('loginPassword').value;
-      if (!username || !password) return showToast('Fill all fields', 'error');
-      
-      try {
-        const result = await apiCall('/api/auth/login', 'POST', { username, password });
-        token = result.access_token;
-        localStorage.setItem('token', token);
-        modals.login.classList.remove('show');
-        setTimeout(() => modals.login.style.display = 'none', 300);
-        await loadDashboard();
-        showToast('Login successful!');
-      } catch (e) { showToast(e.message, 'error'); }
-    };
+        document.getElementById('createKeySubmit').addEventListener('click', async () => {
+            const scriptId = document.getElementById('keyScriptSelect').value;
+            const nickname = document.getElementById('keyNickname').value;
+            const duration = parseInt(document.getElementById('keyDuration').value);
+            
+            if (!scriptId) {
+                showToast('Please select a script', 'error');
+                return;
+            }
+            
+            try {
+                await apiCall('/api/keys/create', 'POST', {
+                    script_id: parseInt(scriptId),
+                    nickname: nickname || null,
+                    duration_days: duration
+                });
+                
+                createKeyModal.classList.remove('show');
+                document.getElementById('keyNickname').value = '';
+                showToast('Key generated successfully!');
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
 
-    // Register submit
-    document.getElementById('registerSubmit').onclick = async () => {
-      const username = document.getElementById('registerUsername').value;
-      const email = document.getElementById('registerEmail').value;
-      const password = document.getElementById('registerPassword').value;
-      if (!username || !email || !password) return showToast('Fill all fields', 'error');
-      
-      try {
-        const result = await apiCall('/api/auth/register', 'POST', { username, email, password });
-        token = result.access_token;
-        localStorage.setItem('token', token);
-        modals.register.classList.remove('show');
-        setTimeout(() => modals.register.style.display = 'none', 300);
-        await loadDashboard();
-        showToast('Registration successful!');
-      } catch (e) { showToast(e.message, 'error'); }
-    };
+        window.toggleKeyStatus = async (key, currentStatus) => {
+            try {
+                await apiCall('/api/keys/action', 'POST', {
+                    key: key,
+                    action: currentStatus === 'active' ? 'deactivate' : 'activate'
+                });
+                showToast(`Key ${currentStatus === 'active' ? 'deactivated' : 'activated'}`);
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
 
-    // Create key submit
-    document.getElementById('createKeySubmit').onclick = async () => {
-      const duration = parseInt(document.getElementById('keyDuration').value);
-      const note = document.getElementById('keyNote').value;
-      
-      try {
-        await apiCall('/api/licenses/create', 'POST', { duration_days: duration, note });
-        modals.create.classList.remove('show');
-        setTimeout(() => modals.create.style.display = 'none', 300);
-        document.getElementById('keyNote').value = '';
-        await Promise.all([loadStats(), loadLicenses()]);
-        showToast('License key created!');
-      } catch (e) { showToast(e.message, 'error'); }
-    };
+        window.kickKey = async (key) => {
+            if (!confirm('Kick this user? They will be disconnected on next heartbeat.')) return;
+            
+            try {
+                await apiCall('/api/keys/action', 'POST', {
+                    key: key,
+                    action: 'kick'
+                });
+                showToast('User will be kicked on next heartbeat');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
 
-    // Logout
-    document.getElementById('logoutBtn').onclick = logout;
+        window.resetKeyHWID = async (key) => {
+            if (!confirm('Reset HWID for this key? The user will need to authenticate again.')) return;
+            
+            try {
+                await apiCall('/api/keys/reset-hwid', 'POST', {
+                    key: key,
+                    confirm: true
+                });
+                showToast('HWID reset successfully');
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
 
-    // Check login status
-    if (token) loadDashboard().catch(() => logout());
+        window.setKeyNickname = async (key) => {
+            const nickname = prompt('Enter nickname for this key:');
+            if (nickname === null) return;
+            
+            try {
+                await apiCall('/api/keys/nickname', 'POST', {
+                    key: key,
+                    nickname: nickname
+                });
+                showToast('Nickname updated');
+                await loadKeys();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
 
-    // Auto-refresh
-    setInterval(async () => {
-      if (token && !dashboard.classList.contains('hidden')) {
-        await Promise.all([loadStats(), loadLicenses()]);
-      }
-    }, 30000);
-  </script>
+        window.viewScriptKeys = async (scriptId, scriptName) => {
+            try {
+                const keys = await apiCall('/api/keys');
+                const scriptKeys = keys.filter(k => k.script_name === scriptName);
+                
+                document.getElementById('viewKeysTitle').textContent = `Keys for ${scriptName}`;
+                
+                const tbody = document.getElementById('modalKeysBody');
+                if (scriptKeys.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px;">No keys for this script</td></tr>';
+                } else {
+                    tbody.innerHTML = scriptKeys.map(key => {
+                        const statusClass = key.online ? 'online' : (key.status === 'active' ? 'active' : 'inactive');
+                        const statusText = key.online ? 'ONLINE' : (key.status === 'active' ? 'ACTIVE' : 'INACTIVE');
+                        
+                        return `
+                            <tr>
+                                <td class="key-cell">${key.key}</td>
+                                <td>${key.nickname || '-'}</td>
+                                <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                                <td>${key.hwid ? key.hwid.substring(0, 8) + '...' : 'Not bound'}</td>
+                                <td>${new Date(key.expires_at).toLocaleDateString()}</td>
+                                <td>
+                                    <div class="action-group">
+                                        <button class="btn-icon" onclick="toggleKeyStatus('${key.key}', '${key.status}')">
+                                            <i class="fas ${key.status === 'active' ? 'fa-pause' : 'fa-play'}"></i>
+                                        </button>
+                                        <button class="btn-icon" onclick="kickKey('${key.key}')">
+                                            <i class="fas fa-user-slash"></i>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+                
+                viewKeysModal.classList.add('show');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        document.getElementById('closeViewKeysModal').addEventListener('click', () => {
+            viewKeysModal.classList.remove('show');
+        });
+
+        document.getElementById('closeViewKeysBtn').addEventListener('click', () => {
+            viewKeysModal.classList.remove('show');
+        });
+
+        document.getElementById('generateKeyFromModal').addEventListener('click', () => {
+            viewKeysModal.classList.remove('show');
+            createKeyModal.classList.add('show');
+        });
+
+        // ========== LOADER GENERATION ==========
+        window.generateLoader = async (scriptId) => {
+            try {
+                const response = await apiCall('/api/loader/generate', 'POST', { script_id: scriptId });
+                document.getElementById('loaderCode').textContent = response.loader;
+                loaderModal.classList.add('show');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        document.getElementById('closeLoaderModal').addEventListener('click', () => {
+            loaderModal.classList.remove('show');
+        });
+
+        document.getElementById('closeLoaderBtn').addEventListener('click', () => {
+            loaderModal.classList.remove('show');
+        });
+
+        document.getElementById('copyLoaderBtn').addEventListener('click', () => {
+            const loaderText = document.getElementById('loaderCode').textContent;
+            navigator.clipboard.writeText(loaderText);
+            showToast('Loader copied to clipboard!');
+        });
+
+        // ========== AUTH EVENT LISTENERS ==========
+        loginTab.addEventListener('click', () => {
+            loginTab.classList.add('active');
+            registerTab.classList.remove('active');
+            loginForm.classList.remove('hidden');
+            registerForm.classList.add('hidden');
+        });
+
+        registerTab.addEventListener('click', () => {
+            registerTab.classList.add('active');
+            loginTab.classList.remove('active');
+            registerForm.classList.remove('hidden');
+            loginForm.classList.add('hidden');
+        });
+
+        loginBtn.addEventListener('click', async () => {
+            const username = document.getElementById('loginUsername').value;
+            const password = document.getElementById('loginPassword').value;
+            
+            if (!username || !password) {
+                showToast('Please fill in all fields', 'error');
+                return;
+            }
+            
+            try {
+                const result = await apiCall('/api/auth/login', 'POST', { username, password });
+                token = result.access_token;
+                localStorage.setItem('token', token);
+                
+                await loadDashboard();
+                showToast('Login successful!');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+
+        registerBtn.addEventListener('click', async () => {
+            const username = document.getElementById('registerUsername').value;
+            const password = document.getElementById('registerPassword').value;
+            const apiKey = document.getElementById('registerApiKey').value;
+            
+            if (!username || !password || !apiKey) {
+                showToast('Please fill in all fields', 'error');
+                return;
+            }
+            
+            try {
+                const result = await apiCall('/api/auth/register', 'POST', { 
+                    username, 
+                    password, 
+                    api_key: apiKey 
+                });
+                token = result.access_token;
+                localStorage.setItem('token', token);
+                
+                await loadDashboard();
+                showToast('Registration successful!');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+
+        logoutBtn.addEventListener('click', logout);
+
+        // ========== INIT ==========
+        if (token) {
+            loadDashboard().catch(() => logout());
+        }
+
+        // Auto-refresh every 30 seconds
+        setInterval(async () => {
+            if (token && !dashboardContainer.classList.contains('hidden')) {
+                await Promise.all([
+                    loadStats(),
+                    loadKeys()
+                ]);
+            }
+        }, 30000);
+
+        // Close modals on overlay click
+        document.querySelectorAll('.modal-overlay').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.classList.remove('show');
+                }
+            });
+        });
+    </script>
 </body>
 </html>
 """
 
 # ========== FRONTEND ROUTES ==========
+@app.get("/dashboard", response_class=HTMLResponse)
+async def serve_dashboard():
+    return HTML_TEMPLATE
+
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
+async def root():
     return HTML_TEMPLATE
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)

@@ -2,12 +2,12 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError, jwt
@@ -15,6 +15,7 @@ from passlib.context import CryptContext
 import asyncpg
 from dotenv import load_dotenv
 import uvicorn
+import bcrypt
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +29,34 @@ print("🚀 Starting Authy application...")
 print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
 print(f"🔑 SECRET_KEY exists: {bool(SECRET_KEY)}")
 
+# ========== PASSWORD HASHING ==========
+# Use direct bcrypt to avoid passlib issues
+def hash_password(password: str) -> str:
+    """Hash password using bcrypt directly"""
+    # Truncate to 72 bytes if needed (bcrypt limit)
+    password_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt(rounds=12)
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password using bcrypt directly"""
+    try:
+        plain_bytes = plain_password.encode('utf-8')[:72]
+        hashed_bytes = hashed_password.encode('utf-8')
+        return bcrypt.checkpw(plain_bytes, hashed_bytes)
+    except Exception as e:
+        print(f"Password verification error: {e}")
+        return False
+
+# Test bcrypt at startup
+try:
+    test_hash = hash_password("test123")
+    test_verify = verify_password("test123", test_hash)
+    print(f"✅ Bcrypt working: {test_verify}")
+except Exception as e:
+    print(f"❌ Bcrypt error: {e}")
+
 # ========== DATABASE CONNECTION POOL ==========
 class Database:
     def __init__(self):
@@ -39,20 +68,9 @@ class Database:
         
         if not DATABASE_URL:
             print("❌ CRITICAL: DATABASE_URL is not set!")
-            print("Please set DATABASE_URL in your environment variables")
             return
         
         try:
-            # Mask password in logs for security
-            masked_url = DATABASE_URL
-            if '@' in masked_url:
-                parts = masked_url.split('@')
-                auth_part = parts[0].split('://')[1] if '://' in parts[0] else parts[0]
-                if ':' in auth_part:
-                    user = auth_part.split(':')[0]
-                    masked_url = masked_url.replace(auth_part, f"{user}:****")
-            print(f"🔌 Connecting to: {masked_url}")
-            
             self.pool = await asyncpg.create_pool(
                 DATABASE_URL, 
                 min_size=5, 
@@ -71,7 +89,6 @@ class Database:
             
         except Exception as e:
             print(f"❌ Database connection failed: {type(e).__name__}: {e}")
-            print("⚠️  The app will still run but API endpoints will fail!")
             return False
 
     async def disconnect(self):
@@ -81,24 +98,18 @@ class Database:
             print("✅ Database disconnected")
 
     async def init_db(self):
-        """Initialize database tables - RECREATES TABLES with correct schema"""
+        """Initialize database tables"""
         if not self.pool:
             print("⚠️  Cannot init DB - no connection pool")
             return
             
         try:
             async with self.pool.acquire() as conn:
-                print("🔄 Recreating database tables...")
+                print("🔄 Creating database tables...")
                 
-                # Drop existing tables (in correct order due to foreign keys)
-                await conn.execute('DROP TABLE IF EXISTS heartbeat_logs CASCADE')
-                await conn.execute('DROP TABLE IF EXISTS licenses CASCADE')
-                await conn.execute('DROP TABLE IF EXISTS users CASCADE')
-                print("✅ Dropped existing tables")
-                
-                # Users table with email column
+                # Users table
                 await conn.execute('''
-                    CREATE TABLE users (
+                    CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
                         username TEXT UNIQUE NOT NULL,
                         password_hash TEXT NOT NULL,
@@ -108,11 +119,11 @@ class Database:
                         api_key TEXT UNIQUE
                     )
                 ''')
-                print("✅ Created users table with email column")
+                print("✅ Users table ready")
                 
                 # Licenses table
                 await conn.execute('''
-                    CREATE TABLE licenses (
+                    CREATE TABLE IF NOT EXISTS licenses (
                         id SERIAL PRIMARY KEY,
                         key TEXT UNIQUE NOT NULL,
                         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -126,11 +137,11 @@ class Database:
                         note TEXT
                     )
                 ''')
-                print("✅ Created licenses table")
+                print("✅ Licenses table ready")
                 
                 # Heartbeat logs table
                 await conn.execute('''
-                    CREATE TABLE heartbeat_logs (
+                    CREATE TABLE IF NOT EXISTS heartbeat_logs (
                         id SERIAL PRIMARY KEY,
                         license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -138,21 +149,12 @@ class Database:
                         ip_address TEXT
                     )
                 ''')
-                print("✅ Created heartbeat_logs table")
+                print("✅ Heartbeat logs table ready")
                 
-                # Create indexes for performance
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key)')
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)')
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_license_id ON heartbeat_logs(license_id)')
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
-                print("✅ Created indexes")
-                
-                print("✅ Database tables recreated successfully!")
+                print("✅ Database tables ready")
                 
         except Exception as e:
             print(f"❌ Failed to initialize tables: {e}")
-            import traceback
-            traceback.print_exc()
 
 db = Database()
 
@@ -165,7 +167,6 @@ async def lifespan(app: FastAPI):
         await db.connect()
     except Exception as e:
         print(f"⚠️  Startup error: {e}")
-        print("The app will continue but database features may not work")
     
     yield
     
@@ -191,7 +192,6 @@ app.add_middleware(
 )
 
 # Security
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
 # ========== HELPER FUNCTIONS ==========
@@ -314,40 +314,26 @@ async def debug_db():
             "database_url_exists": bool(DATABASE_URL)
         }
 
-
-@app.get("/api/test-password")
-async def test_password():
-    """Test if password hashing works"""
+@app.get("/api/test-bcrypt")
+async def test_bcrypt():
+    """Test bcrypt directly"""
     try:
-        test_pass = "testpassword123"
-        hashed = pwd_context.hash(test_pass)
-        verified = pwd_context.verify(test_pass, hashed)
+        password = "test123"
+        hashed = hash_password(password)
+        verified = verify_password(password, hashed)
+        
         return {
-            "hashing_works": True,
-            "hash_preview": hashed[:20] + "...",
-            "verification": verified
+            "status": "ok",
+            "password": password,
+            "hash_preview": hashed[:30] + "...",
+            "verification": verified,
+            "message": "Bcrypt is working"
         }
     except Exception as e:
         return {
+            "status": "error",
             "error": str(e),
             "type": type(e).__name__
-        }
-
-@app.get("/api/test-token")
-async def test_token():
-    """Test if JWT token creation works"""
-    try:
-        token = create_access_token({"sub": "test", "id": 1})
-        return {
-            "token_created": True, 
-            "token_preview": token[:20] + "...",
-            "secret_key_exists": bool(SECRET_KEY)
-        }
-    except Exception as e:
-        return {
-            "error": str(e), 
-            "type": type(e).__name__,
-            "secret_key_exists": bool(SECRET_KEY)
         }
 
 # ========== PUBLIC API ENDPOINTS (for Lua clients) ==========
@@ -477,79 +463,80 @@ async def validate_key(request: HeartbeatRequest):
 # ========== AUTH ENDPOINTS ==========
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user: UserCreate):
-    """Register a new user with detailed error logging"""
-    print(f"📝 Register attempt for username: {user.username}, email: {user.email}")
+    """Register a new user"""
+    print(f"📝 Register attempt: {user.username}")
     
-    # Check database pool
     if not db.pool:
-        print("❌ Database pool is None!")
         raise HTTPException(status_code=503, detail="Database not available")
-    
-    # Check password length for bcrypt (max 72 bytes)
-    if len(user.password.encode('utf-8')) > 72:
-        print("⚠️ Password too long, truncating to 72 bytes")
-        # Truncate password to 72 bytes
-        password_bytes = user.password.encode('utf-8')[:72]
-        password = password_bytes.decode('utf-8', errors='ignore')
-    else:
-        password = user.password
     
     try:
         async with db.pool.acquire() as conn:
-            print("✅ Acquired database connection")
-            
             # Check if user exists
-            try:
-                existing = await conn.fetchval(
-                    "SELECT id FROM users WHERE username = $1 OR email = $2",
-                    user.username, user.email
-                )
-                print(f"🔍 Existing user check result: {existing}")
-            except Exception as e:
-                print(f"❌ Error checking existing user: {e}")
-                raise HTTPException(status_code=500, detail=f"Database query error: {str(e)}")
+            existing = await conn.fetchval(
+                "SELECT id FROM users WHERE username = $1 OR email = $2",
+                user.username, user.email
+            )
             
             if existing:
-                print("⚠️ Username or email already taken")
                 raise HTTPException(status_code=400, detail="Username or email already taken")
             
-            # Create user
-            try:
-                hashed = pwd_context.hash(password)
-                print("✅ Password hashed successfully")
-                
-                api_key = secrets.token_urlsafe(32)
-                print(f"✅ API key generated: {api_key[:8]}...")
-                
-                user_id = await conn.fetchval(
-                    "INSERT INTO users (username, password_hash, email, api_key) VALUES ($1, $2, $3, $4) RETURNING id",
-                    user.username, hashed, user.email, api_key
-                )
-                print(f"✅ User created with ID: {user_id}")
-                
-            except Exception as e:
-                print(f"❌ Error creating user: {e}")
-                raise HTTPException(status_code=500, detail=f"User creation error: {str(e)}")
+            # Hash password and create user
+            hashed = hash_password(user.password)
+            api_key = secrets.token_urlsafe(32)
+            
+            user_id = await conn.fetchval(
+                "INSERT INTO users (username, password_hash, email, api_key) VALUES ($1, $2, $3, $4) RETURNING id",
+                user.username, hashed, user.email, api_key
+            )
             
             # Create token
-            try:
-                token = create_access_token({"sub": user.username, "id": user_id})
-                print("✅ JWT token created")
-            except Exception as e:
-                print(f"❌ Error creating token: {e}")
-                raise HTTPException(status_code=500, detail=f"Token creation error: {str(e)}")
+            token = create_access_token({"sub": user.username, "id": user_id})
             
-            print(f"✅ Registration successful for {user.username}")
+            print(f"✅ Registered: {user.username}")
             return {"access_token": token, "token_type": "bearer"}
             
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        print(f"❌ Unexpected error in register: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        print(f"❌ Register error: {e}")
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(user: UserLogin):
+    """Login user"""
+    print(f"🔐 Login attempt: {user.username}")
+    
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        async with db.pool.acquire() as conn:
+            # Get user
+            db_user = await conn.fetchrow(
+                "SELECT * FROM users WHERE username = $1",
+                user.username
+            )
+            
+            if not db_user:
+                print(f"❌ User not found: {user.username}")
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            
+            # Verify password
+            if not verify_password(user.password, db_user['password_hash']):
+                print(f"❌ Invalid password for: {user.username}")
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            
+            # Create token
+            token = create_access_token({"sub": user.username, "id": db_user['id']})
+            
+            print(f"✅ Login successful: {user.username}")
+            return {"access_token": token, "token_type": "bearer"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Login error: {e}")
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @app.get("/api/user/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
@@ -574,7 +561,7 @@ async def create_license(
         
         # Create license
         expires_at = datetime.now() + timedelta(days=license_data.duration_days)
-        license_id = await conn.fetchval(
+        await conn.fetchval(
             """
             INSERT INTO licenses 
             (key, user_id, expires_at, note, max_hwid_resets) 
@@ -659,7 +646,6 @@ async def reset_hwid(
             }
         
         # Reset HWID
-        old_hwid = license['hwid']
         await conn.execute(
             "UPDATE licenses SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1 WHERE id = $1",
             license['id']
@@ -667,8 +653,7 @@ async def reset_hwid(
         
         return {
             "success": True,
-            "message": f"HWID reset for {request.key}. {license['max_hwid_resets'] - license['hwid_resets_used'] - 1} resets remaining.",
-            "old_hwid": old_hwid
+            "message": f"HWID reset for {request.key}. {license['max_hwid_resets'] - license['hwid_resets_used'] - 1} resets remaining."
         }
 
 @app.delete("/api/licenses/{key}")
@@ -691,7 +676,7 @@ async def delete_license(
         
         return {"success": True}
 
-# ========== STATS & ACTIVITY ==========
+# ========== STATS ==========
 @app.get("/api/stats")
 async def get_stats(current_user: dict = Depends(get_current_user)):
     """Get dashboard stats"""
@@ -705,7 +690,7 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             current_user['id']
         )
         
-        # Active licenses (not expired, status active)
+        # Active licenses
         active = await conn.fetchval(
             """
             SELECT COUNT(*) FROM licenses 
@@ -716,7 +701,7 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             current_user['id']
         )
         
-        # Online now (heartbeat in last 2 minutes)
+        # Online now
         online = await conn.fetchval(
             """
             SELECT COUNT(*) FROM licenses 
@@ -727,7 +712,7 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             current_user['id']
         )
         
-        # Expiring soon (next 7 days)
+        # Expiring soon
         expiring = await conn.fetchval(
             """
             SELECT COUNT(*) FROM licenses 
@@ -746,38 +731,7 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             "expiring_soon": expiring or 0
         }
 
-@app.get("/api/activity")
-async def get_activity(current_user: dict = Depends(get_current_user)):
-    """Get recent activity"""
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    async with db.pool.acquire() as conn:
-        logs = await conn.fetch(
-            """
-            SELECT h.*, l.key 
-            FROM heartbeat_logs h
-            JOIN licenses l ON h.license_id = l.id
-            WHERE l.user_id = $1
-            ORDER BY h.timestamp DESC
-            LIMIT 50
-            """,
-            current_user['id']
-        )
-        
-        result = []
-        for log in logs:
-            log = dict(log)
-            result.append({
-                "key": log['key'],
-                "hwid": log['hwid'][:8] + "..." if log['hwid'] and len(log['hwid']) > 8 else log['hwid'],
-                "timestamp": log['timestamp'].isoformat(),
-                "ip": log['ip_address']
-            })
-        
-        return result
-
-# ========== FRONTEND (Your New HTML/CSS/JS) ==========
+# ========== FRONTEND ==========
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en" class="dark">
@@ -785,7 +739,6 @@ HTML_TEMPLATE = """
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Authy - Protect Your Lua Scripts</title>
-  <!-- Inter font -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1322,7 +1275,7 @@ HTML_TEMPLATE = """
     </div>
   </nav>
 
-  <!-- Hero Section (shown when not logged in) -->
+  <!-- Hero Section -->
   <section class="hero-section" id="heroSection">
     <div class="hero-text">
       Protect Your Lua <span class="highlight">Scripts</span>
@@ -1332,59 +1285,30 @@ HTML_TEMPLATE = """
     </div>
   </section>
 
-  <!-- Dashboard (shown when logged in) -->
+  <!-- Dashboard -->
   <div class="dashboard hidden" id="dashboard">
     <div class="welcome-card">
       <div class="welcome-header">
         <h1 class="welcome-title">Welcome back, <span id="username">User</span>!</h1>
         <div>
-          <button class="create-key-btn" id="createKeyBtn">
-            + Create New Key
-          </button>
+          <button class="create-key-btn" id="createKeyBtn">+ Create New Key</button>
           <button class="logout-btn" id="logoutBtn">Logout</button>
         </div>
       </div>
       
       <div class="stats-grid" id="statsGrid">
-        <div class="stat-card">
-          <div class="stat-label">Total Keys</div>
-          <div class="stat-value" id="totalKeys">0</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Active Keys</div>
-          <div class="stat-value" id="activeKeys">0</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Online Now</div>
-          <div class="stat-value" id="onlineNow">0</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Expiring Soon</div>
-          <div class="stat-value" id="expiringSoon">0</div>
-        </div>
+        <div class="stat-card"><div class="stat-label">Total Keys</div><div class="stat-value" id="totalKeys">0</div></div>
+        <div class="stat-card"><div class="stat-label">Active Keys</div><div class="stat-value" id="activeKeys">0</div></div>
+        <div class="stat-card"><div class="stat-label">Online Now</div><div class="stat-value" id="onlineNow">0</div></div>
+        <div class="stat-card"><div class="stat-label">Expiring Soon</div><div class="stat-value" id="expiringSoon">0</div></div>
       </div>
     </div>
 
     <div class="keys-table">
       <h2>Your License Keys</h2>
       <table id="keysTable">
-        <thead>
-          <tr>
-            <th>Key</th>
-            <th>Status</th>
-            <th>HWID</th>
-            <th>Expires</th>
-            <th>Last Seen</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="keysBody">
-          <tr>
-            <td colspan="6" style="text-align: center; padding: 40px; color: #666;">
-              No keys yet. Create your first one!
-            </td>
-          </tr>
-        </tbody>
+        <thead><tr><th>Key</th><th>Status</th><th>HWID</th><th>Expires</th><th>Last Seen</th><th>Actions</th></tr></thead>
+        <tbody id="keysBody"><tr><td colspan="6" style="text-align:center;padding:40px;color:#666;">No keys yet. Create your first one!</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1394,20 +1318,10 @@ HTML_TEMPLATE = """
     <div class="modal">
       <span class="modal-close" id="closeLoginModal">×</span>
       <h2 class="authy-title">Welcome Back</h2>
-      <div class="floating-input">
-        <input type="text" id="loginUsername" placeholder="">
-        <label for="loginUsername">Username</label>
-        <div class="notch-cover"></div>
-      </div>
-      <div class="floating-input">
-        <input type="password" id="loginPassword" placeholder="">
-        <label for="loginPassword">Password</label>
-        <div class="notch-cover"></div>
-      </div>
+      <div class="floating-input"><input type="text" id="loginUsername" placeholder=""><label>Username</label><div class="notch-cover"></div></div>
+      <div class="floating-input"><input type="password" id="loginPassword" placeholder=""><label>Password</label><div class="notch-cover"></div></div>
       <button class="login-btn" id="loginSubmit">Log in</button>
-      <div class="terms">
-        Don't have an account? <a href="#" id="switchToRegister">Sign up</a>
-      </div>
+      <div class="terms">Don't have an account? <a href="#" id="switchToRegister">Sign up</a></div>
     </div>
   </div>
 
@@ -1416,25 +1330,11 @@ HTML_TEMPLATE = """
     <div class="modal">
       <span class="modal-close" id="closeRegisterModal">×</span>
       <h2 class="authy-title">Create Account</h2>
-      <div class="floating-input">
-        <input type="text" id="registerUsername" placeholder="">
-        <label for="registerUsername">Username</label>
-        <div class="notch-cover"></div>
-      </div>
-      <div class="floating-input">
-        <input type="email" id="registerEmail" placeholder="">
-        <label for="registerEmail">Email</label>
-        <div class="notch-cover"></div>
-      </div>
-      <div class="floating-input">
-        <input type="password" id="registerPassword" placeholder="">
-        <label for="registerPassword">Password</label>
-        <div class="notch-cover"></div>
-      </div>
+      <div class="floating-input"><input type="text" id="registerUsername" placeholder=""><label>Username</label><div class="notch-cover"></div></div>
+      <div class="floating-input"><input type="email" id="registerEmail" placeholder=""><label>Email</label><div class="notch-cover"></div></div>
+      <div class="floating-input"><input type="password" id="registerPassword" placeholder=""><label>Password</label><div class="notch-cover"></div></div>
       <button class="login-btn" id="registerSubmit">Sign up</button>
-      <div class="terms">
-        Already have an account? <a href="#" id="switchToLogin">Sign in</a>
-      </div>
+      <div class="terms">Already have an account? <a href="#" id="switchToLogin">Sign in</a></div>
     </div>
   </div>
 
@@ -1443,218 +1343,98 @@ HTML_TEMPLATE = """
     <div class="modal create-key-modal">
       <span class="modal-close" id="closeCreateModal">×</span>
       <h2 class="authy-title">Create License Key</h2>
-      <select class="duration-select" id="keyDuration">
-        <option value="7">7 days</option>
-        <option value="30" selected>30 days</option>
-        <option value="90">90 days</option>
-        <option value="365">1 year</option>
-      </select>
+      <select class="duration-select" id="keyDuration"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">1 year</option></select>
       <input type="text" class="note-input" id="keyNote" placeholder="Note (optional)">
       <button class="login-btn" id="createKeySubmit">Generate Key</button>
     </div>
   </div>
 
-  <!-- Toast Notification -->
-  <div class="toast" id="toast">
-    <span id="toastMessage"></span>
-  </div>
+  <!-- Toast -->
+  <div class="toast" id="toast"><span id="toastMessage"></span></div>
 
   <script>
-    // API Base URL
     const API_BASE_URL = window.location.origin;
-
-    // State
     let token = localStorage.getItem('token');
     let currentUser = null;
 
-    // DOM Elements
     const heroSection = document.getElementById('heroSection');
     const dashboard = document.getElementById('dashboard');
-    const navRight = document.getElementById('navRight');
     const usernameSpan = document.getElementById('username');
-    const openLoginBtn = document.getElementById('openLogin');
-    const openRegisterBtn = document.getElementById('openRegister');
-    const loginModal = document.getElementById('loginModal');
-    const registerModal = document.getElementById('registerModal');
-    const createKeyModal = document.getElementById('createKeyModal');
-    const createKeyBtn = document.getElementById('createKeyBtn');
-    const logoutBtn = document.getElementById('logoutBtn');
     const toast = document.getElementById('toast');
     const toastMessage = document.getElementById('toastMessage');
 
-    // Modal close buttons
-    const closeLogin = document.getElementById('closeLoginModal');
-    const closeRegister = document.getElementById('closeRegisterModal');
-    const closeCreate = document.getElementById('closeCreateModal');
-
-    // Switch between modals
-    document.getElementById('switchToRegister')?.addEventListener('click', (e) => {
-      e.preventDefault();
-      loginModal.classList.remove('show');
-      setTimeout(() => {
-        loginModal.style.display = 'none';
-        registerModal.style.display = 'flex';
-        setTimeout(() => registerModal.classList.add('show'), 10);
-      }, 300);
-    });
-
-    document.getElementById('switchToLogin')?.addEventListener('click', (e) => {
-      e.preventDefault();
-      registerModal.classList.remove('show');
-      setTimeout(() => {
-        registerModal.style.display = 'none';
-        loginModal.style.display = 'flex';
-        setTimeout(() => loginModal.classList.add('show'), 10);
-      }, 300);
-    });
-
-    // Toast function
     function showToast(message, type = 'success') {
       toastMessage.textContent = message;
       toast.className = `toast show ${type}`;
-      setTimeout(() => {
-        toast.classList.remove('show');
-      }, 3000);
+      setTimeout(() => toast.classList.remove('show'), 3000);
     }
 
-    // API call function
     async function apiCall(endpoint, method = 'GET', data = null) {
-      const headers = {
-        'Content-Type': 'application/json'
-      };
+      const headers = {'Content-Type': 'application/json'};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
       
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method, headers,
+        body: data ? JSON.stringify(data) : null
+      });
+      
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        const text = await response.text();
+        throw new Error('Server error - check console');
       }
       
-      const options = {
-        method,
-        headers
-      };
-      
-      if (data) {
-        options.body = JSON.stringify(data);
-      }
-      
-      try {
-        const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
-        
-        // Check if response is JSON
-        const contentType = response.headers.get('content-type');
-        if (!contentType || !contentType.includes('application/json')) {
-          const text = await response.text();
-          console.error('Non-JSON response:', text.substring(0, 200));
-          throw new Error('Server returned HTML instead of JSON. Check database connection.');
-        }
-        
-        const result = await response.json();
-        
-        if (!response.ok) {
-          throw new Error(result.detail || 'API call failed');
-        }
-        
-        return result;
-      } catch (error) {
-        showToast(error.message, 'error');
-        throw error;
-      }
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'API call failed');
+      return result;
     }
 
-    // Load user data and dashboard
     async function loadDashboard() {
       try {
         currentUser = await apiCall('/api/user/me');
         usernameSpan.textContent = currentUser.username;
-        
-        await Promise.all([
-          loadStats(),
-          loadLicenses()
-        ]);
-        
+        await Promise.all([loadStats(), loadLicenses()]);
         heroSection.classList.add('hidden');
         dashboard.classList.remove('hidden');
-      } catch (error) {
-        console.error('Failed to load dashboard:', error);
-        logout();
-      }
+      } catch { logout(); }
     }
 
-    // Load stats
     async function loadStats() {
-      try {
-        const stats = await apiCall('/api/stats');
-        document.getElementById('totalKeys').textContent = stats.total_licenses;
-        document.getElementById('activeKeys').textContent = stats.active_licenses;
-        document.getElementById('onlineNow').textContent = stats.online_now;
-        document.getElementById('expiringSoon').textContent = stats.expiring_soon;
-      } catch (error) {
-        console.error('Failed to load stats:', error);
-      }
+      const stats = await apiCall('/api/stats');
+      document.getElementById('totalKeys').textContent = stats.total_licenses;
+      document.getElementById('activeKeys').textContent = stats.active_licenses;
+      document.getElementById('onlineNow').textContent = stats.online_now;
+      document.getElementById('expiringSoon').textContent = stats.expiring_soon;
     }
 
-    // Load licenses
     async function loadLicenses() {
-      try {
-        const licenses = await apiCall('/api/licenses');
-        const tbody = document.getElementById('keysBody');
-        
-        if (licenses.length === 0) {
-          tbody.innerHTML = `
-            <tr>
-              <td colspan="6" style="text-align: center; padding: 40px; color: #666;">
-                No keys yet. Click "Create New Key" to get started!
-              </td>
-            </tr>
-          `;
-          return;
-        }
-        
-        tbody.innerHTML = licenses.map(lic => {
-          const statusClass = lic.status === 'active' ? 'status-active' : 'status-expired';
-          const statusText = lic.online ? '🟢 ONLINE' : (lic.status === 'active' ? 'ACTIVE' : 'EXPIRED');
-          
-          return `
-            <tr>
-              <td class="key-cell">${lic.key}</td>
-              <td><span class="status-badge ${statusClass}">${statusText}</span></td>
-              <td>${lic.hwid ? lic.hwid.substring(0, 8) + '...' : 'Not bound'}</td>
-              <td>${new Date(lic.expires_at).toLocaleDateString()}</td>
-              <td>${lic.last_heartbeat ? new Date(lic.last_heartbeat).toLocaleString() : 'Never'}</td>
-              <td>
-                <button class="action-btn" onclick="resetHWID('${lic.key}')">Reset HWID</button>
-                <button class="action-btn delete" onclick="deleteKey('${lic.key}')">Delete</button>
-              </td>
-            </tr>
-          `;
-        }).join('');
-      } catch (error) {
-        console.error('Failed to load licenses:', error);
+      const licenses = await apiCall('/api/licenses');
+      const tbody = document.getElementById('keysBody');
+      if (licenses.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:#666;">No keys yet. Click "Create New Key" to get started!</td></tr>';
+        return;
       }
+      tbody.innerHTML = licenses.map(lic => {
+        const statusClass = lic.status === 'active' ? 'status-active' : 'status-expired';
+        const statusText = lic.online ? '🟢 ONLINE' : (lic.status === 'active' ? 'ACTIVE' : 'EXPIRED');
+        return `<tr><td class="key-cell">${lic.key}</td><td><span class="status-badge ${statusClass}">${statusText}</span></td><td>${lic.hwid ? lic.hwid.substring(0,8)+'...' : 'Not bound'}</td><td>${new Date(lic.expires_at).toLocaleDateString()}</td><td>${lic.last_heartbeat ? new Date(lic.last_heartbeat).toLocaleString() : 'Never'}</td><td><button class="action-btn" onclick="resetHWID('${lic.key}')">Reset HWID</button><button class="action-btn delete" onclick="deleteKey('${lic.key}')">Delete</button></td></tr>`;
+      }).join('');
     }
 
-    // Reset HWID
     window.resetHWID = async (key) => {
-      if (!confirm(`Are you sure you want to reset HWID for ${key}?`)) return;
-      
-      try {
-        await apiCall('/api/licenses/reset-hwid', 'POST', { key, confirm: true });
-        showToast('HWID reset successfully!');
-        loadLicenses();
-      } catch (error) {}
+      if (!confirm(`Reset HWID for ${key}?`)) return;
+      await apiCall('/api/licenses/reset-hwid', 'POST', { key, confirm: true });
+      showToast('HWID reset successfully!');
+      loadLicenses();
     };
 
-    // Delete key
     window.deleteKey = async (key) => {
-      if (!confirm(`Are you sure you want to delete ${key}? This cannot be undone.`)) return;
-      
-      try {
-        await apiCall(`/api/licenses/${key}`, 'DELETE');
-        showToast('Key deleted successfully!');
-        Promise.all([loadStats(), loadLicenses()]);
-      } catch (error) {}
+      if (!confirm(`Delete ${key}?`)) return;
+      await apiCall(`/api/licenses/${key}`, 'DELETE');
+      showToast('Key deleted successfully!');
+      Promise.all([loadStats(), loadLicenses()]);
     };
 
-    // Logout function
     function logout() {
       token = null;
       localStorage.removeItem('token');
@@ -1663,123 +1443,122 @@ HTML_TEMPLATE = """
       showToast('Logged out successfully');
     }
 
-    // ========== EVENT LISTENERS ==========
+    // Modal handlers
+    const modals = {
+      login: document.getElementById('loginModal'),
+      register: document.getElementById('registerModal'),
+      create: document.getElementById('createKeyModal')
+    };
 
-    // Open modals
-    openLoginBtn.addEventListener('click', () => {
-      loginModal.style.display = 'flex';
-      setTimeout(() => loginModal.classList.add('show'), 10);
-    });
+    document.getElementById('openLogin').onclick = () => {
+      modals.login.style.display = 'flex';
+      setTimeout(() => modals.login.classList.add('show'), 10);
+    };
 
-    openRegisterBtn.addEventListener('click', () => {
-      registerModal.style.display = 'flex';
-      setTimeout(() => registerModal.classList.add('show'), 10);
-    });
+    document.getElementById('openRegister').onclick = () => {
+      modals.register.style.display = 'flex';
+      setTimeout(() => modals.register.classList.add('show'), 10);
+    };
 
-    createKeyBtn?.addEventListener('click', () => {
-      createKeyModal.style.display = 'flex';
-      setTimeout(() => createKeyModal.classList.add('show'), 10);
-    });
+    document.getElementById('createKeyBtn').onclick = () => {
+      modals.create.style.display = 'flex';
+      setTimeout(() => modals.create.classList.add('show'), 10);
+    };
 
-    // Close modals
-    closeLogin.addEventListener('click', () => {
-      loginModal.classList.remove('show');
-      setTimeout(() => loginModal.style.display = 'none', 300);
-    });
+    // Close handlers
+    document.getElementById('closeLoginModal').onclick = () => {
+      modals.login.classList.remove('show');
+      setTimeout(() => modals.login.style.display = 'none', 300);
+    };
 
-    closeRegister.addEventListener('click', () => {
-      registerModal.classList.remove('show');
-      setTimeout(() => registerModal.style.display = 'none', 300);
-    });
+    document.getElementById('closeRegisterModal').onclick = () => {
+      modals.register.classList.remove('show');
+      setTimeout(() => modals.register.style.display = 'none', 300);
+    };
 
-    closeCreate.addEventListener('click', () => {
-      createKeyModal.classList.remove('show');
-      setTimeout(() => createKeyModal.style.display = 'none', 300);
-    });
+    document.getElementById('closeCreateModal').onclick = () => {
+      modals.create.classList.remove('show');
+      setTimeout(() => modals.create.style.display = 'none', 300);
+    };
 
-    // Close on overlay click
-    [loginModal, registerModal, createKeyModal].forEach(modal => {
-      modal.addEventListener('click', (e) => {
-        if (e.target === modal) {
-          modal.classList.remove('show');
-          setTimeout(() => modal.style.display = 'none', 300);
-        }
-      });
-    });
+    // Switch between modals
+    document.getElementById('switchToRegister').onclick = (e) => {
+      e.preventDefault();
+      modals.login.classList.remove('show');
+      setTimeout(() => {
+        modals.login.style.display = 'none';
+        modals.register.style.display = 'flex';
+        setTimeout(() => modals.register.classList.add('show'), 10);
+      }, 300);
+    };
+
+    document.getElementById('switchToLogin').onclick = (e) => {
+      e.preventDefault();
+      modals.register.classList.remove('show');
+      setTimeout(() => {
+        modals.register.style.display = 'none';
+        modals.login.style.display = 'flex';
+        setTimeout(() => modals.login.classList.add('show'), 10);
+      }, 300);
+    };
 
     // Login submit
-    document.getElementById('loginSubmit').addEventListener('click', async () => {
+    document.getElementById('loginSubmit').onclick = async () => {
       const username = document.getElementById('loginUsername').value;
       const password = document.getElementById('loginPassword').value;
-      
-      if (!username || !password) {
-        showToast('Please fill in all fields', 'error');
-        return;
-      }
+      if (!username || !password) return showToast('Fill all fields', 'error');
       
       try {
         const result = await apiCall('/api/auth/login', 'POST', { username, password });
         token = result.access_token;
         localStorage.setItem('token', token);
-        
-        loginModal.classList.remove('show');
-        setTimeout(() => loginModal.style.display = 'none', 300);
-        
+        modals.login.classList.remove('show');
+        setTimeout(() => modals.login.style.display = 'none', 300);
         await loadDashboard();
         showToast('Login successful!');
-      } catch (error) {}
-    });
+      } catch (e) { showToast(e.message, 'error'); }
+    };
 
     // Register submit
-    document.getElementById('registerSubmit').addEventListener('click', async () => {
+    document.getElementById('registerSubmit').onclick = async () => {
       const username = document.getElementById('registerUsername').value;
       const email = document.getElementById('registerEmail').value;
       const password = document.getElementById('registerPassword').value;
-      
-      if (!username || !email || !password) {
-        showToast('Please fill in all fields', 'error');
-        return;
-      }
+      if (!username || !email || !password) return showToast('Fill all fields', 'error');
       
       try {
         const result = await apiCall('/api/auth/register', 'POST', { username, email, password });
         token = result.access_token;
         localStorage.setItem('token', token);
-        
-        registerModal.classList.remove('show');
-        setTimeout(() => registerModal.style.display = 'none', 300);
-        
+        modals.register.classList.remove('show');
+        setTimeout(() => modals.register.style.display = 'none', 300);
         await loadDashboard();
         showToast('Registration successful!');
-      } catch (error) {}
-    });
+      } catch (e) { showToast(e.message, 'error'); }
+    };
 
     // Create key submit
-    document.getElementById('createKeySubmit').addEventListener('click', async () => {
+    document.getElementById('createKeySubmit').onclick = async () => {
       const duration = parseInt(document.getElementById('keyDuration').value);
       const note = document.getElementById('keyNote').value;
       
       try {
         await apiCall('/api/licenses/create', 'POST', { duration_days: duration, note });
-        
-        createKeyModal.classList.remove('show');
-        setTimeout(() => createKeyModal.style.display = 'none', 300);
-        
+        modals.create.classList.remove('show');
+        setTimeout(() => modals.create.style.display = 'none', 300);
         document.getElementById('keyNote').value = '';
         await Promise.all([loadStats(), loadLicenses()]);
-        showToast('License key created successfully!');
-      } catch (error) {}
-    });
+        showToast('License key created!');
+      } catch (e) { showToast(e.message, 'error'); }
+    };
 
     // Logout
-    logoutBtn.addEventListener('click', logout);
+    document.getElementById('logoutBtn').onclick = logout;
 
-    // Check if already logged in
-    if (token) {
-      loadDashboard().catch(() => logout());
-    }
+    // Check login status
+    if (token) loadDashboard().catch(() => logout());
 
-    // Auto-refresh every 30 seconds
+    // Auto-refresh
     setInterval(async () => {
       if (token && !dashboard.classList.contains('hidden')) {
         await Promise.all([loadStats(), loadLicenses()]);
@@ -1793,12 +1572,10 @@ HTML_TEMPLATE = """
 # ========== FRONTEND ROUTES ==========
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
-    """Serve the frontend HTML"""
     return HTML_TEMPLATE
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def catch_all(full_path: str):
-    """Catch all routes to serve frontend"""
     return HTML_TEMPLATE
 
 # ========== RUN ==========

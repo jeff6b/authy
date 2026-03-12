@@ -24,70 +24,120 @@ SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+print("🚀 Starting Authy application...")
+print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
+print(f"🔑 SECRET_KEY exists: {bool(SECRET_KEY)}")
+
 # ========== DATABASE CONNECTION POOL ==========
 class Database:
     def __init__(self):
         self.pool = None
 
     async def connect(self):
-        """Create connection pool"""
-        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
-        await self.init_db()
+        """Create connection pool with better error handling"""
+        print(f"🔌 Attempting to connect to database...")
+        
+        if not DATABASE_URL:
+            print("❌ CRITICAL: DATABASE_URL is not set!")
+            print("Please set DATABASE_URL in your environment variables")
+            return
+        
+        try:
+            # Mask password in logs for security
+            masked_url = DATABASE_URL
+            if '@' in masked_url:
+                parts = masked_url.split('@')
+                auth_part = parts[0].split('://')[1] if '://' in parts[0] else parts[0]
+                if ':' in auth_part:
+                    user = auth_part.split(':')[0]
+                    masked_url = masked_url.replace(auth_part, f"{user}:****")
+            print(f"🔌 Connecting to: {masked_url}")
+            
+            self.pool = await asyncpg.create_pool(
+                DATABASE_URL, 
+                min_size=5, 
+                max_size=20,
+                command_timeout=60
+            )
+            
+            # Test the connection
+            async with self.pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+                print("✅ Database connection test successful!")
+            
+            await self.init_db()
+            print("✅ Database connected and initialized")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Database connection failed: {type(e).__name__}: {e}")
+            print("⚠️  The app will still run but API endpoints will fail!")
+            return False
 
     async def disconnect(self):
         """Close connection pool"""
         if self.pool:
             await self.pool.close()
+            print("✅ Database disconnected")
 
     async def init_db(self):
         """Initialize database tables"""
-        async with self.pool.acquire() as conn:
-            # Users table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    email TEXT UNIQUE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_admin BOOLEAN DEFAULT FALSE,
-                    api_key TEXT UNIQUE
-                )
-            ''')
+        if not self.pool:
+            print("⚠️  Cannot init DB - no connection pool")
+            return
             
-            # Licenses table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS licenses (
-                    id SERIAL PRIMARY KEY,
-                    key TEXT UNIQUE NOT NULL,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP NOT NULL,
-                    last_heartbeat TIMESTAMP,
-                    hwid TEXT,
-                    max_hwid_resets INTEGER DEFAULT 3,
-                    hwid_resets_used INTEGER DEFAULT 0,
-                    status TEXT DEFAULT 'active',
-                    note TEXT
-                )
-            ''')
-            
-            # Heartbeat logs table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS heartbeat_logs (
-                    id SERIAL PRIMARY KEY,
-                    license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    hwid TEXT NOT NULL,
-                    ip_address TEXT
-                )
-            ''')
-            
-            # Create indexes for performance
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_license_id ON heartbeat_logs(license_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
+        try:
+            async with self.pool.acquire() as conn:
+                # Users table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        email TEXT UNIQUE NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_admin BOOLEAN DEFAULT FALSE,
+                        api_key TEXT UNIQUE
+                    )
+                ''')
+                
+                # Licenses table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS licenses (
+                        id SERIAL PRIMARY KEY,
+                        key TEXT UNIQUE NOT NULL,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP NOT NULL,
+                        last_heartbeat TIMESTAMP,
+                        hwid TEXT,
+                        max_hwid_resets INTEGER DEFAULT 3,
+                        hwid_resets_used INTEGER DEFAULT 0,
+                        status TEXT DEFAULT 'active',
+                        note TEXT
+                    )
+                ''')
+                
+                # Heartbeat logs table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS heartbeat_logs (
+                        id SERIAL PRIMARY KEY,
+                        license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        hwid TEXT NOT NULL,
+                        ip_address TEXT
+                    )
+                ''')
+                
+                # Create indexes for performance
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_license_id ON heartbeat_logs(license_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
+                
+                print("✅ Database tables initialized")
+        except Exception as e:
+            print(f"❌ Failed to initialize tables: {e}")
 
 db = Database()
 
@@ -95,16 +145,22 @@ db = Database()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    await db.connect()
-    print("✅ Database connected")
+    print("🚀 Starting up...")
+    try:
+        await db.connect()
+    except Exception as e:
+        print(f"⚠️  Startup error: {e}")
+        print("The app will continue but database features may not work")
+    
     yield
+    
     # Shutdown
+    print("🛑 Shutting down...")
     await db.disconnect()
-    print("✅ Database disconnected")
 
 # ========== FASTAPI APP ==========
 app = FastAPI(
-    title="Lua Auth System",
+    title="Authy - Lua Auth System",
     description="Complete authentication system for Lua scripts",
     version="1.0.0",
     lifespan=lifespan
@@ -147,6 +203,9 @@ async def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security
     payload = verify_token(auth.credentials)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
+    
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
         user = await conn.fetchrow(
@@ -203,10 +262,45 @@ class HWIDResetRequest(BaseModel):
     key: str
     confirm: bool = False
 
+# ========== DEBUG ENDPOINT ==========
+@app.get("/api/debug")
+async def debug_db():
+    """Debug endpoint to check database connection"""
+    try:
+        if not db.pool:
+            return {
+                "status": "error", 
+                "message": "Database pool not initialized",
+                "database_url_exists": bool(DATABASE_URL)
+            }
+        
+        async with db.pool.acquire() as conn:
+            result = await conn.fetchval("SELECT 1")
+            return {
+                "status": "ok", 
+                "message": "Database connected",
+                "test_query": result,
+                "pool_size": db.pool.get_size()
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__,
+            "database_url_exists": bool(DATABASE_URL)
+        }
+
 # ========== PUBLIC API ENDPOINTS (for Lua clients) ==========
 @app.post("/api/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest, req: Request):
     """Lua clients call this every 60 seconds"""
+    if not db.pool:
+        return HeartbeatResponse(
+            valid=False, 
+            status="error", 
+            message="Database not available"
+        )
+    
     async with db.pool.acquire() as conn:
         # Get license
         license = await conn.fetchrow(
@@ -285,6 +379,9 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
 @app.post("/api/validate")
 async def validate_key(request: HeartbeatRequest):
     """Simple validation without heartbeat logging"""
+    if not db.pool:
+        return {"valid": False, "reason": "database_error"}
+    
     async with db.pool.acquire() as conn:
         license = await conn.fetchrow(
             "SELECT * FROM licenses WHERE key = $1",
@@ -321,6 +418,9 @@ async def validate_key(request: HeartbeatRequest):
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user: UserCreate):
     """Register a new user"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         # Check if user exists
         existing = await conn.fetchval(
@@ -348,6 +448,9 @@ async def register(user: UserCreate):
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user: UserLogin):
     """Login user"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         db_user = await conn.fetchrow(
             "SELECT * FROM users WHERE username = $1",
@@ -373,6 +476,9 @@ async def create_license(
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new license key"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         # Generate unique key
         key = generate_license_key()
@@ -400,6 +506,9 @@ async def create_license(
 @app.get("/api/licenses")
 async def get_licenses(current_user: dict = Depends(get_current_user)):
     """Get all licenses for current user"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         licenses = await conn.fetch(
             """
@@ -439,6 +548,9 @@ async def reset_hwid(
     current_user: dict = Depends(get_current_user)
 ):
     """Reset HWID for a license"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         license = await conn.fetchrow(
             "SELECT * FROM licenses WHERE key = $1 AND user_id = $2",
@@ -478,6 +590,9 @@ async def delete_license(
     current_user: dict = Depends(get_current_user)
 ):
     """Delete a license"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         result = await conn.execute(
             "DELETE FROM licenses WHERE key = $1 AND user_id = $2",
@@ -493,6 +608,9 @@ async def delete_license(
 @app.get("/api/stats")
 async def get_stats(current_user: dict = Depends(get_current_user)):
     """Get dashboard stats"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         # Total licenses
         total = await conn.fetchval(
@@ -544,6 +662,9 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
 @app.get("/api/activity")
 async def get_activity(current_user: dict = Depends(get_current_user)):
     """Get recent activity"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     async with db.pool.acquire() as conn:
         logs = await conn.fetch(
             """
@@ -1131,7 +1252,7 @@ HTML_TEMPLATE = """
         <h1 class="welcome-title">Welcome back, <span id="username">User</span>!</h1>
         <div>
           <button class="create-key-btn" id="createKeyBtn">
-            <i class="fas fa-plus"></i> Create New Key
+            + Create New Key
           </button>
           <button class="logout-btn" id="logoutBtn">Logout</button>
         </div>
@@ -1330,6 +1451,15 @@ HTML_TEMPLATE = """
       
       try {
         const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
+        
+        // Check if response is JSON
+        const contentType = response.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          const text = await response.text();
+          console.error('Non-JSON response:', text.substring(0, 200));
+          throw new Error('Server returned HTML instead of JSON. Check database connection.');
+        }
+        
         const result = await response.json();
         
         if (!response.ok) {

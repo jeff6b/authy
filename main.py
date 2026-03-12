@@ -81,16 +81,24 @@ class Database:
             print("✅ Database disconnected")
 
     async def init_db(self):
-        """Initialize database tables"""
+        """Initialize database tables - RECREATES TABLES with correct schema"""
         if not self.pool:
             print("⚠️  Cannot init DB - no connection pool")
             return
             
         try:
             async with self.pool.acquire() as conn:
-                # Users table
+                print("🔄 Recreating database tables...")
+                
+                # Drop existing tables (in correct order due to foreign keys)
+                await conn.execute('DROP TABLE IF EXISTS heartbeat_logs CASCADE')
+                await conn.execute('DROP TABLE IF EXISTS licenses CASCADE')
+                await conn.execute('DROP TABLE IF EXISTS users CASCADE')
+                print("✅ Dropped existing tables")
+                
+                # Users table with email column
                 await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
+                    CREATE TABLE users (
                         id SERIAL PRIMARY KEY,
                         username TEXT UNIQUE NOT NULL,
                         password_hash TEXT NOT NULL,
@@ -100,10 +108,11 @@ class Database:
                         api_key TEXT UNIQUE
                     )
                 ''')
+                print("✅ Created users table with email column")
                 
                 # Licenses table
                 await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS licenses (
+                    CREATE TABLE licenses (
                         id SERIAL PRIMARY KEY,
                         key TEXT UNIQUE NOT NULL,
                         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -117,10 +126,11 @@ class Database:
                         note TEXT
                     )
                 ''')
+                print("✅ Created licenses table")
                 
                 # Heartbeat logs table
                 await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS heartbeat_logs (
+                    CREATE TABLE heartbeat_logs (
                         id SERIAL PRIMARY KEY,
                         license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -128,16 +138,21 @@ class Database:
                         ip_address TEXT
                     )
                 ''')
+                print("✅ Created heartbeat_logs table")
                 
                 # Create indexes for performance
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_license_id ON heartbeat_logs(license_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
+                print("✅ Created indexes")
                 
-                print("✅ Database tables initialized")
+                print("✅ Database tables recreated successfully!")
+                
         except Exception as e:
             print(f"❌ Failed to initialize tables: {e}")
+            import traceback
+            traceback.print_exc()
 
 db = Database()
 
@@ -262,7 +277,7 @@ class HWIDResetRequest(BaseModel):
     key: str
     confirm: bool = False
 
-# ========== DEBUG ENDPOINT ==========
+# ========== DEBUG ENDPOINTS ==========
 @app.get("/api/debug")
 async def debug_db():
     """Debug endpoint to check database connection"""
@@ -276,11 +291,20 @@ async def debug_db():
         
         async with db.pool.acquire() as conn:
             result = await conn.fetchval("SELECT 1")
+            # Check if tables exist
+            tables = await conn.fetch("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """)
+            table_list = [t['table_name'] for t in tables]
+            
             return {
                 "status": "ok", 
                 "message": "Database connected",
                 "test_query": result,
-                "pool_size": db.pool.get_size()
+                "pool_size": db.pool.get_size(),
+                "tables": table_list
             }
     except Exception as e:
         return {
@@ -288,6 +312,23 @@ async def debug_db():
             "message": str(e),
             "type": type(e).__name__,
             "database_url_exists": bool(DATABASE_URL)
+        }
+
+@app.get("/api/test-token")
+async def test_token():
+    """Test if JWT token creation works"""
+    try:
+        token = create_access_token({"sub": "test", "id": 1})
+        return {
+            "token_created": True, 
+            "token_preview": token[:20] + "...",
+            "secret_key_exists": bool(SECRET_KEY)
+        }
+    except Exception as e:
+        return {
+            "error": str(e), 
+            "type": type(e).__name__,
+            "secret_key_exists": bool(SECRET_KEY)
         }
 
 # ========== PUBLIC API ENDPOINTS (for Lua clients) ==========

@@ -91,91 +91,93 @@ class Database:
             print("✅ Database disconnected")
 
     async def init_db(self):
-    """Initialize database tables with correct schema"""
-    if not self.pool:
-        print("⚠️ Cannot init DB - no connection pool")
-        return
-        
-    try:
-        async with self.pool.acquire() as conn:
-            print("🔄 Recreating database tables with correct schema...")
+        """Initialize database tables with correct schema"""
+        if not self.pool:
+            print("⚠️ Cannot init DB - no connection pool")
+            return
             
-            # Drop existing tables in correct order (due to foreign keys)
-            await conn.execute('DROP TABLE IF EXISTS heartbeat_logs CASCADE')
-            await conn.execute('DROP TABLE IF EXISTS keys CASCADE')
-            await conn.execute('DROP TABLE IF EXISTS scripts CASCADE')
-            await conn.execute('DROP TABLE IF EXISTS users CASCADE')
-            print("✅ Dropped existing tables")
-            
-            # Users table
-            await conn.execute('''
-                CREATE TABLE users (
-                    id SERIAL PRIMARY KEY,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    email TEXT UNIQUE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_admin BOOLEAN DEFAULT FALSE
-                )
-            ''')
-            print("✅ Users table ready")
-            
-            # Scripts table
-            await conn.execute('''
-                CREATE TABLE scripts (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(name, user_id)
-                )
-            ''')
-            print("✅ Scripts table ready")
-            
-            # Keys table (with script_id foreign key)
-            await conn.execute('''
-                CREATE TABLE keys (
-                    id SERIAL PRIMARY KEY,
-                    key TEXT UNIQUE NOT NULL,
-                    script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
-                    nickname TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP NOT NULL,
-                    last_heartbeat TIMESTAMP,
-                    hwid TEXT,
-                    status TEXT DEFAULT 'active',
-                    max_hwid_resets INTEGER DEFAULT 3,
-                    hwid_resets_used INTEGER DEFAULT 0,
-                    note TEXT
-                )
-            ''')
-            print("✅ Keys table ready with script_id column")
-            
-            # Heartbeat logs table
-            await conn.execute('''
-                CREATE TABLE heartbeat_logs (
-                    id SERIAL PRIMARY KEY,
-                    key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    hwid TEXT NOT NULL,
-                    ip_address TEXT
-                )
-            ''')
-            print("✅ Heartbeat logs table ready")
-            
-            # Create indexes for performance
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
-            
-            print("✅ Database tables recreated successfully!")
-            
-    except Exception as e:
-        print(f"❌ Failed to initialize tables: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            async with self.pool.acquire() as conn:
+                print("🔄 Recreating database tables with correct schema...")
+                
+                # Drop existing tables in correct order (due to foreign keys)
+                await conn.execute('DROP TABLE IF EXISTS heartbeat_logs CASCADE')
+                await conn.execute('DROP TABLE IF EXISTS keys CASCADE')
+                await conn.execute('DROP TABLE IF EXISTS scripts CASCADE')
+                await conn.execute('DROP TABLE IF EXISTS users CASCADE')
+                print("✅ Dropped existing tables")
+                
+                # Users table
+                await conn.execute('''
+                    CREATE TABLE users (
+                        id SERIAL PRIMARY KEY,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        email TEXT UNIQUE NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_admin BOOLEAN DEFAULT FALSE
+                    )
+                ''')
+                print("✅ Users table ready")
+                
+                # Scripts table
+                await conn.execute('''
+                    CREATE TABLE scripts (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(name, user_id)
+                    )
+                ''')
+                print("✅ Scripts table ready")
+                
+                # Keys table (with script_id foreign key)
+                await conn.execute('''
+                    CREATE TABLE keys (
+                        id SERIAL PRIMARY KEY,
+                        key TEXT UNIQUE NOT NULL,
+                        script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+                        nickname TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP NOT NULL,
+                        last_heartbeat TIMESTAMP,
+                        hwid TEXT,
+                        status TEXT DEFAULT 'active',
+                        max_hwid_resets INTEGER DEFAULT 3,
+                        hwid_resets_used INTEGER DEFAULT 0,
+                        note TEXT
+                    )
+                ''')
+                print("✅ Keys table ready with script_id column")
+                
+                # Heartbeat logs table
+                await conn.execute('''
+                    CREATE TABLE heartbeat_logs (
+                        id SERIAL PRIMARY KEY,
+                        key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        hwid TEXT NOT NULL,
+                        ip_address TEXT
+                    )
+                ''')
+                print("✅ Heartbeat logs table ready")
+                
+                # Create indexes for performance
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
+                
+                print("✅ Database tables recreated successfully!")
+                
+        except Exception as e:
+            print(f"❌ Failed to initialize tables: {e}")
+            import traceback
+            traceback.print_exc()
+
+db = Database()
 
 # ========== LIFESPAN HANDLER ==========
 @asynccontextmanager
@@ -1041,12 +1043,7 @@ HTML_TEMPLATE = """
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        *{margin:0;padding:0;box-sizing:border-box;}
         :root {
             --bg-primary: #0A0C10;
             --bg-secondary: #12141A;
@@ -1070,7 +1067,6 @@ HTML_TEMPLATE = """
             --shadow-xl: 0 20px 25px rgba(0,0,0,0.25);
             --blur-bg: rgba(10, 12, 16, 0.7);
         }
-
         body {
             font-family: 'Inter', sans-serif;
             background: var(--bg-primary);
@@ -1079,7 +1075,6 @@ HTML_TEMPLATE = """
             line-height: 1.5;
             position: relative;
         }
-
         body::before {
             content: '';
             position: fixed;
@@ -1094,8 +1089,6 @@ HTML_TEMPLATE = """
             pointer-events: none;
             z-index: -1;
         }
-
-        /* Navbar */
         .navbar {
             position: fixed;
             top: 20px;
@@ -1116,7 +1109,6 @@ HTML_TEMPLATE = """
             z-index: 1000;
             box-shadow: var(--shadow-lg);
         }
-
         .logo {
             display: flex;
             align-items: center;
@@ -1127,16 +1119,13 @@ HTML_TEMPLATE = """
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-
         .logo i {
             font-size: 2rem;
         }
-
         .nav-links {
             display: flex;
             gap: 40px;
         }
-
         .nav-link {
             color: var(--text-secondary);
             text-decoration: none;
@@ -1144,11 +1133,9 @@ HTML_TEMPLATE = """
             transition: all 0.3s ease;
             position: relative;
         }
-
         .nav-link:hover {
             color: var(--text-primary);
         }
-
         .nav-link::after {
             content: '';
             position: absolute;
@@ -1159,17 +1146,14 @@ HTML_TEMPLATE = """
             background: var(--gradient-primary);
             transition: width 0.3s ease;
         }
-
         .nav-link:hover::after {
             width: 100%;
         }
-
         .nav-user {
             display: flex;
             align-items: center;
             gap: 20px;
         }
-
         .user-menu {
             display: flex;
             align-items: center;
@@ -1181,16 +1165,13 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .user-menu:hover {
             border-color: var(--accent-primary);
         }
-
         .username {
             font-weight: 600;
             color: var(--text-primary);
         }
-
         .btn-logout {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -1204,27 +1185,21 @@ HTML_TEMPLATE = """
             align-items: center;
             justify-content: center;
         }
-
         .btn-logout:hover {
             border-color: var(--accent-danger);
             color: var(--accent-danger);
         }
-
-        /* Main Content */
         .main-content {
             padding: 120px 30px 40px;
             max-width: 1400px;
             margin: 0 auto;
         }
-
-        /* Auth Container */
         .auth-container {
             min-height: calc(100vh - 200px);
             display: flex;
             align-items: center;
             justify-content: center;
         }
-
         .auth-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -1236,7 +1211,6 @@ HTML_TEMPLATE = """
             position: relative;
             overflow: hidden;
         }
-
         .auth-card::before {
             content: '';
             position: absolute;
@@ -1246,12 +1220,10 @@ HTML_TEMPLATE = """
             height: 4px;
             background: var(--gradient-primary);
         }
-
         .auth-header {
             text-align: center;
             margin-bottom: 40px;
         }
-
         .auth-header i {
             font-size: 3rem;
             background: var(--gradient-primary);
@@ -1259,16 +1231,13 @@ HTML_TEMPLATE = """
             -webkit-text-fill-color: transparent;
             margin-bottom: 20px;
         }
-
         .auth-header h2 {
             font-size: 2rem;
             margin-bottom: 10px;
         }
-
         .auth-header p {
             color: var(--text-secondary);
         }
-
         .auth-tabs {
             display: flex;
             gap: 10px;
@@ -1277,7 +1246,6 @@ HTML_TEMPLATE = """
             padding: 5px;
             border-radius: 12px;
         }
-
         .tab-btn {
             flex: 1;
             padding: 12px;
@@ -1289,34 +1257,28 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .tab-btn.active {
             background: var(--accent-primary);
             color: white;
         }
-
         .auth-form {
             display: flex;
             flex-direction: column;
             gap: 20px;
         }
-
         .auth-form.hidden {
             display: none;
         }
-
         .form-group {
             display: flex;
             flex-direction: column;
             gap: 8px;
         }
-
         .form-group label {
             color: var(--text-secondary);
             font-size: 0.9rem;
             font-weight: 500;
         }
-
         .form-group input {
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
@@ -1326,13 +1288,11 @@ HTML_TEMPLATE = """
             font-size: 1rem;
             transition: all 0.3s ease;
         }
-
         .form-group input:focus {
             outline: none;
             border-color: var(--accent-primary);
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
         }
-
         .btn-primary {
             background: var(--gradient-primary);
             border: none;
@@ -1348,12 +1308,10 @@ HTML_TEMPLATE = """
             justify-content: center;
             gap: 10px;
         }
-
         .btn-primary:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3);
         }
-
         .btn-secondary {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -1364,12 +1322,10 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .btn-secondary:hover {
             background: var(--bg-tertiary);
             border-color: var(--accent-primary);
         }
-
         .btn-danger {
             background: var(--gradient-danger);
             border: none;
@@ -1380,12 +1336,10 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .btn-danger:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(239, 68, 68, 0.3);
         }
-
         .btn-success {
             background: var(--gradient-success);
             border: none;
@@ -1396,12 +1350,10 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .btn-success:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(16, 185, 129, 0.3);
         }
-
         .btn-warning {
             background: var(--gradient-warning);
             border: none;
@@ -1412,12 +1364,10 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .btn-warning:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(245, 158, 11, 0.3);
         }
-
         .btn-icon {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -1431,39 +1381,31 @@ HTML_TEMPLATE = """
             align-items: center;
             justify-content: center;
         }
-
         .btn-icon:hover {
             border-color: var(--accent-primary);
             color: var(--accent-primary);
         }
-
-        /* Dashboard */
         .dashboard-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 30px;
         }
-
         .dashboard-header h1 {
             font-size: 2.5rem;
             font-weight: 700;
         }
-
         .dashboard-header h1 span {
             background: var(--gradient-primary);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-
-        /* Stats Grid */
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
-
         .stat-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -1473,7 +1415,6 @@ HTML_TEMPLATE = """
             position: relative;
             overflow: hidden;
         }
-
         .stat-card::before {
             content: '';
             position: absolute;
@@ -1485,29 +1426,24 @@ HTML_TEMPLATE = """
             opacity: 0;
             transition: opacity 0.3s ease;
         }
-
         .stat-card:hover::before {
             opacity: 1;
         }
-
         .stat-card:hover {
             transform: translateY(-4px);
             box-shadow: var(--shadow-xl);
         }
-
         .stat-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 16px;
         }
-
         .stat-title {
             color: var(--text-secondary);
             font-size: 0.95rem;
             font-weight: 500;
         }
-
         .stat-icon {
             width: 48px;
             height: 48px;
@@ -1517,97 +1453,78 @@ HTML_TEMPLATE = """
             justify-content: center;
             font-size: 1.5rem;
         }
-
         .stat-icon.blue {
             background: rgba(59, 130, 246, 0.1);
             color: var(--accent-primary);
         }
-
         .stat-icon.green {
             background: rgba(16, 185, 129, 0.1);
             color: var(--accent-success);
         }
-
         .stat-icon.purple {
             background: rgba(99, 102, 241, 0.1);
             color: var(--accent-secondary);
         }
-
         .stat-icon.orange {
             background: rgba(245, 158, 11, 0.1);
             color: var(--accent-warning);
         }
-
         .stat-value {
             font-size: 2.5rem;
             font-weight: 700;
             margin-bottom: 8px;
         }
-
         .stat-change {
             color: var(--text-secondary);
             font-size: 0.9rem;
         }
-
         .stat-change.positive {
             color: var(--accent-success);
         }
-
         .stat-change.negative {
             color: var(--accent-danger);
         }
-
-        /* Charts */
         .charts-grid {
             display: grid;
             grid-template-columns: 2fr 1fr;
             gap: 20px;
             margin-bottom: 30px;
         }
-
         .chart-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
             border-radius: 20px;
             padding: 24px;
         }
-
         .chart-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 20px;
         }
-
         .chart-header h3 {
             font-size: 1.2rem;
             font-weight: 600;
         }
-
         .chart-container {
             height: 300px;
         }
-
-        /* Scripts Section */
         .section-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 20px;
         }
-
         .section-header h2 {
             font-size: 1.5rem;
             font-weight: 600;
         }
-
         .scripts-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
             gap: 20px;
             margin-bottom: 40px;
         }
-
         .script-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -1615,24 +1532,20 @@ HTML_TEMPLATE = """
             padding: 24px;
             transition: all 0.3s ease;
         }
-
         .script-card:hover {
             border-color: var(--accent-primary);
             box-shadow: var(--shadow-lg);
         }
-
         .script-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 16px;
         }
-
         .script-name {
             font-size: 1.3rem;
             font-weight: 600;
         }
-
         .script-badge {
             background: rgba(59, 130, 246, 0.1);
             color: var(--accent-primary);
@@ -1641,7 +1554,6 @@ HTML_TEMPLATE = """
             font-size: 0.85rem;
             font-weight: 500;
         }
-
         .script-stats {
             display: flex;
             gap: 20px;
@@ -1650,32 +1562,25 @@ HTML_TEMPLATE = """
             border-top: 1px solid var(--border-color);
             border-bottom: 1px solid var(--border-color);
         }
-
         .script-stat {
             flex: 1;
         }
-
         .script-stat-label {
             color: var(--text-secondary);
             font-size: 0.85rem;
             margin-bottom: 4px;
         }
-
         .script-stat-value {
             font-size: 1.2rem;
             font-weight: 600;
         }
-
         .script-actions {
             display: flex;
             gap: 10px;
         }
-
         .script-actions button {
             flex: 1;
         }
-
-        /* Keys Table */
         .keys-table-container {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -1683,12 +1588,10 @@ HTML_TEMPLATE = """
             padding: 24px;
             overflow-x: auto;
         }
-
         table {
             width: 100%;
             border-collapse: collapse;
         }
-
         th {
             text-align: left;
             padding: 16px;
@@ -1697,21 +1600,17 @@ HTML_TEMPLATE = """
             font-size: 0.9rem;
             border-bottom: 1px solid var(--border-color);
         }
-
         td {
             padding: 16px;
             border-bottom: 1px solid var(--border-color);
         }
-
         tr:hover td {
             background: var(--bg-tertiary);
         }
-
         .key-cell {
             font-family: monospace;
             font-size: 0.95rem;
         }
-
         .status-badge {
             display: inline-flex;
             align-items: center;
@@ -1721,27 +1620,22 @@ HTML_TEMPLATE = """
             font-size: 0.85rem;
             font-weight: 500;
         }
-
         .status-badge.active {
             background: rgba(16, 185, 129, 0.1);
             color: var(--accent-success);
         }
-
         .status-badge.inactive {
             background: rgba(239, 68, 68, 0.1);
             color: var(--accent-danger);
         }
-
         .status-badge.expired {
             background: rgba(107, 114, 128, 0.1);
             color: var(--text-secondary);
         }
-
         .status-badge.online {
             background: rgba(59, 130, 246, 0.1);
             color: var(--accent-primary);
         }
-
         .status-badge::before {
             content: '';
             width: 8px;
@@ -1749,29 +1643,22 @@ HTML_TEMPLATE = """
             border-radius: 50%;
             display: inline-block;
         }
-
         .status-badge.active::before {
             background: var(--accent-success);
         }
-
         .status-badge.inactive::before {
             background: var(--accent-danger);
         }
-
         .status-badge.expired::before {
             background: var(--text-secondary);
         }
-
         .status-badge.online::before {
             background: var(--accent-primary);
         }
-
         .action-group {
             display: flex;
             gap: 6px;
         }
-
-        /* Modal */
         .modal-overlay {
             position: fixed;
             top: 0;
@@ -1785,11 +1672,9 @@ HTML_TEMPLATE = """
             justify-content: center;
             z-index: 2000;
         }
-
         .modal-overlay.show {
             display: flex;
         }
-
         .modal {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -1798,7 +1683,6 @@ HTML_TEMPLATE = """
             max-width: 500px;
             animation: modalSlide 0.3s ease;
         }
-
         @keyframes modalSlide {
             from {
                 opacity: 0;
@@ -1809,7 +1693,6 @@ HTML_TEMPLATE = """
                 transform: translateY(0);
             }
         }
-
         .modal-header {
             padding: 24px;
             border-bottom: 1px solid var(--border-color);
@@ -1817,12 +1700,10 @@ HTML_TEMPLATE = """
             justify-content: space-between;
             align-items: center;
         }
-
         .modal-header h3 {
             font-size: 1.3rem;
             font-weight: 600;
         }
-
         .modal-close {
             background: transparent;
             border: none;
@@ -1831,15 +1712,12 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: color 0.3s ease;
         }
-
         .modal-close:hover {
             color: var(--text-primary);
         }
-
         .modal-body {
             padding: 24px;
         }
-
         .modal-footer {
             padding: 24px;
             border-top: 1px solid var(--border-color);
@@ -1847,8 +1725,6 @@ HTML_TEMPLATE = """
             justify-content: flex-end;
             gap: 12px;
         }
-
-        /* Loader Preview */
         .loader-preview {
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
@@ -1858,7 +1734,6 @@ HTML_TEMPLATE = """
             max-height: 400px;
             overflow-y: auto;
         }
-
         .loader-preview pre {
             color: var(--text-primary);
             font-family: monospace;
@@ -1866,8 +1741,6 @@ HTML_TEMPLATE = """
             line-height: 1.6;
             white-space: pre-wrap;
         }
-
-        /* Toast */
         .toast {
             position: fixed;
             bottom: 30px;
@@ -1881,63 +1754,49 @@ HTML_TEMPLATE = """
             z-index: 3000;
             box-shadow: var(--shadow-xl);
         }
-
         .toast.show {
             transform: translateX(0);
         }
-
         .toast-content {
             display: flex;
             align-items: center;
             gap: 12px;
         }
-
         .toast.success {
             border-left: 4px solid var(--accent-success);
         }
-
         .toast.error {
             border-left: 4px solid var(--accent-danger);
         }
-
         .toast.info {
             border-left: 4px solid var(--accent-primary);
         }
-
-        /* Utility */
         .hidden {
             display: none !important;
         }
-
         .loader {
             text-align: center;
             padding: 40px;
             color: var(--text-secondary);
         }
-
         .loader i {
             font-size: 2rem;
             margin-bottom: 16px;
         }
-
         @media (max-width: 768px) {
             .navbar {
                 width: 95%;
                 padding: 0 20px;
             }
-
             .nav-links {
                 display: none;
             }
-
             .charts-grid {
                 grid-template-columns: 1fr;
             }
-
             .scripts-grid {
                 grid-template-columns: 1fr;
             }
-
             .dashboard-header {
                 flex-direction: column;
                 gap: 20px;

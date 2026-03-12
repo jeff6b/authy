@@ -91,76 +91,91 @@ class Database:
             print("✅ Database disconnected")
 
     async def init_db(self):
-        if not self.pool:
-            print("⚠️ Cannot init DB - no connection pool")
-            return
+    """Initialize database tables with correct schema"""
+    if not self.pool:
+        print("⚠️ Cannot init DB - no connection pool")
+        return
+        
+    try:
+        async with self.pool.acquire() as conn:
+            print("🔄 Recreating database tables with correct schema...")
             
-        try:
-            async with self.pool.acquire() as conn:
-                print("🔄 Creating database tables...")
-                
-                # Users table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id SERIAL PRIMARY KEY,
-                        username TEXT UNIQUE NOT NULL,
-                        password_hash TEXT NOT NULL,
-                        email TEXT UNIQUE NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        is_admin BOOLEAN DEFAULT FALSE
-                    )
-                ''')
-                print("✅ Users table ready")
-                
-                # Scripts table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS scripts (
-                        id SERIAL PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(name, user_id)
-                    )
-                ''')
-                print("✅ Scripts table ready")
-                
-                # Keys table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS keys (
-                        id SERIAL PRIMARY KEY,
-                        key TEXT UNIQUE NOT NULL,
-                        script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
-                        nickname TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        expires_at TIMESTAMP NOT NULL,
-                        last_heartbeat TIMESTAMP,
-                        hwid TEXT,
-                        status TEXT DEFAULT 'active',
-                        max_hwid_resets INTEGER DEFAULT 3,
-                        hwid_resets_used INTEGER DEFAULT 0,
-                        note TEXT
-                    )
-                ''')
-                print("✅ Keys table ready")
-                
-                # Heartbeat logs table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS heartbeat_logs (
-                        id SERIAL PRIMARY KEY,
-                        key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        hwid TEXT NOT NULL,
-                        ip_address TEXT
-                    )
-                ''')
-                print("✅ Heartbeat logs table ready")
-                
-                print("✅ Database tables ready")
-                
-        except Exception as e:
-            print(f"❌ Failed to initialize tables: {e}")
-
-db = Database()
+            # Drop existing tables in correct order (due to foreign keys)
+            await conn.execute('DROP TABLE IF EXISTS heartbeat_logs CASCADE')
+            await conn.execute('DROP TABLE IF EXISTS keys CASCADE')
+            await conn.execute('DROP TABLE IF EXISTS scripts CASCADE')
+            await conn.execute('DROP TABLE IF EXISTS users CASCADE')
+            print("✅ Dropped existing tables")
+            
+            # Users table
+            await conn.execute('''
+                CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_admin BOOLEAN DEFAULT FALSE
+                )
+            ''')
+            print("✅ Users table ready")
+            
+            # Scripts table
+            await conn.execute('''
+                CREATE TABLE scripts (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(name, user_id)
+                )
+            ''')
+            print("✅ Scripts table ready")
+            
+            # Keys table (with script_id foreign key)
+            await conn.execute('''
+                CREATE TABLE keys (
+                    id SERIAL PRIMARY KEY,
+                    key TEXT UNIQUE NOT NULL,
+                    script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+                    nickname TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL,
+                    last_heartbeat TIMESTAMP,
+                    hwid TEXT,
+                    status TEXT DEFAULT 'active',
+                    max_hwid_resets INTEGER DEFAULT 3,
+                    hwid_resets_used INTEGER DEFAULT 0,
+                    note TEXT
+                )
+            ''')
+            print("✅ Keys table ready with script_id column")
+            
+            # Heartbeat logs table
+            await conn.execute('''
+                CREATE TABLE heartbeat_logs (
+                    id SERIAL PRIMARY KEY,
+                    key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    hwid TEXT NOT NULL,
+                    ip_address TEXT
+                )
+            ''')
+            print("✅ Heartbeat logs table ready")
+            
+            # Create indexes for performance
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
+            
+            print("✅ Database tables recreated successfully!")
+            
+    except Exception as e:
+        print(f"❌ Failed to initialize tables: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ========== LIFESPAN HANDLER ==========
 @asynccontextmanager

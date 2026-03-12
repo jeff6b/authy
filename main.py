@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError, jwt
@@ -23,7 +23,7 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 DATABASE_URL = os.getenv("DATABASE_URL")
-MASTER_API_KEY = "123"  # Hardcoded for now
+MASTER_API_KEY = "123"
 
 print("🚀 Starting Authy application...")
 print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
@@ -98,9 +98,9 @@ class Database:
             
         try:
             async with self.pool.acquire() as conn:
-                print("🔄 Recreating database tables with correct schema...")
+                print("🔄 Creating database tables...")
                 
-                # Drop existing tables in correct order (due to foreign keys)
+                # Drop existing tables in correct order
                 await conn.execute('DROP TABLE IF EXISTS heartbeat_logs CASCADE')
                 await conn.execute('DROP TABLE IF EXISTS keys CASCADE')
                 await conn.execute('DROP TABLE IF EXISTS scripts CASCADE')
@@ -120,19 +120,21 @@ class Database:
                 ''')
                 print("✅ Users table ready")
                 
-                # Scripts table
+                # Scripts table with script_type for differentiation
                 await conn.execute('''
                     CREATE TABLE scripts (
                         id SERIAL PRIMARY KEY,
                         name TEXT NOT NULL,
+                        script_type TEXT DEFAULT 'standard',
                         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        config JSONB DEFAULT '{}',
                         UNIQUE(name, user_id)
                     )
                 ''')
                 print("✅ Scripts table ready")
                 
-                # Keys table (with script_id foreign key)
+                # Keys table
                 await conn.execute('''
                     CREATE TABLE keys (
                         id SERIAL PRIMARY KEY,
@@ -144,12 +146,13 @@ class Database:
                         last_heartbeat TIMESTAMP,
                         hwid TEXT,
                         status TEXT DEFAULT 'active',
+                        kicked BOOLEAN DEFAULT FALSE,
                         max_hwid_resets INTEGER DEFAULT 3,
                         hwid_resets_used INTEGER DEFAULT 0,
                         note TEXT
                     )
                 ''')
-                print("✅ Keys table ready with script_id column")
+                print("✅ Keys table ready")
                 
                 # Heartbeat logs table
                 await conn.execute('''
@@ -163,14 +166,14 @@ class Database:
                 ''')
                 print("✅ Heartbeat logs table ready")
                 
-                # Create indexes for performance
+                # Create indexes
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
                 
-                print("✅ Database tables recreated successfully!")
+                print("✅ Database tables ready")
                 
         except Exception as e:
             print(f"❌ Failed to initialize tables: {e}")
@@ -272,13 +275,17 @@ class TokenResponse(BaseModel):
 
 class ScriptCreate(BaseModel):
     name: str
+    script_type: Optional[str] = "standard"
+    config: Optional[dict] = {}
 
 class ScriptResponse(BaseModel):
     id: int
     name: str
+    script_type: str
     created_at: str
     key_count: int
     active_keys: int
+    config: dict
 
 class KeyCreate(BaseModel):
     script_id: int
@@ -307,6 +314,10 @@ class HeartbeatResponse(BaseModel):
     valid: bool
     status: str
     message: str
+    script_name: Optional[str] = None
+    script_type: Optional[str] = None
+    config: Optional[dict] = None
+    kicked: bool = False
     expires_at: Optional[str] = None
 
 class HWIDResetRequest(BaseModel):
@@ -319,7 +330,6 @@ async def register(user: UserCreate):
     """Register a new user using API key"""
     print(f"📝 Register attempt: {user.username}")
     
-    # Check API key
     if user.api_key != MASTER_API_KEY:
         print(f"❌ Invalid API key: {user.api_key}")
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -329,7 +339,6 @@ async def register(user: UserCreate):
     
     try:
         async with db.pool.acquire() as conn:
-            # Check if user exists
             existing = await conn.fetchval(
                 "SELECT id FROM users WHERE username = $1 OR email = $2",
                 user.username, f"{user.username}@placeholder.com"
@@ -338,7 +347,6 @@ async def register(user: UserCreate):
             if existing:
                 raise HTTPException(status_code=400, detail="Username already taken")
             
-            # Create user with placeholder email
             hashed = hash_password(user.password)
             
             user_id = await conn.fetchval(
@@ -346,7 +354,6 @@ async def register(user: UserCreate):
                 user.username, hashed, f"{user.username}@authy.local"
             )
             
-            # Create token
             token = create_access_token({"sub": user.username, "id": user_id})
             
             print(f"✅ Registered: {user.username}")
@@ -373,12 +380,7 @@ async def login(user: UserLogin):
                 user.username
             )
             
-            if not db_user:
-                print(f"❌ User not found: {user.username}")
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-            
-            if not verify_password(user.password, db_user['password_hash']):
-                print(f"❌ Invalid password for: {user.username}")
+            if not db_user or not verify_password(user.password, db_user['password_hash']):
                 raise HTTPException(status_code=401, detail="Invalid credentials")
             
             token = create_access_token({"sub": user.username, "id": db_user['id']})
@@ -402,12 +404,11 @@ async def create_script(
     script_data: ScriptCreate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Create a new script"""
+    """Create a new script with type differentiation"""
     if not db.pool:
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Check if script name already exists for this user
         existing = await conn.fetchval(
             "SELECT id FROM scripts WHERE name = $1 AND user_id = $2",
             script_data.name, current_user['id']
@@ -417,13 +418,14 @@ async def create_script(
             raise HTTPException(status_code=400, detail="Script name already exists")
         
         script_id = await conn.fetchval(
-            "INSERT INTO scripts (name, user_id) VALUES ($1, $2) RETURNING id",
-            script_data.name, current_user['id']
+            "INSERT INTO scripts (name, script_type, user_id, config) VALUES ($1, $2, $3, $4) RETURNING id",
+            script_data.name, script_data.script_type, current_user['id'], script_data.config or {}
         )
         
         return {
             "id": script_id,
             "name": script_data.name,
+            "script_type": script_data.script_type,
             "message": "Script created successfully"
         }
 
@@ -453,9 +455,11 @@ async def get_scripts(current_user: dict = Depends(get_current_user)):
             result.append({
                 "id": script['id'],
                 "name": script['name'],
+                "script_type": script['script_type'],
                 "created_at": script['created_at'].isoformat(),
                 "key_count": script['key_count'],
-                "active_keys": script['active_keys']
+                "active_keys": script['active_keys'],
+                "config": script['config']
             })
         
         return result
@@ -491,7 +495,6 @@ async def create_key(
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Verify script belongs to user
         script = await conn.fetchval(
             "SELECT id FROM scripts WHERE id = $1 AND user_id = $2",
             key_data.script_id, current_user['id']
@@ -500,12 +503,10 @@ async def create_key(
         if not script:
             raise HTTPException(status_code=404, detail="Script not found")
         
-        # Generate unique key
         key = generate_key()
         while await conn.fetchval("SELECT id FROM keys WHERE key = $1", key):
             key = generate_key()
         
-        # Create key
         expires_at = datetime.now() + timedelta(days=key_data.duration_days)
         await conn.fetchval(
             """
@@ -533,7 +534,7 @@ async def get_keys(current_user: dict = Depends(get_current_user)):
     async with db.pool.acquire() as conn:
         keys = await conn.fetch(
             """
-            SELECT k.*, s.name as script_name
+            SELECT k.*, s.name as script_name, s.script_type
             FROM keys k
             JOIN scripts s ON k.script_id = s.id
             WHERE s.user_id = $1
@@ -553,12 +554,14 @@ async def get_keys(current_user: dict = Depends(get_current_user)):
                 "key": key['key'],
                 "nickname": key['nickname'],
                 "script_name": key['script_name'],
+                "script_type": key['script_type'],
                 "created_at": key['created_at'].isoformat() if key['created_at'] else None,
                 "expires_at": key['expires_at'].isoformat() if key['expires_at'] else None,
                 "last_heartbeat": key['last_heartbeat'].isoformat() if key['last_heartbeat'] else None,
                 "hwid": key['hwid'],
                 "status": key['status'],
                 "online": online,
+                "kicked": key['kicked'],
                 "hwid_resets_used": key['hwid_resets_used'],
                 "max_hwid_resets": key['max_hwid_resets']
             })
@@ -575,7 +578,6 @@ async def key_action(
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Verify key belongs to user
         key_info = await conn.fetchrow(
             """
             SELECT k.* FROM keys k
@@ -590,20 +592,24 @@ async def key_action(
         
         if action.action == "activate":
             await conn.execute(
-                "UPDATE keys SET status = 'active' WHERE key = $1",
+                "UPDATE keys SET status = 'active', kicked = FALSE WHERE key = $1",
                 action.key
             )
             return {"success": True, "message": "Key activated"}
             
         elif action.action == "deactivate":
             await conn.execute(
-                "UPDATE keys SET status = 'suspended' WHERE key = $1",
+                "UPDATE keys SET status = 'suspended', kicked = FALSE WHERE key = $1",
                 action.key
             )
             return {"success": True, "message": "Key deactivated"}
             
         elif action.action == "kick":
-            # Just log that they were kicked - next heartbeat will fail
+            # Set kicked flag - next heartbeat will fail and client will be kicked
+            await conn.execute(
+                "UPDATE keys SET kicked = TRUE WHERE key = $1",
+                action.key
+            )
             return {"success": True, "message": "User will be kicked on next heartbeat"}
         
         raise HTTPException(status_code=400, detail="Invalid action")
@@ -618,7 +624,6 @@ async def set_nickname(
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Verify key belongs to user
         key_info = await conn.fetchrow(
             """
             SELECT k.* FROM keys k
@@ -670,7 +675,7 @@ async def reset_hwid(
             }
         
         await conn.execute(
-            "UPDATE keys SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1 WHERE key = $1",
+            "UPDATE keys SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1, kicked = FALSE WHERE key = $1",
             request.key
         )
         
@@ -712,13 +717,11 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Total scripts
         total_scripts = await conn.fetchval(
             "SELECT COUNT(*) FROM scripts WHERE user_id = $1",
             current_user['id']
         )
         
-        # Total keys
         total_keys = await conn.fetchval(
             """
             SELECT COUNT(*) FROM keys k
@@ -728,7 +731,6 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             current_user['id']
         )
         
-        # Active keys
         active_keys = await conn.fetchval(
             """
             SELECT COUNT(*) FROM keys k
@@ -740,7 +742,6 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             current_user['id']
         )
         
-        # Online now
         online_now = await conn.fetchval(
             """
             SELECT COUNT(*) FROM keys k
@@ -752,7 +753,6 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             current_user['id']
         )
         
-        # Expiring soon
         expiring_soon = await conn.fetchval(
             """
             SELECT COUNT(*) FROM keys k
@@ -779,7 +779,7 @@ async def generate_loader(
     data: dict,
     current_user: dict = Depends(get_current_user)
 ):
-    """Generate a loader for a script"""
+    """Generate a differentiated loader for a specific script"""
     script_id = data.get('script_id')
     
     if not script_id:
@@ -789,7 +789,6 @@ async def generate_loader(
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Verify script belongs to user
         script = await conn.fetchrow(
             "SELECT * FROM scripts WHERE id = $1 AND user_id = $2",
             script_id, current_user['id']
@@ -798,26 +797,29 @@ async def generate_loader(
         if not script:
             raise HTTPException(status_code=404, detail="Script not found")
         
-        # Generate loader code
+        # Generate differentiated loader based on script type
+        script_type = script['script_type']
+        config = script['config'] or {}
+        
         loader = f'''-- =============================================
 -- AUTHY LOADER FOR: {script['name']}
+-- TYPE: {script_type}
 -- GENERATED: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 -- =============================================
 
 local AUTH_URL = "https://authy-o0pm.onrender.com"
 local API_BASE = AUTH_URL
 
--- Get HWID using executor's gethwid()
+-- Get HWID
 local function get_hwid()
     local hwid = gethwid and gethwid()
     if not hwid then
-        -- Fallback for testing
         hwid = "TEST-HWID-123456"
     end
     return hwid
 end
 
--- HTTP request function
+-- HTTP request
 local function request_api(endpoint, data)
     local response = syn and syn.request or http and http.request or request
     if not response then
@@ -836,17 +838,16 @@ local function request_api(endpoint, data)
     return game:GetService("HttpService"):JSONDecode(result.Body)
 end
 
--- Validate key function
+-- Validate key
 local function validate_key(key, hwid)
     local response = request_api("/api/validate", {{
         key = key,
         hwid = hwid
     }})
-    
     return response.valid, response
 end
 
--- Heartbeat function
+-- Heartbeat
 local function send_heartbeat(key, hwid)
     local response = request_api("/api/heartbeat", {{
         key = key,
@@ -855,12 +856,11 @@ local function send_heartbeat(key, hwid)
     return response.valid, response
 end
 
--- Main authentication function
+-- Main authentication
 local function authenticate(key)
     local hwid = get_hwid()
     print("🔑 HWID: " .. hwid)
     
-    -- Validate key
     local valid, response = validate_key(key, hwid)
     
     if not valid then
@@ -869,16 +869,20 @@ local function authenticate(key)
     end
     
     print("✅ Authentication successful!")
-    if response.expires then
-        print("📅 Expires: " .. response.expires)
+    print("📜 Script: {script['name']} ({script_type})")
+    
+    -- Check if kicked
+    if response.kicked then
+        print("❌ You have been kicked from this script!")
+        return false
     end
     
-    -- Start heartbeat loop
+    -- Start heartbeat
     spawn(function()
         while wait(60) do
             local valid, hb_response = send_heartbeat(key, hwid)
-            if not valid then
-                print("❌ License invalidated: " .. (hb_response.message or "unknown"))
+            if not valid or hb_response.kicked then
+                print("❌ You have been kicked or license invalidated!")
                 return
             end
             print("💓 Heartbeat OK")
@@ -888,17 +892,7 @@ local function authenticate(key)
     return true
 end
 
--- ========== YOUR SCRIPT BELOW ==========
--- PASTE YOUR SCRIPT AFTER THIS LINE
--- The key will be provided by your main script
-
--- Example:
--- local success = authenticate("YOUR-KEY-HERE")
--- if success then
---     print("🚀 Loading script...")
---     -- Your actual script code here
--- end
-
+-- Export functions
 return {{
     authenticate = authenticate,
     get_hwid = get_hwid,
@@ -909,13 +903,14 @@ return {{
         return {
             "loader": loader,
             "script_name": script['name'],
+            "script_type": script_type,
             "instructions": "Copy this loader and paste it at the bottom of your script. The user will need to provide their key."
         }
 
 # ========== PUBLIC API ENDPOINTS ==========
 @app.post("/api/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest, req: Request):
-    """Lua clients call this every 60 seconds"""
+    """Lua clients call this - checks if kicked"""
     if not db.pool:
         return HeartbeatResponse(
             valid=False, 
@@ -924,9 +919,13 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
         )
     
     async with db.pool.acquire() as conn:
-        # Get key
         key_info = await conn.fetchrow(
-            "SELECT * FROM keys WHERE key = $1",
+            """
+            SELECT k.*, s.name as script_name, s.script_type, s.config
+            FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE k.key = $1
+            """,
             request.key
         )
         
@@ -938,10 +937,18 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             )
         
         key_info = dict(key_info)
-        expires_at = key_info['expires_at']
+        
+        # Check if kicked
+        if key_info['kicked']:
+            return HeartbeatResponse(
+                valid=False,
+                status="kicked",
+                message="You have been kicked from this script",
+                kicked=True
+            )
         
         # Check if expired
-        if expires_at < datetime.now():
+        if key_info['expires_at'] < datetime.now():
             await conn.execute(
                 "UPDATE keys SET status = 'expired' WHERE id = $1",
                 key_info['id']
@@ -986,24 +993,33 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             key_info['id'], request.hwid, client_ip
         )
         
-        days_left = (expires_at - datetime.now()).days
+        days_left = (key_info['expires_at'] - datetime.now()).days
         
         return HeartbeatResponse(
             valid=True, 
             status="active", 
             message=f"Valid - {days_left} days remaining",
-            expires_at=expires_at.isoformat()
+            script_name=key_info['script_name'],
+            script_type=key_info['script_type'],
+            config=key_info['config'],
+            kicked=False,
+            expires_at=key_info['expires_at'].isoformat()
         )
 
 @app.post("/api/validate")
 async def validate_key(request: HeartbeatRequest):
-    """Simple validation without heartbeat logging"""
+    """Simple validation"""
     if not db.pool:
         return {"valid": False, "reason": "database_error"}
     
     async with db.pool.acquire() as conn:
         key_info = await conn.fetchrow(
-            "SELECT * FROM keys WHERE key = $1",
+            """
+            SELECT k.*, s.name as script_name, s.script_type
+            FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE k.key = $1
+            """,
             request.key
         )
         
@@ -1011,6 +1027,9 @@ async def validate_key(request: HeartbeatRequest):
             return {"valid": False, "reason": "not_found"}
         
         key_info = dict(key_info)
+        
+        if key_info['kicked']:
+            return {"valid": False, "reason": "kicked"}
         
         if key_info['expires_at'] < datetime.now():
             return {"valid": False, "reason": "expired"}
@@ -1028,7 +1047,9 @@ async def validate_key(request: HeartbeatRequest):
             )
         
         return {
-            "valid": True, 
+            "valid": True,
+            "script_name": key_info['script_name'],
+            "script_type": key_info['script_type'],
             "expires": key_info['expires_at'].isoformat()
         }
 
@@ -1041,7 +1062,7 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Authy - Advanced Lua Authentication</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         *{margin:0;padding:0;box-sizing:border-box;}
         :root {
@@ -1121,6 +1142,8 @@ HTML_TEMPLATE = """
         }
         .logo i {
             font-size: 2rem;
+            color: #3B82F6;
+            -webkit-text-fill-color: initial;
         }
         .nav-links {
             display: flex;
@@ -1226,9 +1249,7 @@ HTML_TEMPLATE = """
         }
         .auth-header i {
             font-size: 3rem;
-            background: var(--gradient-primary);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            color: #3B82F6;
             margin-bottom: 20px;
         }
         .auth-header h2 {
@@ -1335,6 +1356,9 @@ HTML_TEMPLATE = """
             font-weight: 500;
             cursor: pointer;
             transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .btn-danger:hover {
             transform: translateY(-2px);
@@ -1349,6 +1373,9 @@ HTML_TEMPLATE = """
             font-weight: 500;
             cursor: pointer;
             transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .btn-success:hover {
             transform: translateY(-2px);
@@ -1363,6 +1390,9 @@ HTML_TEMPLATE = """
             font-weight: 500;
             cursor: pointer;
             transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .btn-warning:hover {
             transform: translateY(-2px);
@@ -1380,10 +1410,15 @@ HTML_TEMPLATE = """
             display: inline-flex;
             align-items: center;
             justify-content: center;
+            font-size: 1rem;
         }
         .btn-icon:hover {
             border-color: var(--accent-primary);
             color: var(--accent-primary);
+        }
+        .btn-icon.danger:hover {
+            border-color: var(--accent-danger);
+            color: var(--accent-danger);
         }
         .dashboard-header {
             display: flex;
@@ -1477,12 +1512,6 @@ HTML_TEMPLATE = """
         .stat-change {
             color: var(--text-secondary);
             font-size: 0.9rem;
-        }
-        .stat-change.positive {
-            color: var(--accent-success);
-        }
-        .stat-change.negative {
-            color: var(--accent-danger);
         }
         .charts-grid {
             display: grid;
@@ -1580,6 +1609,10 @@ HTML_TEMPLATE = """
         }
         .script-actions button {
             flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
         }
         .keys-table-container {
             background: var(--bg-secondary);
@@ -1610,6 +1643,7 @@ HTML_TEMPLATE = """
         .key-cell {
             font-family: monospace;
             font-size: 0.95rem;
+            color: var(--accent-primary);
         }
         .status-badge {
             display: inline-flex;
@@ -2014,6 +2048,14 @@ HTML_TEMPLATE = """
                     <label>Script Name</label>
                     <input type="text" id="scriptName" placeholder="e.g., 'Lua Executor' or 'DarkHub'">
                 </div>
+                <div class="form-group">
+                    <label>Script Type</label>
+                    <select id="scriptType" class="btn-secondary" style="width: 100%; padding: 12px;">
+                        <option value="standard">Standard</option>
+                        <option value="premium">Premium</option>
+                        <option value="custom">Custom</option>
+                    </select>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn-secondary" id="cancelScriptBtn">Cancel</button>
@@ -2137,7 +2179,7 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <script src="https://kit.fontawesome.com/your-kit.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         // API Configuration
         const API_BASE = window.location.origin;
@@ -2269,7 +2311,7 @@ HTML_TEMPLATE = """
                     <div class="script-card">
                         <div class="script-header">
                             <span class="script-name">${script.name}</span>
-                            <span class="script-badge">ID: ${script.id}</span>
+                            <span class="script-badge">${script.script_type}</span>
                         </div>
                         <div class="script-stats">
                             <div class="script-stat">
@@ -2361,7 +2403,6 @@ HTML_TEMPLATE = """
         }
 
         function initCharts() {
-            // Activity Chart
             const activityCtx = document.getElementById('activityChart').getContext('2d');
             if (activityChart) activityChart.destroy();
             
@@ -2381,33 +2422,20 @@ HTML_TEMPLATE = """
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            display: false
-                        }
-                    },
+                    plugins: { legend: { display: false } },
                     scales: {
                         y: {
-                            grid: {
-                                color: 'rgba(255, 255, 255, 0.05)'
-                            },
-                            ticks: {
-                                color: '#9CA3AF'
-                            }
+                            grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                            ticks: { color: '#9CA3AF' }
                         },
                         x: {
-                            grid: {
-                                display: false
-                            },
-                            ticks: {
-                                color: '#9CA3AF'
-                            }
+                            grid: { display: false },
+                            ticks: { color: '#9CA3AF' }
                         }
                     }
                 }
             });
 
-            // Distribution Chart
             const distCtx = document.getElementById('distributionChart').getContext('2d');
             if (distributionChart) distributionChart.destroy();
             
@@ -2417,11 +2445,7 @@ HTML_TEMPLATE = """
                     labels: ['Active', 'Inactive', 'Expired'],
                     datasets: [{
                         data: [65, 25, 10],
-                        backgroundColor: [
-                            '#10B981',
-                            '#EF4444',
-                            '#6B7280'
-                        ],
+                        backgroundColor: ['#10B981', '#EF4444', '#6B7280'],
                         borderWidth: 0
                     }]
                 },
@@ -2431,9 +2455,7 @@ HTML_TEMPLATE = """
                     plugins: {
                         legend: {
                             position: 'bottom',
-                            labels: {
-                                color: '#9CA3AF'
-                            }
+                            labels: { color: '#9CA3AF' }
                         }
                     },
                     cutout: '70%'
@@ -2464,6 +2486,7 @@ HTML_TEMPLATE = """
 
         document.getElementById('createScriptSubmit').addEventListener('click', async () => {
             const name = document.getElementById('scriptName').value;
+            const scriptType = document.getElementById('scriptType').value;
             
             if (!name) {
                 showToast('Please enter a script name', 'error');
@@ -2471,7 +2494,7 @@ HTML_TEMPLATE = """
             }
             
             try {
-                await apiCall('/api/scripts/create', 'POST', { name });
+                await apiCall('/api/scripts/create', 'POST', { name, script_type: scriptType });
                 createScriptModal.classList.remove('show');
                 document.getElementById('scriptName').value = '';
                 showToast('Script created successfully!');

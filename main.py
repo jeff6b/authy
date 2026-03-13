@@ -928,8 +928,6 @@ return {{
             "instructions": "Copy this loader and paste it at the bottom of your script. The user will need to provide their key."
         }
 
-# ========== PUBLIC API ENDPOINTS ==========
-# ========== PUBLIC API ENDPOINTS ==========
 @app.post("/api/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest, req: Request):
     """Lua clients call this - checks if kicked"""
@@ -965,6 +963,15 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             
             key_info = dict(key_info)
             print(f"✅ Key found: {key_info['key']}, kicked: {key_info['kicked']}")
+            
+            # 🔥 FIX: Parse config from JSON string to dict if it's a string
+            config = key_info['config']
+            if isinstance(config, str):
+                import json
+                try:
+                    config = json.loads(config)
+                except:
+                    config = {}
             
             # Check if kicked
             if key_info['kicked']:
@@ -1035,7 +1042,7 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
                 message=f"Valid - {days_left} days remaining",
                 script_name=key_info['script_name'],
                 script_type=key_info['script_type'],
-                config=key_info['config'],
+                config=config,  # 🔥 Now using the parsed config
                 kicked=False,
                 expires_at=key_info['expires_at'].isoformat()
             )
@@ -1058,7 +1065,7 @@ async def validate_key(request: HeartbeatRequest):
     async with db.pool.acquire() as conn:
         key_info = await conn.fetchrow(
             """
-            SELECT k.*, s.name as script_name, s.script_type
+            SELECT k.*, s.name as script_name, s.script_type, s.config
             FROM keys k
             JOIN scripts s ON k.script_id = s.id
             WHERE k.key = $1
@@ -1070,6 +1077,15 @@ async def validate_key(request: HeartbeatRequest):
             return {"valid": False, "reason": "not_found"}
         
         key_info = dict(key_info)
+        
+        # 🔥 FIX: Parse config from JSON string to dict
+        config = key_info['config']
+        if isinstance(config, str):
+            import json
+            try:
+                config = json.loads(config)
+            except:
+                config = {}
         
         if key_info['kicked']:
             return {"valid": False, "reason": "kicked"}
@@ -1093,9 +1109,9 @@ async def validate_key(request: HeartbeatRequest):
             "valid": True,
             "script_name": key_info['script_name'],
             "script_type": key_info['script_type'],
+            "config": config,  # 🔥 Now using parsed config
             "expires": key_info['expires_at'].isoformat()
         }
-
 # ========== ORIGINAL HOMEPAGE ==========
 HOMEPAGE_TEMPLATE = """
 <!DOCTYPE html>

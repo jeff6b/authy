@@ -2,6 +2,8 @@ import os
 import secrets
 import uuid
 import json
+import random
+import string
 from datetime import datetime, timedelta
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -114,10 +116,10 @@ class Database:
                 ''')
                 print("Users table ready")
                 
-                # Scripts table
+                # Scripts table with TEXT id for random IDs
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS scripts (
-                        id SERIAL PRIMARY KEY,
+                        id TEXT PRIMARY KEY,
                         name TEXT NOT NULL,
                         script_type TEXT DEFAULT 'standard',
                         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -126,14 +128,14 @@ class Database:
                         UNIQUE(name, user_id)
                     )
                 ''')
-                print("Scripts table ready")
+                print("Scripts table ready (with TEXT IDs)")
                 
                 # Keys table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS keys (
                         id SERIAL PRIMARY KEY,
                         key TEXT UNIQUE NOT NULL,
-                        script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+                        script_id TEXT NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
                         nickname TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         expires_at TIMESTAMP NOT NULL,
@@ -253,6 +255,11 @@ def generate_key():
         parts.append(uuid.uuid4().hex[:4].upper())
     return f"AUTHY-{'-'.join(parts)}"
 
+def generate_script_id():
+    """Generate a random 7-character script ID (letters and numbers)"""
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(random.choices(characters, k=7))
+
 # ========== PYDANTIC MODELS ==========
 class UserCreate(BaseModel):
     username: str
@@ -273,7 +280,7 @@ class ScriptCreate(BaseModel):
     config: Optional[dict] = {}
 
 class ScriptResponse(BaseModel):
-    id: int
+    id: str
     name: str
     script_type: str
     created_at: str
@@ -282,7 +289,7 @@ class ScriptResponse(BaseModel):
     config: dict
 
 class KeyCreate(BaseModel):
-    script_id: int
+    script_id: str
     nickname: Optional[str] = None
     duration_days: int = 30
 
@@ -398,7 +405,7 @@ async def create_script(
     script_data: ScriptCreate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Create a new script with type differentiation"""
+    """Create a new script with random 7-character ID"""
     print(f"Creating script: {script_data.name} for user {current_user['id']}")
     
     if not db.pool:
@@ -407,6 +414,7 @@ async def create_script(
     
     try:
         async with db.pool.acquire() as conn:
+            # Check if script name already exists
             existing = await conn.fetchval(
                 "SELECT id FROM scripts WHERE name = $1 AND user_id = $2",
                 script_data.name, current_user['id']
@@ -416,13 +424,18 @@ async def create_script(
                 print(f"Script name already exists: {script_data.name}")
                 raise HTTPException(status_code=400, detail="Script name already exists")
             
+            # Generate random 7-character ID
+            script_id = generate_script_id()
+            while await conn.fetchval("SELECT id FROM scripts WHERE id = $1", script_id):
+                script_id = generate_script_id()
+            
             config_json = '{}'
             if script_data.config:
                 config_json = json.dumps(script_data.config)
             
-            script_id = await conn.fetchval(
-                "INSERT INTO scripts (name, script_type, user_id, config) VALUES ($1, $2, $3, $4::jsonb) RETURNING id",
-                script_data.name, script_data.script_type, current_user['id'], config_json
+            await conn.fetchval(
+                "INSERT INTO scripts (id, name, script_type, user_id, config) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id",
+                script_id, script_data.name, script_data.script_type, current_user['id'], config_json
             )
             
             print(f"Script created with ID: {script_id}")
@@ -477,7 +490,7 @@ async def get_scripts(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/scripts/{script_id}")
 async def get_script(
-    script_id: int,
+    script_id: str,
     current_user: dict = Depends(get_current_user)
 ):
     """Get a specific script by ID"""
@@ -497,7 +510,7 @@ async def get_script(
 
 @app.delete("/api/scripts/{script_id}")
 async def delete_script(
-    script_id: int,
+    script_id: str,
     current_user: dict = Depends(get_current_user)
 ):
     """Delete a script and all its keys"""
@@ -601,7 +614,7 @@ async def get_keys(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/keys/script/{script_id}")
 async def get_script_keys(
-    script_id: int,
+    script_id: str,
     current_user: dict = Depends(get_current_user)
 ):
     """Get all keys for a specific script"""
@@ -857,7 +870,7 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/stats/script/{script_id}")
 async def get_script_stats(
-    script_id: int,
+    script_id: str,
     current_user: dict = Depends(get_current_user)
 ):
     """Get stats for a specific script"""
@@ -937,6 +950,7 @@ async def generate_loader(
         
         loader = f'''-- =============================================
 -- AUTHY LOADER FOR: {script['name']}
+-- ID: {script_id}
 -- TYPE: {script_type}
 -- GENERATED: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 -- =============================================
@@ -1003,7 +1017,7 @@ local function authenticate(key)
     end
     
     print("Authentication successful!")
-    print("Script: {script['name']} ({script_type})")
+    print("Script: {script['name']} (ID: {script_id})")
     
     if response.kicked then
         print("You have been kicked from this script!")
@@ -1033,6 +1047,7 @@ return {{
         return {
             "loader": loader,
             "script_name": script['name'],
+            "script_id": script_id,
             "script_type": script_type,
             "instructions": "Copy this loader and paste it at the bottom of your script."
         }
@@ -2963,7 +2978,7 @@ DASHBOARD_TEMPLATE = """
                     <div class="script-card">
                         <div class="script-header">
                             <span class="script-name">${script.name}</span>
-                            <span class="script-badge">${script.script_type}</span>
+                            <span class="script-badge">ID: ${script.id}</span>
                         </div>
                         <div class="script-stats">
                             <div class="script-stat">
@@ -2980,15 +2995,15 @@ DASHBOARD_TEMPLATE = """
                             </div>
                         </div>
                         <div class="script-actions">
-                            <button class="btn-success" onclick="showGenerateKeyModal(${script.id}, '${script.name}')">
+                            <button class="btn-success" onclick="showGenerateKeyModal('${script.id}', '${script.name}')">
                                 <i class="fas fa-plus"></i>
                                 Key
                             </button>
-                            <button class="btn-primary" onclick="generateLoader(${script.id})">
+                            <button class="btn-primary" onclick="generateLoader('${script.id}')">
                                 <i class="fas fa-download"></i>
                                 Loader
                             </button>
-                            <button class="btn-secondary" onclick="viewScriptKeys(${script.id}, '${script.name}')">
+                            <button class="btn-secondary" onclick="viewScriptKeys('${script.id}', '${script.name}')">
                                 <i class="fas fa-eye"></i>
                                 View
                             </button>
@@ -3180,7 +3195,7 @@ DASHBOARD_TEMPLATE = """
             
             try {
                 await apiCall('/api/keys/create', 'POST', {
-                    script_id: parseInt(scriptId),
+                    script_id: scriptId,
                     nickname: nickname || null,
                     duration_days: duration
                 });
@@ -3254,16 +3269,15 @@ DASHBOARD_TEMPLATE = """
 
         window.viewScriptKeys = async (scriptId, scriptName) => {
             try {
-                const keys = await apiCall('/api/keys');
-                const scriptKeys = keys.filter(k => k.script_name === scriptName);
+                const keys = await apiCall('/api/keys/script/' + scriptId);
                 
                 document.getElementById('viewKeysTitle').textContent = `Keys for ${scriptName}`;
                 
                 const tbody = document.getElementById('modalKeysBody');
-                if (scriptKeys.length === 0) {
+                if (keys.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px;">No keys for this script</td></tr>';
                 } else {
-                    tbody.innerHTML = scriptKeys.map(key => {
+                    tbody.innerHTML = keys.map(key => {
                         const statusClass = key.online ? 'online' : (key.status === 'active' ? 'active' : 'inactive');
                         const statusText = key.online ? 'ONLINE' : (key.status === 'active' ? 'ACTIVE' : 'INACTIVE');
                         

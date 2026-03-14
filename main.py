@@ -1,6 +1,7 @@
 import os
 import secrets
 import uuid
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -25,9 +26,9 @@ ALGORITHM = "HS256"
 DATABASE_URL = os.getenv("DATABASE_URL")
 MASTER_API_KEY = "123"
 
-print("🚀 Starting Authy application...")
-print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
-print(f"🔑 SECRET_KEY exists: {bool(SECRET_KEY)}")
+print("Starting Authy application...")
+print(f"DATABASE_URL exists: {bool(DATABASE_URL)}")
+print(f"SECRET_KEY exists: {bool(SECRET_KEY)}")
 
 # ========== PASSWORD HASHING ==========
 def hash_password(password: str) -> str:
@@ -49,9 +50,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 try:
     test_hash = hash_password("test123")
     test_verify = verify_password("test123", test_hash)
-    print(f"✅ Bcrypt working: {test_verify}")
+    print(f"Bcrypt working: {test_verify}")
 except Exception as e:
-    print(f"❌ Bcrypt error: {e}")
+    print(f"Bcrypt error: {e}")
 
 # ========== DATABASE CONNECTION POOL ==========
 class Database:
@@ -59,10 +60,10 @@ class Database:
         self.pool = None
 
     async def connect(self):
-        print(f"🔌 Attempting to connect to database...")
+        print("Attempting to connect to database...")
         
         if not DATABASE_URL:
-            print("❌ CRITICAL: DATABASE_URL is not set!")
+            print("CRITICAL: DATABASE_URL is not set!")
             return
         
         try:
@@ -75,32 +76,32 @@ class Database:
             
             async with self.pool.acquire() as conn:
                 await conn.execute("SELECT 1")
-                print("✅ Database connection test successful!")
+                print("Database connection test successful!")
             
             await self.init_db()
-            print("✅ Database connected and initialized")
+            print("Database connected and initialized")
             return True
             
         except Exception as e:
-            print(f"❌ Database connection failed: {type(e).__name__}: {e}")
+            print(f"Database connection failed: {type(e).__name__}: {e}")
             return False
 
     async def disconnect(self):
         if self.pool:
             await self.pool.close()
-            print("✅ Database disconnected")
+            print("Database disconnected")
 
     async def init_db(self):
         """Initialize database tables WITHOUT dropping - preserves data!"""
         if not self.pool:
-            print("⚠️ Cannot init DB - no connection pool")
+            print("Cannot init DB - no connection pool")
             return
             
         try:
             async with self.pool.acquire() as conn:
-                print("🔄 Ensuring database tables exist...")
+                print("Ensuring database tables exist...")
                 
-                # Users table - CREATE IF NOT EXISTS (preserves data)
+                # Users table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
@@ -111,9 +112,9 @@ class Database:
                         is_admin BOOLEAN DEFAULT FALSE
                     )
                 ''')
-                print("✅ Users table ready")
+                print("Users table ready")
                 
-                # Scripts table - CREATE IF NOT EXISTS
+                # Scripts table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS scripts (
                         id SERIAL PRIMARY KEY,
@@ -125,9 +126,9 @@ class Database:
                         UNIQUE(name, user_id)
                     )
                 ''')
-                print("✅ Scripts table ready")
+                print("Scripts table ready")
                 
-                # Keys table - CREATE IF NOT EXISTS
+                # Keys table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS keys (
                         id SERIAL PRIMARY KEY,
@@ -145,9 +146,9 @@ class Database:
                         note TEXT
                     )
                 ''')
-                print("✅ Keys table ready")
+                print("Keys table ready")
                 
-                # Heartbeat logs table - CREATE IF NOT EXISTS
+                # Heartbeat logs table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS heartbeat_logs (
                         id SERIAL PRIMARY KEY,
@@ -157,19 +158,19 @@ class Database:
                         ip_address TEXT
                     )
                 ''')
-                print("✅ Heartbeat logs table ready")
+                print("Heartbeat logs table ready")
                 
-                # Create indexes if they don't exist
+                # Create indexes
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
                 
-                print("✅ Database tables ready - data preserved!")
+                print("Database tables ready - data preserved!")
                 
         except Exception as e:
-            print(f"❌ Failed to initialize tables: {e}")
+            print(f"Failed to initialize tables: {e}")
             import traceback
             traceback.print_exc()
 
@@ -178,15 +179,15 @@ db = Database()
 # ========== LIFESPAN HANDLER ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Starting up...")
+    print("Starting up...")
     try:
         await db.connect()
     except Exception as e:
-        print(f"⚠️ Startup error: {e}")
+        print(f"Startup error: {e}")
     
     yield
     
-    print("🛑 Shutting down...")
+    print("Shutting down...")
     await db.disconnect()
 
 # ========== FASTAPI APP ==========
@@ -321,10 +322,10 @@ class HWIDResetRequest(BaseModel):
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user: UserCreate):
     """Register a new user using API key"""
-    print(f"📝 Register attempt: {user.username}")
+    print(f"Register attempt: {user.username}")
     
     if user.api_key != MASTER_API_KEY:
-        print(f"❌ Invalid API key: {user.api_key}")
+        print(f"Invalid API key: {user.api_key}")
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     if not db.pool:
@@ -349,19 +350,19 @@ async def register(user: UserCreate):
             
             token = create_access_token({"sub": user.username, "id": user_id})
             
-            print(f"✅ Registered: {user.username}")
+            print(f"Registered: {user.username}")
             return {"access_token": token, "token_type": "bearer"}
             
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Register error: {e}")
+        print(f"Register error: {e}")
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user: UserLogin):
     """Login user"""
-    print(f"🔐 Login attempt: {user.username}")
+    print(f"Login attempt: {user.username}")
     
     if not db.pool:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -378,13 +379,13 @@ async def login(user: UserLogin):
             
             token = create_access_token({"sub": user.username, "id": db_user['id']})
             
-            print(f"✅ Login successful: {user.username}")
+            print(f"Login successful: {user.username}")
             return {"access_token": token, "token_type": "bearer"}
             
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Login error: {e}")
+        print(f"Login error: {e}")
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @app.get("/api/user/me")
@@ -392,47 +393,39 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     return current_user
 
 # ========== SCRIPT MANAGEMENT ==========
-# ========== SCRIPT MANAGEMENT ==========
 @app.post("/api/scripts/create")
 async def create_script(
     script_data: ScriptCreate,
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new script with type differentiation"""
-    print(f"📝 Creating script: {script_data.name} for user {current_user['id']}")
-    print(f"📝 Script data: {script_data}")
+    print(f"Creating script: {script_data.name} for user {current_user['id']}")
     
     if not db.pool:
-        print("❌ Database not available")
+        print("Database not available")
         raise HTTPException(status_code=503, detail="Database not available")
     
     try:
         async with db.pool.acquire() as conn:
-            # Check if script name already exists
             existing = await conn.fetchval(
                 "SELECT id FROM scripts WHERE name = $1 AND user_id = $2",
                 script_data.name, current_user['id']
             )
             
             if existing:
-                print(f"❌ Script name already exists: {script_data.name}")
+                print(f"Script name already exists: {script_data.name}")
                 raise HTTPException(status_code=400, detail="Script name already exists")
             
-            # Convert config dict to JSON string for PostgreSQL
-            config_json = '{}'  # Default empty JSON object
+            config_json = '{}'
             if script_data.config:
-                import json
                 config_json = json.dumps(script_data.config)
             
-            print(f"📝 Config JSON: {config_json}")
-            
-            # Insert new script
             script_id = await conn.fetchval(
                 "INSERT INTO scripts (name, script_type, user_id, config) VALUES ($1, $2, $3, $4::jsonb) RETURNING id",
                 script_data.name, script_data.script_type, current_user['id'], config_json
             )
             
-            print(f"✅ Script created with ID: {script_id}")
+            print(f"Script created with ID: {script_id}")
             return {
                 "id": script_id,
                 "name": script_data.name,
@@ -442,7 +435,7 @@ async def create_script(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Script creation error: {e}")
+        print(f"Script creation error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Script creation failed: {str(e)}")
@@ -482,6 +475,26 @@ async def get_scripts(current_user: dict = Depends(get_current_user)):
         
         return result
 
+@app.get("/api/scripts/{script_id}")
+async def get_script(
+    script_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific script by ID"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        script = await conn.fetchrow(
+            "SELECT * FROM scripts WHERE id = $1 AND user_id = $2",
+            script_id, current_user['id']
+        )
+        
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        
+        return dict(script)
+
 @app.delete("/api/scripts/{script_id}")
 async def delete_script(
     script_id: int,
@@ -513,7 +526,6 @@ async def create_key(
         raise HTTPException(status_code=503, detail="Database not available")
     
     async with db.pool.acquire() as conn:
-        # Verify script belongs to user
         script = await conn.fetchval(
             "SELECT id FROM scripts WHERE id = $1 AND user_id = $2",
             key_data.script_id, current_user['id']
@@ -522,13 +534,11 @@ async def create_key(
         if not script:
             raise HTTPException(status_code=404, detail="Script not found")
         
-        # Generate unique key
         key = generate_key()
         while await conn.fetchval("SELECT id FROM keys WHERE key = $1", key):
             key = generate_key()
         
-        # Create key
-        expires_at = datetime.now() + timedelta(days=key_data.duration_days) if key_data.duration_days > 0 else datetime.now() + timedelta(days=3650)  # ~10 years for lifetime
+        expires_at = datetime.now() + timedelta(days=key_data.duration_days) if key_data.duration_days > 0 else datetime.now() + timedelta(days=3650)
         await conn.fetchval(
             """
             INSERT INTO keys 
@@ -589,6 +599,58 @@ async def get_keys(current_user: dict = Depends(get_current_user)):
         
         return result
 
+@app.get("/api/keys/script/{script_id}")
+async def get_script_keys(
+    script_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all keys for a specific script"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        # Verify script belongs to user
+        script = await conn.fetchval(
+            "SELECT id FROM scripts WHERE id = $1 AND user_id = $2",
+            script_id, current_user['id']
+        )
+        
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        
+        keys = await conn.fetch(
+            """
+            SELECT * FROM keys 
+            WHERE script_id = $1 
+            ORDER BY created_at DESC
+            """,
+            script_id
+        )
+        
+        result = []
+        for key in keys:
+            key = dict(key)
+            online = False
+            if key['last_heartbeat']:
+                online = (datetime.now() - key['last_heartbeat']).seconds < 120
+            
+            result.append({
+                "key": key['key'],
+                "nickname": key['nickname'],
+                "created_at": key['created_at'].isoformat() if key['created_at'] else None,
+                "expires_at": key['expires_at'].isoformat() if key['expires_at'] else None,
+                "last_heartbeat": key['last_heartbeat'].isoformat() if key['last_heartbeat'] else None,
+                "hwid": key['hwid'],
+                "status": key['status'],
+                "online": online,
+                "kicked": key['kicked'],
+                "hwid_resets_used": key['hwid_resets_used'],
+                "max_hwid_resets": key['max_hwid_resets'],
+                "note": key['note']
+            })
+        
+        return result
+
 @app.post("/api/keys/action")
 async def key_action(
     action: KeyAction,
@@ -626,7 +688,6 @@ async def key_action(
             return {"success": True, "message": "Key deactivated"}
             
         elif action.action == "kick":
-            # Set kicked flag - next heartbeat will fail and client will be kicked
             await conn.execute(
                 "UPDATE keys SET kicked = TRUE WHERE key = $1",
                 action.key
@@ -794,6 +855,59 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
             "expiring_soon": expiring_soon or 0
         }
 
+@app.get("/api/stats/script/{script_id}")
+async def get_script_stats(
+    script_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get stats for a specific script"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        # Verify script belongs to user
+        script = await conn.fetchrow(
+            "SELECT * FROM scripts WHERE id = $1 AND user_id = $2",
+            script_id, current_user['id']
+        )
+        
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        
+        total_keys = await conn.fetchval(
+            "SELECT COUNT(*) FROM keys WHERE script_id = $1",
+            script_id
+        )
+        
+        active_keys = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys 
+            WHERE script_id = $1 
+            AND status = 'active' 
+            AND expires_at > CURRENT_TIMESTAMP
+            """,
+            script_id
+        )
+        
+        online_now = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys 
+            WHERE script_id = $1 
+            AND last_heartbeat IS NOT NULL
+            AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_heartbeat)) < 120
+            """,
+            script_id
+        )
+        
+        return {
+            "script_id": script_id,
+            "script_name": script['name'],
+            "script_type": script['script_type'],
+            "total_keys": total_keys or 0,
+            "active_keys": active_keys or 0,
+            "online_now": online_now or 0
+        }
+
 # ========== LOADER GENERATION ==========
 @app.post("/api/loader/generate")
 async def generate_loader(
@@ -818,7 +932,6 @@ async def generate_loader(
         if not script:
             raise HTTPException(status_code=404, detail="Script not found")
         
-        # Generate differentiated loader based on script type
         script_type = script['script_type']
         config = script['config'] or {}
         
@@ -880,40 +993,36 @@ end
 -- Main authentication
 local function authenticate(key)
     local hwid = get_hwid()
-    print("🔑 HWID: " .. hwid)
+    print("HWID: " .. hwid)
     
     local valid, response = validate_key(key, hwid)
     
     if not valid then
-        print("❌ Authentication failed: " .. (response.reason or "unknown error"))
+        print("Authentication failed: " .. (response.reason or "unknown error"))
         return false
     end
     
-    print("✅ Authentication successful!")
-    print("📜 Script: {script['name']} ({script_type})")
+    print("Authentication successful!")
+    print("Script: {script['name']} ({script_type})")
     
-    -- Check if kicked
     if response.kicked then
-        print("❌ You have been kicked from this script!")
+        print("You have been kicked from this script!")
         return false
     end
     
-    -- Start heartbeat
     spawn(function()
         while wait(60) do
             local valid, hb_response = send_heartbeat(key, hwid)
             if not valid or hb_response.kicked then
-                print("❌ You have been kicked or license invalidated!")
+                print("You have been kicked or license invalidated!")
                 return
             end
-            print("💓 Heartbeat OK")
         end
     end)
     
     return true
 end
 
--- Export functions
 return {{
     authenticate = authenticate,
     get_hwid = get_hwid,
@@ -925,16 +1034,14 @@ return {{
             "loader": loader,
             "script_name": script['name'],
             "script_type": script_type,
-            "instructions": "Copy this loader and paste it at the bottom of your script. The user will need to provide their key."
+            "instructions": "Copy this loader and paste it at the bottom of your script."
         }
 
+# ========== PUBLIC API ENDPOINTS ==========
 @app.post("/api/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest, req: Request):
     """Lua clients call this - checks if kicked"""
-    print(f"💓 Heartbeat received for key: {request.key}")
-    
     if not db.pool:
-        print("❌ Database not available")
         return HeartbeatResponse(
             valid=False, 
             status="error", 
@@ -954,7 +1061,6 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             )
             
             if not key_info:
-                print(f"❌ Key not found: {request.key}")
                 return HeartbeatResponse(
                     valid=False, 
                     status="invalid", 
@@ -962,20 +1068,16 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
                 )
             
             key_info = dict(key_info)
-            print(f"✅ Key found: {key_info['key']}, kicked: {key_info['kicked']}")
             
-            # 🔥 FIX: Parse config from JSON string to dict if it's a string
+            # Parse config if it's a string
             config = key_info['config']
             if isinstance(config, str):
-                import json
                 try:
                     config = json.loads(config)
                 except:
                     config = {}
             
-            # Check if kicked
             if key_info['kicked']:
-                print(f"❌ Key is kicked: {request.key}")
                 return HeartbeatResponse(
                     valid=False,
                     status="kicked",
@@ -983,9 +1085,7 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
                     kicked=True
                 )
             
-            # Check if expired
             if key_info['expires_at'] < datetime.now():
-                print(f"❌ Key expired: {request.key}")
                 await conn.execute(
                     "UPDATE keys SET status = 'expired' WHERE id = $1",
                     key_info['id']
@@ -996,26 +1096,21 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
                     message="Key expired"
                 )
             
-            # Check if suspended
             if key_info['status'] != 'active':
-                print(f"❌ Key {key_info['status']}: {request.key}")
                 return HeartbeatResponse(
                     valid=False, 
                     status=key_info['status'], 
                     message=f"Key {key_info['status']}"
                 )
             
-            # HWID binding
             client_ip = req.client.host if req.client else "unknown"
             
             if not key_info['hwid']:
-                print(f"🔑 Binding HWID for key: {request.key}")
                 await conn.execute(
                     "UPDATE keys SET hwid = $1, last_heartbeat = CURRENT_TIMESTAMP WHERE id = $2",
                     request.hwid, key_info['id']
                 )
             elif key_info['hwid'] != request.hwid:
-                print(f"❌ HWID mismatch for key: {request.key}")
                 return HeartbeatResponse(
                     valid=False, 
                     status="hwid_mismatch", 
@@ -1027,7 +1122,6 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
                     key_info['id']
                 )
             
-            # Log heartbeat
             await conn.execute(
                 "INSERT INTO heartbeat_logs (key_id, hwid, ip_address) VALUES ($1, $2, $3)",
                 key_info['id'], request.hwid, client_ip
@@ -1035,19 +1129,18 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             
             days_left = (key_info['expires_at'] - datetime.now()).days if key_info['expires_at'] > datetime.now() else 0
             
-            print(f"✅ Heartbeat successful for key: {request.key}")
             return HeartbeatResponse(
                 valid=True, 
                 status="active", 
                 message=f"Valid - {days_left} days remaining",
                 script_name=key_info['script_name'],
                 script_type=key_info['script_type'],
-                config=config,  # 🔥 Now using the parsed config
+                config=config,
                 kicked=False,
                 expires_at=key_info['expires_at'].isoformat()
             )
     except Exception as e:
-        print(f"❌ Heartbeat error: {e}")
+        print(f"Heartbeat error: {e}")
         import traceback
         traceback.print_exc()
         return HeartbeatResponse(
@@ -1078,10 +1171,8 @@ async def validate_key(request: HeartbeatRequest):
         
         key_info = dict(key_info)
         
-        # 🔥 FIX: Parse config from JSON string to dict
         config = key_info['config']
         if isinstance(config, str):
-            import json
             try:
                 config = json.loads(config)
             except:
@@ -1109,10 +1200,11 @@ async def validate_key(request: HeartbeatRequest):
             "valid": True,
             "script_name": key_info['script_name'],
             "script_type": key_info['script_type'],
-            "config": config,  # 🔥 Now using parsed config
+            "config": config,
             "expires": key_info['expires_at'].isoformat()
         }
-# ========== ORIGINAL HOMEPAGE ==========
+
+# ========== HOMEPAGE TEMPLATE ==========
 HOMEPAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en" class="dark">
@@ -1674,7 +1766,7 @@ HOMEPAGE_TEMPLATE = """
 </html>
 """
 
-# ========== DASHBOARD TEMPLATE (Full working dashboard) ==========
+# ========== DASHBOARD TEMPLATE ==========
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -2744,6 +2836,7 @@ DASHBOARD_TEMPLATE = """
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         // API Configuration
         const API_BASE = window.location.origin;
@@ -3272,7 +3365,7 @@ DASHBOARD_TEMPLATE = """
 # ========== FRONTEND ROUTES ==========
 @app.get("/", response_class=HTMLResponse)
 async def serve_homepage():
-    """Serve the original beautiful homepage"""
+    """Serve the homepage"""
     return HOMEPAGE_TEMPLATE
 
 @app.get("/dashboard", response_class=HTMLResponse)

@@ -8,9 +8,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError, jwt
@@ -55,6 +55,10 @@ try:
     print(f"Bcrypt working: {test_verify}")
 except Exception as e:
     print(f"Bcrypt error: {e}")
+
+# ========== HOSTED FILES STORAGE ==========
+# In-memory storage for hosted files (in production, use database)
+hosted_files = {}
 
 # ========== DATABASE CONNECTION POOL ==========
 class Database:
@@ -116,7 +120,6 @@ class Database:
                 ''')
                 print("Users table ready")
                 
-                # ========== FIX: Handle scripts table with TEXT IDs ==========
                 # Check if scripts table exists
                 table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scripts')")
                 
@@ -169,7 +172,6 @@ class Database:
                     ''')
                     print("Scripts table created with TEXT IDs")
                 
-                # ========== FIX: Handle keys table with TEXT script_id ==========
                 # Check if keys table exists
                 table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'keys')")
                 
@@ -408,6 +410,13 @@ class HeartbeatResponse(BaseModel):
 class HWIDResetRequest(BaseModel):
     key: str
     confirm: bool = False
+
+# ========== HOSTED FILE MODELS ==========
+class HostFileRequest(BaseModel):
+    content: str
+    file_type: str = "lua"  # 'lua' or 'txt'
+    enhanced_security: bool = False
+    script_id: str
 
 # ========== AUTH ENDPOINTS ==========
 @app.post("/api/auth/register", response_model=TokenResponse)
@@ -1004,6 +1013,146 @@ async def get_script_stats(
             "active_keys": active_keys or 0,
             "online_now": online_now or 0
         }
+
+# ========== HOSTED FILE ENDPOINTS ==========
+@app.post("/api/hostfile")
+async def host_file(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Host a file with enhanced security options"""
+    try:
+        data = await request.json()
+        file_content = data.get('content')
+        file_type = data.get('file_type', 'lua')
+        enhanced_security = data.get('enhanced_security', False)
+        script_id = data.get('script_id')
+        
+        # Validate file type
+        if file_type not in ['lua', 'txt']:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Only .lua and .txt files are allowed"}
+            )
+        
+        # Validate script exists and belongs to user
+        async with db.pool.acquire() as conn:
+            script = await conn.fetchrow(
+                "SELECT * FROM scripts WHERE id = $1 AND user_id = $2",
+                script_id, current_user['id']
+            )
+            
+            if not script:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "Script not found"}
+                )
+        
+        # Generate a random token for accessing this file
+        file_token = secrets.token_urlsafe(16)
+        
+        # Store the file
+        hosted_files[file_token] = {
+            "content": file_content,
+            "file_type": file_type,
+            "enhanced_security": enhanced_security,
+            "script_id": script_id,
+            "created_at": datetime.now().isoformat(),
+            "user_id": current_user['id']
+        }
+        
+        # Return the access URL
+        access_url = f"/raw/{file_token}"
+        
+        return {
+            "success": True,
+            "file_token": file_token,
+            "access_url": access_url,
+            "message": f"File hosted at {access_url}"
+        }
+        
+    except Exception as e:
+        print(f"Error hosting file: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.get("/raw/{file_token}")
+async def get_raw_file(
+    file_token: str,
+    x_loader: Optional[str] = Header(None)
+):
+    """Serve the raw file with header protection"""
+    
+    # Check if file exists
+    if file_token not in hosted_files:
+        return HTMLResponse(
+            content="<h1>404 - File Not Found</h1>",
+            status_code=404
+        )
+    
+    file_data = hosted_files[file_token]
+    
+    # If enhanced security is ON, check for the X-Loader header
+    if file_data['enhanced_security']:
+        # Check if header exists and is not empty
+        if not x_loader:
+            return HTMLResponse(
+                content="<h1>Access Denied</h1><p>nice try</p>",
+                status_code=403
+            )
+        # Optional: You can add more sophisticated validation here
+        # For example, check if the header matches a expected value
+        
+    # Return the file content with appropriate content type
+    content_type = "text/plain"
+    if file_data['file_type'] == 'lua':
+        content_type = "text/x-lua"
+    
+    return PlainTextResponse(
+        content=file_data['content'],
+        media_type=content_type
+    )
+
+@app.get("/api/hosted-files")
+async def get_hosted_files(current_user: dict = Depends(get_current_user)):
+    """Get all hosted files for the current user"""
+    user_files = []
+    for token, data in hosted_files.items():
+        if data['user_id'] == current_user['id']:
+            user_files.append({
+                "token": token,
+                "file_type": data['file_type'],
+                "enhanced_security": data['enhanced_security'],
+                "script_id": data['script_id'],
+                "created_at": data['created_at'],
+                "access_url": f"/raw/{token}"
+            })
+    
+    return {"files": user_files}
+
+@app.delete("/api/hosted-files/{file_token}")
+async def delete_hosted_file(
+    file_token: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a hosted file"""
+    if file_token not in hosted_files:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "File not found"}
+        )
+    
+    if hosted_files[file_token]['user_id'] != current_user['id']:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Not authorized to delete this file"}
+        )
+    
+    del hosted_files[file_token]
+    
+    return {"success": True, "message": "File deleted"}
 
 # ========== LOADER GENERATION ==========
 @app.post("/api/loader/generate")
@@ -1877,12 +2026,7 @@ DASHBOARD_TEMPLATE = """
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        *{margin:0;padding:0;box-sizing:border-box;}
         :root {
             --bg-primary: #0A0C10;
             --bg-secondary: #12141A;
@@ -1905,7 +2049,6 @@ DASHBOARD_TEMPLATE = """
             --shadow-lg: 0 10px 15px rgba(0,0,0,0.2);
             --shadow-xl: 0 20px 25px rgba(0,0,0,0.25);
         }
-
         body {
             font-family: 'Inter', sans-serif;
             background: var(--bg-primary);
@@ -1913,7 +2056,6 @@ DASHBOARD_TEMPLATE = """
             min-height: 100vh;
             line-height: 1.5;
         }
-
         body::before {
             content: '';
             position: fixed;
@@ -1928,8 +2070,6 @@ DASHBOARD_TEMPLATE = """
             pointer-events: none;
             z-index: -1;
         }
-
-        /* Navbar */
         .navbar {
             position: fixed;
             top: 20px;
@@ -1950,7 +2090,6 @@ DASHBOARD_TEMPLATE = """
             z-index: 1000;
             box-shadow: var(--shadow-lg);
         }
-
         .logo {
             display: flex;
             align-items: center;
@@ -1961,18 +2100,15 @@ DASHBOARD_TEMPLATE = """
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-
         .logo i {
             font-size: 2rem;
             color: #3B82F6;
             -webkit-text-fill-color: initial;
         }
-
         .nav-links {
             display: flex;
             gap: 40px;
         }
-
         .nav-link {
             color: var(--text-secondary);
             text-decoration: none;
@@ -1980,11 +2116,9 @@ DASHBOARD_TEMPLATE = """
             transition: all 0.3s ease;
             position: relative;
         }
-
         .nav-link:hover {
             color: var(--text-primary);
         }
-
         .nav-link::after {
             content: '';
             position: absolute;
@@ -1995,17 +2129,14 @@ DASHBOARD_TEMPLATE = """
             background: var(--gradient-primary);
             transition: width 0.3s ease;
         }
-
         .nav-link:hover::after {
             width: 100%;
         }
-
         .nav-user {
             display: flex;
             align-items: center;
             gap: 20px;
         }
-
         .user-menu {
             display: flex;
             align-items: center;
@@ -2017,16 +2148,13 @@ DASHBOARD_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .user-menu:hover {
             border-color: var(--accent-primary);
         }
-
         .username {
             font-weight: 600;
             color: var(--text-primary);
         }
-
         .btn-logout {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -2040,36 +2168,30 @@ DASHBOARD_TEMPLATE = """
             align-items: center;
             justify-content: center;
         }
-
         .btn-logout:hover {
             border-color: var(--accent-danger);
             color: var(--accent-danger);
         }
-
         .main-content {
             padding: 120px 30px 40px;
             max-width: 1400px;
             margin: 0 auto;
         }
-
         .dashboard-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 30px;
         }
-
         .dashboard-header h1 {
             font-size: 2.5rem;
             font-weight: 700;
         }
-
         .dashboard-header h1 span {
             background: var(--gradient-primary);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-
         .btn-primary {
             background: var(--gradient-primary);
             border: none;
@@ -2085,12 +2207,10 @@ DASHBOARD_TEMPLATE = """
             justify-content: center;
             gap: 10px;
         }
-
         .btn-primary:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3);
         }
-
         .btn-secondary {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -2101,12 +2221,10 @@ DASHBOARD_TEMPLATE = """
             cursor: pointer;
             transition: all 0.3s ease;
         }
-
         .btn-secondary:hover {
             background: var(--bg-tertiary);
             border-color: var(--accent-primary);
         }
-
         .btn-danger {
             background: var(--gradient-danger);
             border: none;
@@ -2120,12 +2238,10 @@ DASHBOARD_TEMPLATE = """
             align-items: center;
             gap: 6px;
         }
-
         .btn-danger:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(239, 68, 68, 0.3);
         }
-
         .btn-success {
             background: var(--gradient-success);
             border: none;
@@ -2139,12 +2255,10 @@ DASHBOARD_TEMPLATE = """
             align-items: center;
             gap: 6px;
         }
-
         .btn-success:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(16, 185, 129, 0.3);
         }
-
         .btn-icon {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -2159,24 +2273,20 @@ DASHBOARD_TEMPLATE = """
             justify-content: center;
             font-size: 1rem;
         }
-
         .btn-icon:hover {
             border-color: var(--accent-primary);
             color: var(--accent-primary);
         }
-
         .btn-icon.danger:hover {
             border-color: var(--accent-danger);
             color: var(--accent-danger);
         }
-
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
-
         .stat-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -2186,7 +2296,6 @@ DASHBOARD_TEMPLATE = """
             position: relative;
             overflow: hidden;
         }
-
         .stat-card::before {
             content: '';
             position: absolute;
@@ -2198,29 +2307,24 @@ DASHBOARD_TEMPLATE = """
             opacity: 0;
             transition: opacity 0.3s ease;
         }
-
         .stat-card:hover::before {
             opacity: 1;
         }
-
         .stat-card:hover {
             transform: translateY(-4px);
             box-shadow: var(--shadow-xl);
         }
-
         .stat-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 16px;
         }
-
         .stat-title {
             color: var(--text-secondary);
             font-size: 0.95rem;
             font-weight: 500;
         }
-
         .stat-icon {
             width: 48px;
             height: 48px;
@@ -2230,87 +2334,72 @@ DASHBOARD_TEMPLATE = """
             justify-content: center;
             font-size: 1.5rem;
         }
-
         .stat-icon.blue {
             background: rgba(59, 130, 246, 0.1);
             color: var(--accent-primary);
         }
-
         .stat-icon.green {
             background: rgba(16, 185, 129, 0.1);
             color: var(--accent-success);
         }
-
         .stat-icon.purple {
             background: rgba(99, 102, 241, 0.1);
             color: var(--accent-secondary);
         }
-
         .stat-icon.orange {
             background: rgba(245, 158, 11, 0.1);
             color: var(--accent-warning);
         }
-
         .stat-value {
             font-size: 2.5rem;
             font-weight: 700;
             margin-bottom: 8px;
         }
-
         .stat-change {
             color: var(--text-secondary);
             font-size: 0.9rem;
         }
-
         .charts-grid {
             display: grid;
             grid-template-columns: 2fr 1fr;
             gap: 20px;
             margin-bottom: 30px;
         }
-
         .chart-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
             border-radius: 20px;
             padding: 24px;
         }
-
         .chart-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 20px;
         }
-
         .chart-header h3 {
             font-size: 1.2rem;
             font-weight: 600;
         }
-
         .chart-container {
             height: 300px;
         }
-
         .section-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 20px;
         }
-
         .section-header h2 {
             font-size: 1.5rem;
             font-weight: 600;
         }
-
         .scripts-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
             gap: 20px;
             margin-bottom: 40px;
         }
-
         .script-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -2318,24 +2407,20 @@ DASHBOARD_TEMPLATE = """
             padding: 24px;
             transition: all 0.3s ease;
         }
-
         .script-card:hover {
             border-color: var(--accent-primary);
             box-shadow: var(--shadow-lg);
         }
-
         .script-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 16px;
         }
-
         .script-name {
             font-size: 1.3rem;
             font-weight: 600;
         }
-
         .script-badge {
             background: rgba(59, 130, 246, 0.1);
             color: var(--accent-primary);
@@ -2344,7 +2429,6 @@ DASHBOARD_TEMPLATE = """
             font-size: 0.85rem;
             font-weight: 500;
         }
-
         .script-stats {
             display: flex;
             gap: 20px;
@@ -2353,27 +2437,22 @@ DASHBOARD_TEMPLATE = """
             border-top: 1px solid var(--border-color);
             border-bottom: 1px solid var(--border-color);
         }
-
         .script-stat {
             flex: 1;
         }
-
         .script-stat-label {
             color: var(--text-secondary);
             font-size: 0.85rem;
             margin-bottom: 4px;
         }
-
         .script-stat-value {
             font-size: 1.2rem;
             font-weight: 600;
         }
-
         .script-actions {
             display: flex;
             gap: 10px;
         }
-
         .script-actions button {
             flex: 1;
             display: flex;
@@ -2381,7 +2460,6 @@ DASHBOARD_TEMPLATE = """
             justify-content: center;
             gap: 6px;
         }
-
         .keys-table-container {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -2389,12 +2467,10 @@ DASHBOARD_TEMPLATE = """
             padding: 24px;
             overflow-x: auto;
         }
-
         table {
             width: 100%;
             border-collapse: collapse;
         }
-
         th {
             text-align: left;
             padding: 16px;
@@ -2403,22 +2479,18 @@ DASHBOARD_TEMPLATE = """
             font-size: 0.9rem;
             border-bottom: 1px solid var(--border-color);
         }
-
         td {
             padding: 16px;
             border-bottom: 1px solid var(--border-color);
         }
-
         tr:hover td {
             background: var(--bg-tertiary);
         }
-
         .key-cell {
             font-family: monospace;
             font-size: 0.95rem;
             color: var(--accent-primary);
         }
-
         .status-badge {
             display: inline-flex;
             align-items: center;
@@ -2428,27 +2500,22 @@ DASHBOARD_TEMPLATE = """
             font-size: 0.85rem;
             font-weight: 500;
         }
-
         .status-badge.active {
             background: rgba(16, 185, 129, 0.1);
             color: var(--accent-success);
         }
-
         .status-badge.inactive {
             background: rgba(239, 68, 68, 0.1);
             color: var(--accent-danger);
         }
-
         .status-badge.expired {
             background: rgba(107, 114, 128, 0.1);
             color: var(--text-secondary);
         }
-
         .status-badge.online {
             background: rgba(59, 130, 246, 0.1);
             color: var(--accent-primary);
         }
-
         .status-badge::before {
             content: '';
             width: 8px;
@@ -2456,28 +2523,22 @@ DASHBOARD_TEMPLATE = """
             border-radius: 50%;
             display: inline-block;
         }
-
         .status-badge.active::before {
             background: var(--accent-success);
         }
-
         .status-badge.inactive::before {
             background: var(--accent-danger);
         }
-
         .status-badge.expired::before {
             background: var(--text-secondary);
         }
-
         .status-badge.online::before {
             background: var(--accent-primary);
         }
-
         .action-group {
             display: flex;
             gap: 6px;
         }
-
         .modal-overlay {
             position: fixed;
             top: 0;
@@ -2491,11 +2552,9 @@ DASHBOARD_TEMPLATE = """
             justify-content: center;
             z-index: 2000;
         }
-
         .modal-overlay.show {
             display: flex;
         }
-
         .modal {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -2504,7 +2563,6 @@ DASHBOARD_TEMPLATE = """
             max-width: 500px;
             animation: modalSlide 0.3s ease;
         }
-
         @keyframes modalSlide {
             from {
                 opacity: 0;
@@ -2515,7 +2573,6 @@ DASHBOARD_TEMPLATE = """
                 transform: translateY(0);
             }
         }
-
         .modal-header {
             padding: 24px;
             border-bottom: 1px solid var(--border-color);
@@ -2523,12 +2580,10 @@ DASHBOARD_TEMPLATE = """
             justify-content: space-between;
             align-items: center;
         }
-
         .modal-header h3 {
             font-size: 1.3rem;
             font-weight: 600;
         }
-
         .modal-close {
             background: transparent;
             border: none;
@@ -2537,15 +2592,12 @@ DASHBOARD_TEMPLATE = """
             cursor: pointer;
             transition: color 0.3s ease;
         }
-
         .modal-close:hover {
             color: var(--text-primary);
         }
-
         .modal-body {
             padding: 24px;
         }
-
         .modal-footer {
             padding: 24px;
             border-top: 1px solid var(--border-color);
@@ -2553,7 +2605,6 @@ DASHBOARD_TEMPLATE = """
             justify-content: flex-end;
             gap: 12px;
         }
-
         .loader-preview {
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
@@ -2563,7 +2614,6 @@ DASHBOARD_TEMPLATE = """
             max-height: 400px;
             overflow-y: auto;
         }
-
         .loader-preview pre {
             color: var(--text-primary);
             font-family: monospace;
@@ -2571,7 +2621,6 @@ DASHBOARD_TEMPLATE = """
             line-height: 1.6;
             white-space: pre-wrap;
         }
-
         .toast {
             position: fixed;
             bottom: 30px;
@@ -2585,44 +2634,35 @@ DASHBOARD_TEMPLATE = """
             z-index: 3000;
             box-shadow: var(--shadow-xl);
         }
-
         .toast.show {
             transform: translateX(0);
         }
-
         .toast-content {
             display: flex;
             align-items: center;
             gap: 12px;
         }
-
         .toast.success {
             border-left: 4px solid var(--accent-success);
         }
-
         .toast.error {
             border-left: 4px solid var(--accent-danger);
         }
-
         .toast.info {
             border-left: 4px solid var(--accent-primary);
         }
-
         .hidden {
             display: none !important;
         }
-
         .loader {
             text-align: center;
             padding: 40px;
             color: var(--text-secondary);
         }
-
         .loader i {
             font-size: 2rem;
             margin-bottom: 16px;
         }
-
         @media (max-width: 768px) {
             .navbar {
                 width: 95%;
@@ -2759,6 +2799,21 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Hosted Files Section -->
+        <div class="section-header">
+            <h2>Hosted Files</h2>
+            <button class="btn-primary" id="hostFileBtn">
+                <i class="fas fa-upload"></i>
+                Host File
+            </button>
+        </div>
+        <div class="keys-table-container" id="hostedFilesContainer">
+            <div class="loader">
+                <i class="fas fa-spinner fa-spin"></i>
+                <p>Loading hosted files...</p>
+            </div>
+        </div>
+
         <!-- Keys Table -->
         <div class="section-header">
             <h2>Recent Keys</h2>
@@ -2818,6 +2873,48 @@ DASHBOARD_TEMPLATE = """
                 <button class="btn-primary" id="createScriptSubmit">
                     <i class="fas fa-plus"></i>
                     Create Script
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Host File Modal -->
+    <div class="modal-overlay" id="hostFileModal">
+        <div class="modal" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3>Host a File</h3>
+                <button class="modal-close" id="closeHostFileModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Select Script</label>
+                    <select id="hostFileScriptSelect" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="">Loading scripts...</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">File Type</label>
+                    <select id="hostFileType" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="lua">Lua Script (.lua)</option>
+                        <option value="txt">Text File (.txt)</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">
+                        <input type="checkbox" id="enhancedSecurity" style="margin-right: 8px;">
+                        Enhanced Security (Requires X-Loader header)
+                    </label>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">File Content</label>
+                    <textarea id="fileContent" rows="10" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-family: monospace;" placeholder="Paste your Lua script or text here..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="cancelHostFileBtn">Cancel</button>
+                <button class="btn-primary" id="hostFileSubmit">
+                    <i class="fas fa-upload"></i>
+                    Host File
                 </button>
             </div>
         </div>
@@ -2927,6 +3024,37 @@ DASHBOARD_TEMPLATE = """
         </div>
     </div>
 
+    <!-- View File Modal -->
+    <div class="modal-overlay" id="viewFileModal">
+        <div class="modal" style="max-width: 700px;">
+            <div class="modal-header">
+                <h3 id="viewFileTitle">File Details</h3>
+                <button class="modal-close" id="closeViewFileModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="fileDetails" style="margin-bottom: 20px;">
+                    <p><strong>File Token:</strong> <code id="fileToken">-</code></p>
+                    <p><strong>Access URL:</strong> <code id="fileUrl">-</code></p>
+                    <p><strong>Enhanced Security:</strong> <span id="fileSecurity">-</span></p>
+                </div>
+                <div class="loader-preview">
+                    <pre id="fileContentPreview">Loading...</pre>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" id="copyFileUrlBtn">
+                    <i class="fas fa-copy"></i>
+                    Copy URL
+                </button>
+                <button class="btn-danger" id="deleteFileBtn">
+                    <i class="fas fa-trash"></i>
+                    Delete
+                </button>
+                <button class="btn-secondary" id="closeViewFileBtn">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast -->
     <div class="toast" id="toast">
         <div class="toast-content">
@@ -2962,6 +3090,8 @@ DASHBOARD_TEMPLATE = """
         const createKeyModal = document.getElementById('createKeyModal');
         const viewKeysModal = document.getElementById('viewKeysModal');
         const loaderModal = document.getElementById('loaderModal');
+        const hostFileModal = document.getElementById('hostFileModal');
+        const viewFileModal = document.getElementById('viewFileModal');
 
         // ========== UTILITY FUNCTIONS ==========
         function showToast(message, type = 'success') {
@@ -3000,7 +3130,7 @@ DASHBOARD_TEMPLATE = """
             
             const result = await response.json();
             if (!response.ok) {
-                throw new Error(result.detail || 'API call failed');
+                throw new Error(result.detail || result.error || 'API call failed');
             }
             return result;
         }
@@ -3015,7 +3145,8 @@ DASHBOARD_TEMPLATE = """
                 await Promise.all([
                     loadStats(),
                     loadScripts(),
-                    loadKeys()
+                    loadKeys(),
+                    loadHostedFiles()
                 ]);
                 
                 initCharts();
@@ -3094,6 +3225,18 @@ DASHBOARD_TEMPLATE = """
                         </div>
                     </div>
                 `).join('');
+                
+                // Populate script selects in modals
+                const scriptSelects = ['keyScriptSelect', 'hostFileScriptSelect'];
+                scriptSelects.forEach(selectId => {
+                    const select = document.getElementById(selectId);
+                    if (select) {
+                        select.innerHTML = scripts.map(script => 
+                            `<option value="${script.id}">${script.name} (${script.id})</option>`
+                        ).join('');
+                    }
+                });
+                
             } catch (error) {
                 console.error('Failed to load scripts:', error);
             }
@@ -3150,6 +3293,70 @@ DASHBOARD_TEMPLATE = """
                 }).join('');
             } catch (error) {
                 console.error('Failed to load keys:', error);
+            }
+        }
+
+        async function loadHostedFiles() {
+            try {
+                const response = await apiCall('/api/hosted-files');
+                const container = document.getElementById('hostedFilesContainer');
+                
+                if (!response.files || response.files.length === 0) {
+                    container.innerHTML = `
+                        <div style="text-align: center; padding: 40px;">
+                            <i class="fas fa-file" style="font-size: 3rem; opacity: 0.5; margin-bottom: 10px;"></i>
+                            <p>No hosted files yet. Click "Host File" to upload one.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>File Token</th>
+                                <th>Type</th>
+                                <th>Security</th>
+                                <th>Script</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${response.files.map(file => `
+                                <tr>
+                                    <td><code>${file.token}</code></td>
+                                    <td>${file.file_type.toUpperCase()}</td>
+                                    <td>${file.enhanced_security ? '🔒 Enhanced' : '🔓 Basic'}</td>
+                                    <td>${file.script_id}</td>
+                                    <td>${new Date(file.created_at).toLocaleString()}</td>
+                                    <td>
+                                        <div class="action-group">
+                                            <button class="btn-icon" onclick="viewFile('${file.token}')" title="View File">
+                                                <i class="fas fa-eye"></i>
+                                            </button>
+                                            <button class="btn-icon" onclick="copyFileUrl('${file.access_url}')" title="Copy URL">
+                                                <i class="fas fa-copy"></i>
+                                            </button>
+                                            <button class="btn-icon danger" onclick="deleteFile('${file.token}')" title="Delete">
+                                                <i class="fas fa-trash"></i>
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch (error) {
+                console.error('Failed to load hosted files:', error);
+                document.getElementById('hostedFilesContainer').innerHTML = `
+                    <div style="text-align: center; padding: 40px; color: var(--accent-danger);">
+                        <i class="fas fa-exclamation-triangle" style="font-size: 3rem; margin-bottom: 10px;"></i>
+                        <p>Failed to load hosted files: ${error.message}</p>
+                    </div>
+                `;
             }
         }
 
@@ -3251,6 +3458,128 @@ DASHBOARD_TEMPLATE = """
             } catch (error) {
                 showToast(error.message, 'error');
             }
+        });
+
+        // ========== HOST FILE ACTIONS ==========
+        document.getElementById('hostFileBtn').addEventListener('click', () => {
+            hostFileModal.classList.add('show');
+        });
+
+        document.getElementById('closeHostFileModal').addEventListener('click', () => {
+            hostFileModal.classList.remove('show');
+        });
+
+        document.getElementById('cancelHostFileBtn').addEventListener('click', () => {
+            hostFileModal.classList.remove('show');
+        });
+
+        document.getElementById('hostFileSubmit').addEventListener('click', async () => {
+            const scriptId = document.getElementById('hostFileScriptSelect').value;
+            const fileType = document.getElementById('hostFileType').value;
+            const enhancedSecurity = document.getElementById('enhancedSecurity').checked;
+            const content = document.getElementById('fileContent').value;
+            
+            if (!scriptId) {
+                showToast('Please select a script', 'error');
+                return;
+            }
+            
+            if (!content) {
+                showToast('Please enter file content', 'error');
+                return;
+            }
+            
+            try {
+                const result = await apiCall('/api/hostfile', 'POST', {
+                    script_id: scriptId,
+                    file_type: fileType,
+                    enhanced_security: enhancedSecurity,
+                    content: content
+                });
+                
+                hostFileModal.classList.remove('show');
+                document.getElementById('fileContent').value = '';
+                document.getElementById('enhancedSecurity').checked = false;
+                
+                showToast('File hosted successfully!');
+                await loadHostedFiles();
+                
+                // Show the file details
+                viewFile(result.file_token);
+                
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+
+        // File viewing functions
+        window.viewFile = async (fileToken) => {
+            try {
+                // Get file details from the hosted files list
+                const response = await apiCall('/api/hosted-files');
+                const file = response.files.find(f => f.token === fileToken);
+                
+                if (!file) {
+                    showToast('File not found', 'error');
+                    return;
+                }
+                
+                document.getElementById('viewFileTitle').textContent = `File: ${file.token}`;
+                document.getElementById('fileToken').textContent = file.token;
+                document.getElementById('fileUrl').textContent = file.access_url;
+                document.getElementById('fileSecurity').textContent = file.enhanced_security ? 'Yes (X-Loader header required)' : 'No';
+                
+                // Fetch the actual content
+                const contentResponse = await fetch(file.access_url, {
+                    headers: token ? { 'Authorization': `Bearer ${token}` } : {}
+                });
+                const content = await contentResponse.text();
+                document.getElementById('fileContentPreview').textContent = content;
+                
+                viewFileModal.classList.add('show');
+            } catch (error) {
+                showToast('Failed to load file: ' + error.message, 'error');
+            }
+        };
+
+        window.copyFileUrl = (url) => {
+            const fullUrl = window.location.origin + url;
+            navigator.clipboard.writeText(fullUrl);
+            showToast('URL copied to clipboard!');
+        };
+
+        window.deleteFile = async (fileToken) => {
+            if (!confirm('Are you sure you want to delete this file?')) return;
+            
+            try {
+                await apiCall(`/api/hosted-files/${fileToken}`, 'DELETE');
+                showToast('File deleted successfully');
+                await loadHostedFiles();
+                
+                if (viewFileModal.classList.contains('show')) {
+                    viewFileModal.classList.remove('show');
+                }
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        };
+
+        document.getElementById('closeViewFileModal').addEventListener('click', () => {
+            viewFileModal.classList.remove('show');
+        });
+
+        document.getElementById('closeViewFileBtn').addEventListener('click', () => {
+            viewFileModal.classList.remove('show');
+        });
+
+        document.getElementById('copyFileUrlBtn').addEventListener('click', () => {
+            const url = document.getElementById('fileUrl').textContent;
+            copyFileUrl(url);
+        });
+
+        document.getElementById('deleteFileBtn').addEventListener('click', () => {
+            const token = document.getElementById('fileToken').textContent;
+            deleteFile(token);
         });
 
         // ========== KEY ACTIONS ==========

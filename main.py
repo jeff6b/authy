@@ -94,44 +94,70 @@ class Database:
             print("Database disconnected")
 
     async def init_db(self):
-    """Initialize database tables WITHOUT dropping - preserves data!"""
-    if not self.pool:
-        print("Cannot init DB - no connection pool")
-        return
-        
-    try:
-        async with self.pool.acquire() as conn:
-            print("Ensuring database tables exist...")
+        """Initialize database tables WITHOUT dropping - preserves data!"""
+        if not self.pool:
+            print("Cannot init DB - no connection pool")
+            return
             
-            # Users table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    email TEXT UNIQUE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_admin BOOLEAN DEFAULT FALSE
-                )
-            ''')
-            print("Users table ready")
-            
-            # ========== FIX: Handle scripts table with TEXT IDs ==========
-            # Check if scripts table exists
-            table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scripts')")
-            
-            if table_exists:
-                # Check the data type of the id column
-                column_type = await conn.fetchval("""
-                    SELECT data_type FROM information_schema.columns 
-                    WHERE table_name = 'scripts' AND column_name = 'id'
-                """)
+        try:
+            async with self.pool.acquire() as conn:
+                print("Ensuring database tables exist...")
                 
-                if column_type == 'integer':
-                    print("Converting scripts.id from INTEGER to TEXT...")
-                    # Create a new table with TEXT id
+                # Users table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        email TEXT UNIQUE NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_admin BOOLEAN DEFAULT FALSE
+                    )
+                ''')
+                print("Users table ready")
+                
+                # ========== FIX: Handle scripts table with TEXT IDs ==========
+                # Check if scripts table exists
+                table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scripts')")
+                
+                if table_exists:
+                    # Check the data type of the id column
+                    column_type = await conn.fetchval("""
+                        SELECT data_type FROM information_schema.columns 
+                        WHERE table_name = 'scripts' AND column_name = 'id'
+                    """)
+                    
+                    if column_type == 'integer':
+                        print("Converting scripts.id from INTEGER to TEXT...")
+                        # Create a new table with TEXT id
+                        await conn.execute('''
+                            CREATE TABLE scripts_new (
+                                id TEXT PRIMARY KEY,
+                                name TEXT NOT NULL,
+                                script_type TEXT DEFAULT 'standard',
+                                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                config JSONB DEFAULT '{}',
+                                UNIQUE(name, user_id)
+                            )
+                        ''')
+                        
+                        # Copy existing data
+                        await conn.execute('''
+                            INSERT INTO scripts_new (id, name, script_type, user_id, created_at, config)
+                            SELECT CAST(id AS TEXT), name, script_type, user_id, created_at, config FROM scripts
+                        ''')
+                        
+                        # Drop old table and rename new one
+                        await conn.execute('DROP TABLE scripts CASCADE')
+                        await conn.execute('ALTER TABLE scripts_new RENAME TO scripts')
+                        print("Scripts table converted successfully!")
+                    else:
+                        print("Scripts table already has TEXT IDs")
+                else:
+                    # Create new scripts table with TEXT id
                     await conn.execute('''
-                        CREATE TABLE scripts_new (
+                        CREATE TABLE scripts (
                             id TEXT PRIMARY KEY,
                             name TEXT NOT NULL,
                             script_type TEXT DEFAULT 'standard',
@@ -141,50 +167,56 @@ class Database:
                             UNIQUE(name, user_id)
                         )
                     ''')
-                    
-                    # Copy existing data
-                    await conn.execute('''
-                        INSERT INTO scripts_new (id, name, script_type, user_id, created_at, config)
-                        SELECT CAST(id AS TEXT), name, script_type, user_id, created_at, config FROM scripts
-                    ''')
-                    
-                    # Drop old table and rename new one
-                    await conn.execute('DROP TABLE scripts CASCADE')
-                    await conn.execute('ALTER TABLE scripts_new RENAME TO scripts')
-                    print("Scripts table converted successfully!")
-                else:
-                    print("Scripts table already has TEXT IDs")
-            else:
-                # Create new scripts table with TEXT id
-                await conn.execute('''
-                    CREATE TABLE scripts (
-                        id TEXT PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        script_type TEXT DEFAULT 'standard',
-                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        config JSONB DEFAULT '{}',
-                        UNIQUE(name, user_id)
-                    )
-                ''')
-                print("Scripts table created with TEXT IDs")
-            
-            # ========== FIX: Handle keys table with TEXT script_id ==========
-            # Check if keys table exists
-            table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'keys')")
-            
-            if table_exists:
-                # Check the data type of the script_id column
-                column_type = await conn.fetchval("""
-                    SELECT data_type FROM information_schema.columns 
-                    WHERE table_name = 'keys' AND column_name = 'script_id'
-                """)
+                    print("Scripts table created with TEXT IDs")
                 
-                if column_type == 'integer':
-                    print("Converting keys.script_id from INTEGER to TEXT...")
-                    # Create a new table with TEXT script_id
+                # ========== FIX: Handle keys table with TEXT script_id ==========
+                # Check if keys table exists
+                table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'keys')")
+                
+                if table_exists:
+                    # Check the data type of the script_id column
+                    column_type = await conn.fetchval("""
+                        SELECT data_type FROM information_schema.columns 
+                        WHERE table_name = 'keys' AND column_name = 'script_id'
+                    """)
+                    
+                    if column_type == 'integer':
+                        print("Converting keys.script_id from INTEGER to TEXT...")
+                        # Create a new table with TEXT script_id
+                        await conn.execute('''
+                            CREATE TABLE keys_new (
+                                id SERIAL PRIMARY KEY,
+                                key TEXT UNIQUE NOT NULL,
+                                script_id TEXT NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+                                nickname TEXT,
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                expires_at TIMESTAMP NOT NULL,
+                                last_heartbeat TIMESTAMP,
+                                hwid TEXT,
+                                status TEXT DEFAULT 'active',
+                                kicked BOOLEAN DEFAULT FALSE,
+                                max_hwid_resets INTEGER DEFAULT 3,
+                                hwid_resets_used INTEGER DEFAULT 0,
+                                note TEXT
+                            )
+                        ''')
+                        
+                        # Copy existing data
+                        await conn.execute('''
+                            INSERT INTO keys_new (id, key, script_id, nickname, created_at, expires_at, last_heartbeat, hwid, status, kicked, max_hwid_resets, hwid_resets_used, note)
+                            SELECT id, key, CAST(script_id AS TEXT), nickname, created_at, expires_at, last_heartbeat, hwid, status, kicked, max_hwid_resets, hwid_resets_used, note FROM keys
+                        ''')
+                        
+                        # Drop old table and rename new one
+                        await conn.execute('DROP TABLE keys CASCADE')
+                        await conn.execute('ALTER TABLE keys_new RENAME TO keys')
+                        print("Keys table converted successfully!")
+                    else:
+                        print("Keys table already has TEXT script_ids")
+                else:
+                    # Create new keys table with TEXT script_id
                     await conn.execute('''
-                        CREATE TABLE keys_new (
+                        CREATE TABLE keys (
                             id SERIAL PRIMARY KEY,
                             key TEXT UNIQUE NOT NULL,
                             script_id TEXT NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
@@ -200,65 +232,35 @@ class Database:
                             note TEXT
                         )
                     ''')
-                    
-                    # Copy existing data
-                    await conn.execute('''
-                        INSERT INTO keys_new (id, key, script_id, nickname, created_at, expires_at, last_heartbeat, hwid, status, kicked, max_hwid_resets, hwid_resets_used, note)
-                        SELECT id, key, CAST(script_id AS TEXT), nickname, created_at, expires_at, last_heartbeat, hwid, status, kicked, max_hwid_resets, hwid_resets_used, note FROM keys
-                    ''')
-                    
-                    # Drop old table and rename new one
-                    await conn.execute('DROP TABLE keys CASCADE')
-                    await conn.execute('ALTER TABLE keys_new RENAME TO keys')
-                    print("Keys table converted successfully!")
-                else:
-                    print("Keys table already has TEXT script_ids")
-            else:
-                # Create new keys table with TEXT script_id
+                    print("Keys table created with TEXT script_ids")
+                
+                # Heartbeat logs table
                 await conn.execute('''
-                    CREATE TABLE keys (
+                    CREATE TABLE IF NOT EXISTS heartbeat_logs (
                         id SERIAL PRIMARY KEY,
-                        key TEXT UNIQUE NOT NULL,
-                        script_id TEXT NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
-                        nickname TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        expires_at TIMESTAMP NOT NULL,
-                        last_heartbeat TIMESTAMP,
-                        hwid TEXT,
-                        status TEXT DEFAULT 'active',
-                        kicked BOOLEAN DEFAULT FALSE,
-                        max_hwid_resets INTEGER DEFAULT 3,
-                        hwid_resets_used INTEGER DEFAULT 0,
-                        note TEXT
+                        key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        hwid TEXT NOT NULL,
+                        ip_address TEXT
                     )
                 ''')
-                print("Keys table created with TEXT script_ids")
-            
-            # Heartbeat logs table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS heartbeat_logs (
-                    id SERIAL PRIMARY KEY,
-                    key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    hwid TEXT NOT NULL,
-                    ip_address TEXT
-                )
-            ''')
-            print("Heartbeat logs table ready")
-            
-            # Create indexes
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
-            
-            print("Database tables ready - data preserved!")
-            
-    except Exception as e:
-        print(f"Failed to initialize tables: {e}")
-        import traceback
-        traceback.print_exc()
+                print("Heartbeat logs table ready")
+                
+                # Create indexes
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_keys_script_id ON keys(script_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_scripts_user_id ON scripts(user_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_key_id ON heartbeat_logs(key_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_heartbeat_timestamp ON heartbeat_logs(timestamp)')
+                
+                print("Database tables ready - data preserved!")
+                
+        except Exception as e:
+            print(f"Failed to initialize tables: {e}")
+            import traceback
+            traceback.print_exc()
+
+db = Database()
 
 # ========== LIFESPAN HANDLER ==========
 @asynccontextmanager

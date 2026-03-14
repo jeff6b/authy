@@ -94,7 +94,7 @@ class Database:
             print("Database disconnected")
 
     async def init_db(self):
-    """Initialize database tables WITHOUT dropping - preserves data!"""
+        """Initialize database tables WITHOUT dropping - preserves data!"""
     if not self.pool:
         print("Cannot init DB - no connection pool")
         return

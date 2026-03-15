@@ -7,3 +7,5 @@ bcrypt==4.0.1
 python-multipart==0.0.12
 pydantic>=2.9.0,<3.0.0
 python-dotenv==1.1.0
+cryptography==42.0.5
+redis==5.0.1

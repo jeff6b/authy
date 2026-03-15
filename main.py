@@ -30,7 +30,6 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 DATABASE_URL = os.getenv("DATABASE_URL")
-MASTER_API_KEY = "123"
 
 print("🚀 Starting Authy Backend System...")
 print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
@@ -209,7 +208,7 @@ async def lifespan(app: FastAPI):
 # ========== FASTAPI APP ==========
 app = FastAPI(
     title="Authy Backend System",
-    description="Pure backend for Discord bot integration",
+    description="Backend for Discord bot integration",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -403,115 +402,6 @@ class HostScriptRequest(BaseModel):
     content: str
     enhanced: bool = False
 
-class LoaderRequest(BaseModel):
-    enhanced: bool = False
-
-# ========== AUTH ENDPOINTS ==========
-@app.post("/api/auth/register", response_model=TokenResponse)
-async def register(user: UserCreate):
-    """Register a new user using API key"""
-    print(f"Register attempt: {user.username}")
-    
-    if user.api_key != MASTER_API_KEY:
-        print(f"Invalid API key: {user.api_key}")
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    try:
-        async with db.pool.acquire() as conn:
-            existing = await conn.fetchval(
-                "SELECT id FROM users WHERE username = $1 OR email = $2",
-                user.username, f"{user.username}@placeholder.com"
-            )
-            
-            if existing:
-                raise HTTPException(status_code=400, detail="Username already taken")
-            
-            hashed = hash_password(user.password)
-            
-            user_id = await conn.fetchval(
-                "INSERT INTO users (username, password_hash, email) VALUES ($1, $2, $3) RETURNING id",
-                user.username, hashed, f"{user.username}@authy.local"
-            )
-            
-            token = create_access_token({"sub": user.username, "id": user_id})
-            
-            print(f"Registered: {user.username}")
-            return {"access_token": token, "token_type": "bearer"}
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Register error: {e}")
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
-
-@app.post("/api/auth/login", response_model=TokenResponse)
-async def login(user: UserLogin):
-    """Login user"""
-    print(f"Login attempt: {user.username}")
-    
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    try:
-        async with db.pool.acquire() as conn:
-            db_user = await conn.fetchrow(
-                "SELECT * FROM users WHERE username = $1",
-                user.username
-            )
-            
-            if not db_user or not verify_password(user.password, db_user['password_hash']):
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-            
-            token = create_access_token({"sub": user.username, "id": db_user['id']})
-            
-            print(f"Login successful: {user.username}")
-            return {"access_token": token, "token_type": "bearer"}
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Login error: {e}")
-        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
-
-@app.get("/api/user/me")
-async def get_current_user_info(auth: HTTPAuthorizationCredentials = Depends(security)):
-    """Get current user info - for bot verification"""
-    if not auth:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Not authenticated"}
-        )
-    
-    try:
-        payload = verify_token(auth.credentials)
-        if not payload:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Invalid token"}
-            )
-        
-        async with db.pool.acquire() as conn:
-            user = await conn.fetchrow(
-                "SELECT id, username, email, created_at FROM users WHERE username = $1",
-                payload["sub"]
-            )
-            
-        if not user:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "User not found"}
-            )
-        
-        return dict(user)
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-
 # ========== SCRIPT MANAGEMENT ==========
 @app.post("/api/scripts/create")
 async def create_script(
@@ -522,7 +412,6 @@ async def create_script(
     print(f"Creating script: {script_data.name} for user {current_user['id']}")
     
     if not db.pool:
-        print("Database not available")
         raise HTTPException(status_code=503, detail="Database not available")
     
     try:
@@ -548,7 +437,6 @@ async def create_script(
                 script_id, script_data.name, current_user['id']
             )
             
-            print(f"Script created with ID: {script_id}")
             return {
                 "id": script_id,
                 "name": script_data.name,
@@ -997,135 +885,6 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             message=f"Server error: {str(e)}"
         )
 
-# ========== FILE HOSTING ENDPOINTS ==========
-@app.post("/api/hostscript")
-async def host_script(
-    request: Request,
-    current_user: dict = Depends(get_current_user)
-):
-    """Host a script and return a URL"""
-    # Rate limiting
-    client_ip = request.client.host if request.client else "unknown"
-    if not check_rate_limit(client_ip):
-        return JSONResponse(
-            status_code=429,
-            content={"error": "Rate limit exceeded. Try again later."}
-        )
-    
-    try:
-        data = await request.json()
-        content = data.get('content')
-        
-        if not content:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No content provided"}
-            )
-        
-        # Generate token
-        token = generate_token()
-        
-        # Store the script
-        hosted_files[token] = {
-            "content": content,
-            "user_id": current_user['id'],
-            "created_at": datetime.now().isoformat()
-        }
-        
-        script_url = f"/raw/{token}"
-        
-        return {
-            "success": True,
-            "token": token,
-            "url": script_url,
-            "full_url": f"https://authy-o0pm.onrender.com{script_url}",
-            "message": "Script hosted successfully"
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-
-@app.get("/raw/{token}")
-async def get_raw_script(token: str, request: Request):
-    """Get the raw script content"""
-    # Rate limiting
-    client_ip = request.client.host if request.client else "unknown"
-    if not check_rate_limit(client_ip):
-        return HTMLResponse(
-            content="<h1>Rate Limit Exceeded</h1><p>Too many requests. Try again later.</p>",
-            status_code=429
-        )
-    
-    if token not in hosted_files:
-        return HTMLResponse(
-            content="<h1>404 - Script Not Found</h1>",
-            status_code=404
-        )
-    
-    file_info = hosted_files[token]
-    
-    # Check if browser access
-    user_agent = request.headers.get("user-agent", "").lower()
-    if "mozilla" in user_agent or "chrome" in user_agent or "safari" in user_agent:
-        return HTMLResponse(
-            content="<h1>Access Denied</h1><p>This URL is for loader use only.</p>",
-            status_code=403
-        )
-    
-    return PlainTextResponse(
-        content=file_info['content'],
-        media_type="text/plain"
-    )
-
-# ========== LOADER GENERATION ENDPOINT ==========
-@app.post("/api/loader")
-async def generate_loader(
-    request: Request,
-    current_user: dict = Depends(get_current_user)
-):
-    """Generate a loader for a hosted script"""
-    try:
-        data = await request.json()
-        script_token = data.get('token')
-        enhanced = data.get('enhanced', False)
-        
-        if not script_token:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No script token provided"}
-            )
-        
-        if script_token not in hosted_files:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "Script not found"}
-            )
-        
-        if hosted_files[script_token]['user_id'] != current_user['id']:
-            return JSONResponse(
-                status_code=403,
-                content={"error": "Not authorized to access this script"}
-            )
-        
-        script_url = f"https://authy-o0pm.onrender.com/raw/{script_token}"
-        loader = generate_basic_loader(script_url)
-        
-        return {
-            "success": True,
-            "loader": loader,
-            "enhanced": enhanced,
-            "message": "Loader generated successfully"
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-
 # ========== STATS ==========
 @app.get("/api/stats")
 async def get_stats(current_user: dict = Depends(get_current_user)):
@@ -1227,6 +986,174 @@ async def get_script_stats(
             "active_keys": active_keys or 0,
             "online_now": online_now or 0
         }
+
+# ========== FILE HOSTING ENDPOINTS ==========
+@app.post("/api/hostscript")
+async def host_script(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Host a script and return a URL"""
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded. Try again later."}
+        )
+    
+    try:
+        data = await request.json()
+        content = data.get('content')
+        enhanced = data.get('enhanced', False)
+        
+        if not content:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No content provided"}
+            )
+        
+        # Generate token
+        token = generate_token()
+        
+        # Store the script
+        hosted_files[token] = {
+            "content": content,
+            "user_id": current_user['id'],
+            "enhanced": enhanced,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        script_url = f"/raw/{token}"
+        
+        return {
+            "success": True,
+            "token": token,
+            "url": script_url,
+            "full_url": f"https://authy-o0pm.onrender.com{script_url}",
+            "enhanced": enhanced,
+            "message": "Script hosted successfully"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.get("/raw/{token}")
+async def get_raw_script(token: str, request: Request):
+    """Get the raw script content"""
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        return HTMLResponse(
+            content="<h1>Rate Limit Exceeded</h1><p>Too many requests. Try again later.</p>",
+            status_code=429
+        )
+    
+    if token not in hosted_files:
+        return HTMLResponse(
+            content="<h1>404 - Script Not Found</h1>",
+            status_code=404
+        )
+    
+    file_info = hosted_files[token]
+    
+    # Check if browser access for enhanced files
+    user_agent = request.headers.get("user-agent", "").lower()
+    if file_info['enhanced'] and ("mozilla" in user_agent or "chrome" in user_agent or "safari" in user_agent):
+        return HTMLResponse(
+            content="<h1>Access Denied</h1><p>This URL is for loader use only.</p>",
+            status_code=403
+        )
+    
+    return PlainTextResponse(
+        content=file_info['content'],
+        media_type="text/plain"
+    )
+
+@app.get("/api/hosted-files")
+async def get_hosted_files(current_user: dict = Depends(get_current_user)):
+    """Get all files hosted by current user"""
+    user_files = []
+    
+    for token, info in hosted_files.items():
+        if info['user_id'] == current_user['id']:
+            user_files.append({
+                "token": token,
+                "url": f"/raw/{token}",
+                "enhanced": info.get('enhanced', False),
+                "created_at": info['created_at']
+            })
+    
+    return {"files": user_files}
+
+# ========== LOADER GENERATION ENDPOINT ==========
+@app.post("/api/loader")
+async def generate_loader(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate a loader for a hosted script"""
+    try:
+        data = await request.json()
+        token = data.get('token')
+        enhanced = data.get('enhanced', False)
+        
+        if not token:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No script token provided"}
+            )
+        
+        if token not in hosted_files:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Script not found"}
+            )
+        
+        if hosted_files[token]['user_id'] != current_user['id']:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Not authorized to access this script"}
+            )
+        
+        script_url = f"https://authy-o0pm.onrender.com/raw/{token}"
+        loader = generate_basic_loader(script_url)
+        
+        if enhanced:
+            # Add anti-debug for enhanced version
+            loader = loader.replace(
+                "-- Main execution",
+                """-- Anti-Debug Check
+local function antiDebug()
+    if debug and debug.getinfo then
+        return false
+    end
+    return true
+end
+
+if not antiDebug() then
+    print("⚠️ Security check failed")
+    return
+end
+
+-- Main execution"""
+            )
+        
+        return {
+            "success": True,
+            "loader": loader,
+            "enhanced": enhanced,
+            "message": "Loader generated successfully"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 # ========== HEALTH CHECK ==========
 @app.get("/health")

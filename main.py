@@ -435,6 +435,10 @@ class HWIDResetRequest(BaseModel):
     key: str
     confirm: bool = False
 
+class KeyAction(BaseModel):
+    key: str
+    action: str  # 'activate', 'deactivate', 'kick'
+
 # ========== AUTH ENDPOINTS ==========
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user: UserCreate):

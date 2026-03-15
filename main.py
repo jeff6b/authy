@@ -11,11 +11,8 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -35,17 +32,31 @@ ALGORITHM = "HS256"
 DATABASE_URL = os.getenv("DATABASE_URL")
 MASTER_API_KEY = "123"
 
-print("🚀 Starting Authy Military-Grade Protection System...")
+print("🚀 Starting Authy Complete System...")
 print(f"📊 DATABASE_URL exists: {bool(DATABASE_URL)}")
 print(f"🔑 SECRET_KEY exists: {bool(SECRET_KEY)}")
 
-# ========== IN-MEMORY TOKEN STORAGE (No Redis needed) ==========
-memory_tokens = {}
-memory_nodes = {
-    "us-1": {"url": "https://us-1.authy.com", "load": 0},
-    "eu-1": {"url": "https://eu-1.authy.com", "load": 0},
-    "asia-1": {"url": "https://asia-1.authy.com", "load": 0}
-}
+# ========== RATE LIMITING ==========
+rate_limits = {}
+
+def check_rate_limit(ip: str) -> bool:
+    """Simple rate limiting - 10 requests per minute"""
+    now = time.time()
+    if ip not in rate_limits:
+        rate_limits[ip] = []
+    
+    # Clean old requests
+    rate_limits[ip] = [t for t in rate_limits[ip] if now - t < 60]
+    
+    if len(rate_limits[ip]) >= 10:
+        return False
+    
+    rate_limits[ip].append(now)
+    return True
+
+# ========== FILE STORAGE ==========
+hosted_files = {}  # For simple hosting
+loader_files = {}  # For split loader system
 
 # ========== PASSWORD HASHING ==========
 def hash_password(password: str) -> str:
@@ -62,82 +73,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     except Exception as e:
         print(f"Password verification error: {e}")
         return False
-
-# ========== CRYPTOGRAPHY FUNCTIONS ==========
-def generate_encryption_key(salt: bytes = None) -> tuple:
-    """Generate a Fernet encryption key with optional salt"""
-    if not salt:
-        salt = os.urandom(16)
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=100000,
-    )
-    key = base64.urlsafe_b64encode(kdf.derive(SECRET_KEY.encode()))
-    return Fernet(key), salt
-
-def encrypt_chunk(data: str, key: Fernet) -> str:
-    """Encrypt a chunk of data"""
-    return key.encrypt(data.encode()).decode()
-
-def decrypt_chunk(data: str, key: Fernet) -> str:
-    """Decrypt a chunk of data"""
-    return key.decrypt(data.encode()).decode()
-
-# ========== SCRIPT CHUNKING ==========
-def chunk_script(script: str, chunk_size: int = 500) -> List[str]:
-    """Split script into chunks of approximately chunk_size characters"""
-    lines = script.split('\n')
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    
-    for line in lines:
-        line_size = len(line) + 1  # +1 for newline
-        if current_size + line_size > chunk_size and current_chunk:
-            chunks.append('\n'.join(current_chunk))
-            current_chunk = [line]
-            current_size = line_size
-        else:
-            current_chunk.append(line)
-            current_size += line_size
-    
-    if current_chunk:
-        chunks.append('\n'.join(current_chunk))
-    
-    return chunks
-
-# ========== TOKEN MANAGEMENT (Memory-based) ==========
-async def store_token(token: str, data: dict, expiry: int = 60):
-    """Store token with expiry in memory"""
-    memory_tokens[token] = {
-        "data": data,
-        "expires": time.time() + expiry
-    }
-
-async def get_token_data(token: str) -> Optional[dict]:
-    """Retrieve token data if valid and not expired"""
-    token_data = memory_tokens.get(token)
-    if token_data and token_data["expires"] > time.time():
-        return token_data["data"]
-    elif token_data:
-        del memory_tokens[token]
-    return None
-
-async def delete_token(token: str):
-    """Delete a used token"""
-    memory_tokens.pop(token, None)
-
-# ========== NODE MANAGEMENT ==========
-def get_nearest_node(client_ip: str) -> str:
-    """Get the nearest node based on client IP (simplified)"""
-    # In production, use geolocation
-    # For now, round-robin with lowest load
-    available_nodes = [node for node in memory_nodes.keys()]
-    node = min(available_nodes, key=lambda n: memory_nodes[n]["load"])
-    memory_nodes[node]["load"] += 1
-    return node
 
 # ========== DATABASE CONNECTION POOL ==========
 class Database:
@@ -200,79 +135,17 @@ class Database:
                 print("Users table ready")
                 
                 # Scripts table
-                table_exists = await conn.fetchval("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scripts')")
-                
-                if table_exists:
-                    # Add content column if missing
-                    column_exists = await conn.fetchval("""
-                        SELECT EXISTS (
-                            SELECT FROM information_schema.columns 
-                            WHERE table_name = 'scripts' AND column_name = 'content'
-                        )
-                    """)
-                    
-                    if not column_exists:
-                        print("Adding content column to scripts table...")
-                        await conn.execute("ALTER TABLE scripts ADD COLUMN content TEXT")
-                    
-                    # Add chunk_count column if missing
-                    column_exists = await conn.fetchval("""
-                        SELECT EXISTS (
-                            SELECT FROM information_schema.columns 
-                            WHERE table_name = 'scripts' AND column_name = 'chunk_count'
-                        )
-                    """)
-                    
-                    if not column_exists:
-                        print("Adding chunk_count column to scripts table...")
-                        await conn.execute("ALTER TABLE scripts ADD COLUMN chunk_count INTEGER DEFAULT 0")
-                    
-                    # Check id column type
-                    column_type = await conn.fetchval("""
-                        SELECT data_type FROM information_schema.columns 
-                        WHERE table_name = 'scripts' AND column_name = 'id'
-                    """)
-                    
-                    if column_type == 'integer':
-                        print("Converting scripts.id from INTEGER to TEXT...")
-                        await conn.execute('''
-                            CREATE TABLE scripts_new (
-                                id TEXT PRIMARY KEY,
-                                name TEXT NOT NULL,
-                                script_type TEXT DEFAULT 'standard',
-                                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                config JSONB DEFAULT '{}',
-                                content TEXT,
-                                chunk_count INTEGER DEFAULT 0,
-                                UNIQUE(name, user_id)
-                            )
-                        ''')
-                        
-                        await conn.execute('''
-                            INSERT INTO scripts_new (id, name, script_type, user_id, created_at, config, content, chunk_count)
-                            SELECT CAST(id AS TEXT), name, script_type, user_id, created_at, config, content, chunk_count FROM scripts
-                        ''')
-                        
-                        await conn.execute('DROP TABLE scripts CASCADE')
-                        await conn.execute('ALTER TABLE scripts_new RENAME TO scripts')
-                        print("Scripts table converted successfully!")
-                else:
-                    # Create new scripts table
-                    await conn.execute('''
-                        CREATE TABLE scripts (
-                            id TEXT PRIMARY KEY,
-                            name TEXT NOT NULL,
-                            script_type TEXT DEFAULT 'standard',
-                            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            config JSONB DEFAULT '{}',
-                            content TEXT,
-                            chunk_count INTEGER DEFAULT 0,
-                            UNIQUE(name, user_id)
-                        )
-                    ''')
-                    print("Scripts table created")
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS scripts (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        content TEXT,
+                        UNIQUE(name, user_id)
+                    )
+                ''')
+                print("Scripts table ready")
                 
                 # Keys table
                 await conn.execute('''
@@ -325,7 +198,7 @@ db = Database()
 # ========== LIFESPAN HANDLER ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting up Military-Grade Protection System...")
+    print("Starting up Authy Complete System...")
     try:
         await db.connect()
     except Exception as e:
@@ -338,9 +211,9 @@ async def lifespan(app: FastAPI):
 
 # ========== FASTAPI APP ==========
 app = FastAPI(
-    title="Authy Military-Grade Protection System",
-    description="Advanced multi-layer Lua script protection with node system",
-    version="6.0.0",
+    title="Authy Complete System",
+    description="Simple file hosting with protected loader",
+    version="1.0.0",
     lifespan=lifespan
 )
 
@@ -355,62 +228,6 @@ app.add_middleware(
 
 # Security
 security = HTTPBearer(auto_error=False)
-
-# ========== PYDANTIC MODELS ==========
-class UserCreate(BaseModel):
-    username: str
-    password: str
-    api_key: str
-
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str
-
-class ScriptCreate(BaseModel):
-    name: str
-    script_type: Optional[str] = "standard"
-    content: str
-    config: Optional[dict] = {}
-
-class KeyCreate(BaseModel):
-    script_id: str
-    nickname: Optional[str] = None
-    duration_days: int = 30
-
-class KeyResponse(BaseModel):
-    key: str
-    nickname: Optional[str]
-    expires_at: str
-    status: str
-
-class KeyAction(BaseModel):
-    key: str
-    action: str
-
-class KeyNickname(BaseModel):
-    key: str
-    nickname: str
-
-class HeartbeatRequest(BaseModel):
-    key: str
-    hwid: str
-
-class HeartbeatResponse(BaseModel):
-    valid: bool
-    status: str
-    message: str
-    script_name: Optional[str] = None
-    script_type: Optional[str] = None
-    kicked: bool = False
-    expires_at: Optional[str] = None
-
-class HWIDResetRequest(BaseModel):
-    key: str
-    confirm: bool = False
 
 # ========== HELPER FUNCTIONS ==========
 def create_access_token(data: dict):
@@ -460,294 +277,164 @@ def generate_script_id():
     characters = string.ascii_uppercase + string.digits
     return ''.join(random.choices(characters, k=7))
 
-def generate_session_token() -> str:
-    """Generate a temporary session token"""
-    return secrets.token_urlsafe(32)
+def generate_token():
+    """Generate a random token for file hosting"""
+    return secrets.token_urlsafe(8)
 
-# ========== NODE SYSTEM ENDPOINTS ==========
-@app.get("/api/v1/nodes/get")
-async def get_nearest_node_endpoint(request: Request):
-    """
-    Get the nearest node for the client
-    Returns like: {"node":"eu-1"}
-    """
-    client_ip = request.client.host if request.client else "unknown"
-    node = get_nearest_node(client_ip)
+# ========== PROTECTED LOADER GENERATOR ==========
+def generate_protected_loader(real_url: str, enhanced: bool) -> str:
+    """Generate a loader with anti-debug, anti-tamper, and environment checks"""
     
-    return {
-        "success": True,
-        "message": "Nearest node found.",
-        "node": node
-    }
-
-@app.get("/api/v1/nodes/list")
-async def list_nodes():
-    """List all available nodes"""
-    return {
-        "success": True,
-        "nodes": list(memory_nodes.keys())
-    }
-
-# ========== ADVANCED LOADER ENDPOINTS ==========
-@app.post("/api/v1/loader/get/{script_id}/{license_key}")
-async def get_advanced_loader(
-    script_id: str,
-    license_key: str,
-    request: Request,
-    hwid: str = Header(None, alias="X-HWID")
-):
-    """
-    Get an advanced, obfuscated loader for a script
-    This is what the final loader requests after node selection
-    """
-    if not hwid:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Missing HWID"}
-        )
-    
-    # Validate license
-    async with db.pool.acquire() as conn:
-        key_info = await conn.fetchrow(
-            "SELECT * FROM keys WHERE key = $1 AND script_id = $2",
-            license_key, script_id
-        )
-        
-        if not key_info:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Invalid license key"}
-            )
-        
-        key_info = dict(key_info)
-        
-        if key_info['expires_at'] < datetime.now():
-            return JSONResponse(
-                status_code=401,
-                content={"error": "License expired"}
-            )
-        
-        if key_info['kicked']:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "License revoked"}
-            )
-        
-        if key_info['hwid'] and key_info['hwid'] != hwid:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "HWID mismatch"}
-            )
-        
-        # Get script content
-        script = await conn.fetchrow(
-            "SELECT content, chunk_count FROM scripts WHERE id = $1",
-            script_id
-        )
-        
-        if not script:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "Script not found"}
-            )
-    
-    # Generate session token for chunk requests
-    session_token = generate_session_token()
-    fernet, salt = generate_encryption_key()
-    key_b64 = base64.urlsafe_b64encode(fernet._encryption_key).decode()
-    
-    await store_token(session_token, {
-        "license_key": license_key,
-        "hwid": hwid,
-        "script_id": script_id,
-        "encryption_key": key_b64,
-        "ip": request.client.host if request.client else "unknown"
-    }, expiry=300)  # 5 minutes for full download
-    
-    # Split into chunks
-    chunks = chunk_script(script['content'])
-    
-    # Create ultra-obfuscated loader
-    chunks_json = json.dumps([encrypt_chunk(chunk, fernet) for chunk in chunks])
-    encrypted_chunks = base64.b64encode(chunks_json.encode()).decode()
-    
-    # This is the final loader that gets executed
-    loader = f'''
--- =============================================
--- AUTHY MILITARY-GRADE PROTECTED LOADER
--- GENERATED: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
--- =============================================
-
-local a = {{{','.join([f'"{n}"' for n in memory_nodes.keys()])}}}
-local b,c,d
-
--- Anti-debug / Anti-hook measures
-local e = (debug and debug.getinfo) or (getfenv and getfenv)
-if e then
-    -- Anti-debug: exit if being debugged
-    return
-end
-
--- Check for executor integrity
-local f = (syn and syn.crypt) or (crypt and crypt.encrypt) or (game and game:GetService)
-if not f then
-    return -- Invalid environment
-end
-
--- Node selection (load balancing)
-for g,h in ipairs(a) do
-    local i = request({{
-        Url = "https://authy-o0pm.onrender.com/api/v1/nodes/get",
-        Method = "GET",
-        Headers = {{
-            ["X-Real-IP"] = game:GetService("HttpService"):JSONEncode({{}})
-        }}
-    }})
-    if i and i.StatusCode == 200 then
-        local j = game:GetService("HttpService"):JSONDecode(i.Body)
-        if j and j.node then
-            c = j.node
-            break
-        end
-    end
-    task.wait(0.1)
-end
-
-if not c then
-    -- No nodes available - kick user
-    local k = "No available nodes. Please try again later."
-    pcall(function()
-        game:GetService("Players").LocalPlayer:Kick(k)
-    end)
-    return
-end
-
--- Decryption function (XOR with rolling key)
-local function l(m,n)
-    local o = ""
-    for p = 1, #m do
-        local q = string.byte(m, p)
-        local r = string.byte(n, ((p-1) % #n) + 1)
-        o = o .. string.char(bit32 and bit32.bxor(q, r) or q ~ r)
-    end
-    return o
-end
-
--- Main execution
-local s = "{encrypted_chunks}"
-local t = "{key_b64}"
-local u = base64 and base64.decode or (function(v) return v end)
-local w = u(s)
-local x = game:GetService("HttpService"):JSONDecode(w)
-local y = ""
-
-for z,aa in ipairs(x) do
-    y = y .. l(aa, t)
-    -- Clear chunk from memory
-    x[z] = nil
-    aa = nil
-    collectgarbage()
-end
-
--- Execute with integrity check
-local ab = loadstring(y)
-if ab then
-    setfenv and setfenv(ab, getfenv())
-    pcall(ab)
-end
-
--- Self-destruct
-y = nil
-s = nil
-t = nil
-w = nil
-x = nil
-collectgarbage()
+    if not enhanced:
+        # Simple loader
+        return f'''-- Simple Loader
+local url = "{real_url}"
+local response = request({{Url = url}})
+loadstring(response.Body)()
 '''
     
-    return PlainTextResponse(
-        content=loader,
-        media_type="text/plain"
-    )
+    # Calculate hash for anti-tamper
+    expected_hash = str(hash(real_url) % 10000)
+    
+    # Protected loader with all features
+    return f'''-- =============================================
+-- PROTECTED LOADER - DO NOT MODIFY
+-- =============================================
 
-# ========== SIMPLE FILE HOSTING ENDPOINTS ==========
-simple_files = {}
+-- Anti-Debug Check 1: Check for debug functions
+local function antiDebug()
+    if debug and debug.getinfo then
+        return false
+    end
+    return true
+end
 
-class SimpleFileCreate(BaseModel):
-    content: str
-    file_type: str = "lua"
-    enhanced_security: bool = False
+-- Anti-Debug Check 2: Execution time check
+local function checkTime()
+    local start = os.clock()
+    for i = 1, 1000 do
+        -- Busy work
+        local x = i * i
+    end
+    local elapsed = os.clock() - start
+    if elapsed > 0.5 then  -- Took too long? Someone stepped through
+        return false
+    end
+    return true
+end
 
-@app.post("/api/hostfile")
-async def host_simple_file(
-    request: Request,
-    current_user: dict = Depends(get_current_user)
-):
-    """Simple file hosting with optional header protection"""
-    try:
-        data = await request.json()
-        content = data.get('content')
-        file_type = data.get('file_type', 'lua')
-        enhanced_security = data.get('enhanced_security', False)
-        
-        if file_type not in ['lua', 'txt']:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Only .lua and .txt files are allowed"}
-            )
-        
-        file_token = secrets.token_urlsafe(8)
-        
-        simple_files[file_token] = {
-            "content": content,
-            "file_type": file_type,
-            "enhanced_security": enhanced_security,
-            "user_id": current_user['id'],
-            "created_at": datetime.now().isoformat()
-        }
-        
-        return {
-            "success": True,
-            "file_token": file_token,
-            "access_url": f"/raw/{file_token}",
-            "message": "File hosted successfully"
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+-- Environment Check: Verify we're in a real executor
+local function checkEnvironment()
+    -- Check for executor-specific functions
+    if not (syn and syn.request) and not (request) then
+        return false
+    end
+    
+    -- Check for Roblox globals
+    if not game or not game:GetService then
+        return false
+    end
+    
+    return true
+end
 
-@app.get("/raw/{file_token}")
-async def get_simple_file(
-    file_token: str,
-    x_loader: Optional[str] = Header(None)
-):
-    """Serve the raw file with optional header protection"""
-    
-    if file_token not in simple_files:
-        return HTMLResponse(
-            content="<h1>404 - File Not Found</h1>",
-            status_code=404
-        )
-    
-    file_data = simple_files[file_token]
-    
-    if file_data['enhanced_security'] and not x_loader:
-        return HTMLResponse(
-            content="<h1>Access Denied</h1><p>nice try</p>",
-            status_code=403
-        )
-    
-    content_type = "text/plain"
-    if file_data['file_type'] == 'lua':
-        content_type = "text/x-lua"
-    
-    return PlainTextResponse(
-        content=file_data['content'],
-        media_type=content_type
-    )
+-- Anti-Tamper: Verify loader integrity
+local function checkIntegrity()
+    local critical = "{real_url}"
+    local hash = 0
+    for i = 1, #critical do
+        hash = hash + string.byte(critical, i)
+    end
+    -- Expected hash: {expected_hash}
+    if hash ~= {expected_hash} then
+        return false
+    end
+    return true
+end
+
+-- Run all checks
+if not antiDebug() then
+    print("Debugger detected")
+    return
+end
+
+if not checkTime() then
+    print("Execution time anomaly detected")
+    return
+end
+
+if not checkEnvironment() then
+    print("Invalid environment")
+    return
+end
+
+if not checkIntegrity() then
+    print("Loader corrupted")
+    return
+end
+
+-- Junk code to confuse analysis
+local a = 12345
+local b = "skdjfhg"
+for i = 1, 5 do
+    local c = i * 2
+    local d = function() return "useless" end
+    d()
+end
+
+-- The actual fetcher (hidden in junk)
+local realUrl = "{real_url}"
+local response = request({{
+    Url = realUrl,
+    Method = "GET"
+}})
+
+if response and response.StatusCode == 200 then
+    loadstring(response.Body)()
+else
+    print("Failed to load script")
+end
+
+-- Self-destruct (clear variables)
+realUrl = nil
+response = nil
+collectgarbage()
+'''
+
+# ========== PYDANTIC MODELS ==========
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    api_key: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+class KeyCreate(BaseModel):
+    script_id: str
+    nickname: Optional[str] = None
+    duration_days: int = 30
+
+class HeartbeatRequest(BaseModel):
+    key: str
+    hwid: str
+
+class HeartbeatResponse(BaseModel):
+    valid: bool
+    status: str
+    message: str
+    script_name: Optional[str] = None
+    kicked: bool = False
+    expires_at: Optional[str] = None
+
+class HWIDResetRequest(BaseModel):
+    key: str
+    confirm: bool = False
 
 # ========== AUTH ENDPOINTS ==========
 @app.post("/api/auth/register", response_model=TokenResponse)
@@ -826,11 +513,12 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
 # ========== SCRIPT MANAGEMENT ==========
 @app.post("/api/scripts/create")
 async def create_script(
-    script_data: ScriptCreate,
+    name: str = Form(...),
+    content: str = Form(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """Create a new script with content and chunk it"""
-    print(f"Creating script: {script_data.name} for user {current_user['id']}")
+    """Create a new script"""
+    print(f"Creating script: {name} for user {current_user['id']}")
     
     if not db.pool:
         print("Database not available")
@@ -840,41 +528,30 @@ async def create_script(
         async with db.pool.acquire() as conn:
             existing = await conn.fetchval(
                 "SELECT id FROM scripts WHERE name = $1 AND user_id = $2",
-                script_data.name, current_user['id']
+                name, current_user['id']
             )
             
             if existing:
-                print(f"Script name already exists: {script_data.name}")
+                print(f"Script name already exists: {name}")
                 raise HTTPException(status_code=400, detail="Script name already exists")
             
             script_id = generate_script_id()
             while await conn.fetchval("SELECT id FROM scripts WHERE id = $1", script_id):
                 script_id = generate_script_id()
             
-            chunks = chunk_script(script_data.content)
-            chunk_count = len(chunks)
-            
-            config_json = '{}'
-            if script_data.config:
-                config_json = json.dumps(script_data.config)
-            
             await conn.fetchval(
                 """
-                INSERT INTO scripts 
-                (id, name, script_type, user_id, config, content, chunk_count) 
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7) 
+                INSERT INTO scripts (id, name, user_id, content) 
+                VALUES ($1, $2, $3, $4) 
                 RETURNING id
                 """,
-                script_id, script_data.name, script_data.script_type, 
-                current_user['id'], config_json, script_data.content, chunk_count
+                script_id, name, current_user['id'], content
             )
             
-            print(f"Script created with ID: {script_id} ({chunk_count} chunks)")
+            print(f"Script created with ID: {script_id}")
             return {
                 "id": script_id,
-                "name": script_data.name,
-                "script_type": script_data.script_type,
-                "chunk_count": chunk_count,
+                "name": name,
                 "message": "Script created successfully"
             }
     except HTTPException:
@@ -911,12 +588,9 @@ async def get_scripts(current_user: dict = Depends(get_current_user)):
             result.append({
                 "id": script['id'],
                 "name": script['name'],
-                "script_type": script['script_type'],
                 "created_at": script['created_at'].isoformat(),
                 "key_count": script['key_count'],
-                "active_keys": script['active_keys'],
-                "chunk_count": script['chunk_count'],
-                "config": script['config']
+                "active_keys": script['active_keys']
             })
         
         return result
@@ -932,7 +606,7 @@ async def get_script(
     
     async with db.pool.acquire() as conn:
         script = await conn.fetchrow(
-            "SELECT id, name, script_type, created_at, chunk_count, config FROM scripts WHERE id = $1 AND user_id = $2",
+            "SELECT id, name, created_at FROM scripts WHERE id = $1 AND user_id = $2",
             script_id, current_user['id']
         )
         
@@ -1011,7 +685,7 @@ async def get_keys(current_user: dict = Depends(get_current_user)):
     async with db.pool.acquire() as conn:
         keys = await conn.fetch(
             """
-            SELECT k.*, s.name as script_name, s.script_type
+            SELECT k.*, s.name as script_name
             FROM keys k
             JOIN scripts s ON k.script_id = s.id
             WHERE s.user_id = $1
@@ -1031,7 +705,6 @@ async def get_keys(current_user: dict = Depends(get_current_user)):
                 "key": key['key'],
                 "nickname": key['nickname'],
                 "script_name": key['script_name'],
-                "script_type": key['script_type'],
                 "created_at": key['created_at'].isoformat() if key['created_at'] else None,
                 "expires_at": key['expires_at'].isoformat() if key['expires_at'] else None,
                 "last_heartbeat": key['last_heartbeat'].isoformat() if key['last_heartbeat'] else None,
@@ -1141,35 +814,6 @@ async def key_action(
         
         raise HTTPException(status_code=400, detail="Invalid action")
 
-@app.post("/api/keys/nickname")
-async def set_nickname(
-    nick_data: KeyNickname,
-    current_user: dict = Depends(get_current_user)
-):
-    """Set nickname for a key"""
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    async with db.pool.acquire() as conn:
-        key_info = await conn.fetchrow(
-            """
-            SELECT k.* FROM keys k
-            JOIN scripts s ON k.script_id = s.id
-            WHERE k.key = $1 AND s.user_id = $2
-            """,
-            nick_data.key, current_user['id']
-        )
-        
-        if not key_info:
-            raise HTTPException(status_code=404, detail="Key not found")
-        
-        await conn.execute(
-            "UPDATE keys SET nickname = $1 WHERE key = $2",
-            nick_data.nickname, nick_data.key
-        )
-        
-        return {"success": True, "message": "Nickname updated"}
-
 @app.post("/api/keys/reset-hwid")
 async def reset_hwid(
     request: HWIDResetRequest,
@@ -1236,110 +880,7 @@ async def delete_key(
         
         return {"success": True}
 
-# ========== STATS ==========
-@app.get("/api/stats")
-async def get_stats(current_user: dict = Depends(get_current_user)):
-    """Get dashboard stats"""
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    async with db.pool.acquire() as conn:
-        total_scripts = await conn.fetchval(
-            "SELECT COUNT(*) FROM scripts WHERE user_id = $1",
-            current_user['id']
-        )
-        
-        total_keys = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM keys k
-            JOIN scripts s ON k.script_id = s.id
-            WHERE s.user_id = $1
-            """,
-            current_user['id']
-        )
-        
-        active_keys = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM keys k
-            JOIN scripts s ON k.script_id = s.id
-            WHERE s.user_id = $1 
-            AND k.status = 'active' 
-            AND k.expires_at > CURRENT_TIMESTAMP
-            """,
-            current_user['id']
-        )
-        
-        online_now = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM keys k
-            JOIN scripts s ON k.script_id = s.id
-            WHERE s.user_id = $1 
-            AND k.last_heartbeat IS NOT NULL
-            AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - k.last_heartbeat)) < 120
-            """,
-            current_user['id']
-        )
-        
-        return {
-            "total_scripts": total_scripts or 0,
-            "total_keys": total_keys or 0,
-            "active_keys": active_keys or 0,
-            "online_now": online_now or 0
-        }
-
-@app.get("/api/stats/script/{script_id}")
-async def get_script_stats(
-    script_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get stats for a specific script"""
-    if not db.pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    async with db.pool.acquire() as conn:
-        script = await conn.fetchrow(
-            "SELECT * FROM scripts WHERE id = $1 AND user_id = $2",
-            script_id, current_user['id']
-        )
-        
-        if not script:
-            raise HTTPException(status_code=404, detail="Script not found")
-        
-        total_keys = await conn.fetchval(
-            "SELECT COUNT(*) FROM keys WHERE script_id = $1",
-            script_id
-        )
-        
-        active_keys = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM keys 
-            WHERE script_id = $1 
-            AND status = 'active' 
-            AND expires_at > CURRENT_TIMESTAMP
-            """,
-            script_id
-        )
-        
-        online_now = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM keys 
-            WHERE script_id = $1 
-            AND last_heartbeat IS NOT NULL
-            AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_heartbeat)) < 120
-            """,
-            script_id
-        )
-        
-        return {
-            "script_id": script_id,
-            "script_name": script['name'],
-            "script_type": script['script_type'],
-            "total_keys": total_keys or 0,
-            "active_keys": active_keys or 0,
-            "online_now": online_now or 0
-        }
-
-# ========== PUBLIC API ENDPOINTS ==========
+# ========== HEARTBEAT ==========
 @app.post("/api/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest, req: Request):
     """Lua clients call this - checks if kicked"""
@@ -1353,7 +894,7 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
     try:
         async with db.pool.acquire() as conn:
             key_info = await conn.fetchrow(
-                "SELECT k.*, s.name as script_name, s.script_type FROM keys k JOIN scripts s ON k.script_id = s.id WHERE k.key = $1",
+                "SELECT k.*, s.name as script_name FROM keys k JOIN scripts s ON k.script_id = s.id WHERE k.key = $1",
                 request.key
             )
             
@@ -1418,7 +959,6 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
                 status="active", 
                 message=f"Valid - {days_left} days remaining",
                 script_name=key_info['script_name'],
-                script_type=key_info['script_type'],
                 kicked=False,
                 expires_at=key_info['expires_at'].isoformat()
             )
@@ -1430,25 +970,213 @@ async def heartbeat(request: HeartbeatRequest, req: Request):
             message=f"Server error: {str(e)}"
         )
 
-# ========== FRONTEND ROUTES ==========
-@app.get("/", response_class=HTMLResponse)
-async def serve_homepage():
-    """Serve the homepage"""
-    return HOMEPAGE_TEMPLATE
+# ========== STATS ==========
+@app.get("/api/stats")
+async def get_stats(current_user: dict = Depends(get_current_user)):
+    """Get dashboard stats"""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    async with db.pool.acquire() as conn:
+        total_scripts = await conn.fetchval(
+            "SELECT COUNT(*) FROM scripts WHERE user_id = $1",
+            current_user['id']
+        )
+        
+        total_keys = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1
+            """,
+            current_user['id']
+        )
+        
+        active_keys = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1 
+            AND k.status = 'active' 
+            AND k.expires_at > CURRENT_TIMESTAMP
+            """,
+            current_user['id']
+        )
+        
+        online_now = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys k
+            JOIN scripts s ON k.script_id = s.id
+            WHERE s.user_id = $1 
+            AND k.last_heartbeat IS NOT NULL
+            AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - k.last_heartbeat)) < 120
+            """,
+            current_user['id']
+        )
+        
+        return {
+            "total_scripts": total_scripts or 0,
+            "total_keys": total_keys or 0,
+            "active_keys": active_keys or 0,
+            "online_now": online_now or 0
+        }
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def serve_dashboard():
-    """Serve the dashboard"""
-    return DASHBOARD_TEMPLATE
+# ========== FILE HOSTING ENDPOINTS ==========
+@app.post("/api/hostscript")
+async def host_script(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Host a script with optional enhanced protection"""
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded. Try again later."}
+        )
+    
+    try:
+        data = await request.json()
+        enhanced = data.get('enhanced', False)
+        
+        # Get file content from request
+        content = data.get('content')
+        if not content:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No content provided"}
+            )
+        
+        # Generate tokens for both URLs
+        main_token = generate_token()
+        loader_token = generate_token()
+        
+        # Store the main script
+        hosted_files[main_token] = {
+            "content": content,
+            "user_id": current_user['id'],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Generate loader URL
+        loader_url = f"/loader/{loader_token}"
+        main_url = f"/raw/{main_token}"
+        
+        # Store loader info
+        loader_files[loader_token] = {
+            "main_url": main_url,
+            "enhanced": enhanced,
+            "user_id": current_user['id'],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        return {
+            "success": True,
+            "loader_url": loader_url,
+            "main_url": main_url,
+            "enhanced": enhanced,
+            "message": "Script hosted successfully"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
-# ========== HOMEPAGE TEMPLATE ==========
+@app.get("/loader/{token}")
+async def get_loader(token: str, request: Request):
+    """Get the protected loader"""
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        return HTMLResponse(
+            content="<h1>Rate Limit Exceeded</h1><p>Too many requests. Try again later.</p>",
+            status_code=429
+        )
+    
+    if token not in loader_files:
+        return HTMLResponse(
+            content="<h1>404 - Loader Not Found</h1>",
+            status_code=404
+        )
+    
+    loader_info = loader_files[token]
+    
+    # Check if browser access (no request function)
+    user_agent = request.headers.get("user-agent", "").lower()
+    if "mozilla" in user_agent or "chrome" in user_agent or "safari" in user_agent:
+        return HTMLResponse(
+            content="<h1>Access Denied</h1><p>This URL is for loader use only.</p>",
+            status_code=403
+        )
+    
+    # Generate the protected loader
+    main_url = f"https://authy-o0pm.onrender.com{loader_info['main_url']}"
+    loader = generate_protected_loader(main_url, loader_info['enhanced'])
+    
+    return PlainTextResponse(
+        content=loader,
+        media_type="text/plain"
+    )
+
+@app.get("/raw/{token}")
+async def get_raw_script(token: str, request: Request):
+    """Get the raw script content"""
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        return HTMLResponse(
+            content="<h1>Rate Limit Exceeded</h1><p>Too many requests. Try again later.</p>",
+            status_code=429
+        )
+    
+    if token not in hosted_files:
+        return HTMLResponse(
+            content="<h1>404 - Script Not Found</h1>",
+            status_code=404
+        )
+    
+    file_info = hosted_files[token]
+    
+    # Check if browser access
+    user_agent = request.headers.get("user-agent", "").lower()
+    if "mozilla" in user_agent or "chrome" in user_agent or "safari" in user_agent:
+        return HTMLResponse(
+            content="<h1>Access Denied</h1><p>This URL is for loader use only.</p>",
+            status_code=403
+        )
+    
+    return PlainTextResponse(
+        content=file_info['content'],
+        media_type="text/plain"
+    )
+
+@app.get("/api/myfiles")
+async def get_my_files(current_user: dict = Depends(get_current_user)):
+    """Get all files hosted by current user"""
+    user_files = []
+    
+    for token, info in loader_files.items():
+        if info['user_id'] == current_user['id']:
+            user_files.append({
+                "loader_url": f"/loader/{token}",
+                "main_url": info['main_url'],
+                "enhanced": info['enhanced'],
+                "created_at": info['created_at']
+            })
+    
+    return {"files": user_files}
+
+# ========== HOMEPAGE ==========
 HOMEPAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Authy - Military-Grade Protection</title>
+  <title>Authy - Simple File Hosting</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1788,10 +1516,10 @@ HOMEPAGE_TEMPLATE = """
 
   <section class="hero-section" id="heroSection">
     <div class="hero-text">
-      Military-Grade <span class="highlight">Script Protection</span>
+      Simple File <span class="highlight">Hosting</span>
     </div>
     <div class="hero-subtitle">
-      Multi-node load balancing with anti-tamper and zero vulnerabilities
+      Upload files, get protected loaders, no complexity
     </div>
   </section>
 
@@ -2010,7 +1738,7 @@ DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authy Military-Grade Dashboard</title>
+    <title>Authy Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -2684,7 +2412,7 @@ DASHBOARD_TEMPLATE = """
             <a href="/dashboard" class="nav-link">Dashboard</a>
             <a href="#" class="nav-link">Scripts</a>
             <a href="#" class="nav-link">Keys</a>
-            <a href="#" class="nav-link">Analytics</a>
+            <a href="#" class="nav-link">Hosting</a>
             <a href="#" class="nav-link">Docs</a>
         </div>
         <div class="nav-user">
@@ -2788,6 +2516,21 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Hosted Files Section -->
+        <div class="section-header">
+            <h2>Hosted Files</h2>
+            <button class="btn-primary" id="hostScriptBtn">
+                <i class="fas fa-upload"></i>
+                Host Script
+            </button>
+        </div>
+        <div class="keys-table-container" id="hostedFilesContainer">
+            <div class="loader">
+                <i class="fas fa-spinner fa-spin"></i>
+                <p>Loading hosted files...</p>
+            </div>
+        </div>
+
         <!-- Keys Table -->
         <div class="section-header">
             <h2>Recent Keys</h2>
@@ -2834,14 +2577,6 @@ DASHBOARD_TEMPLATE = """
                     <input type="text" id="scriptName" placeholder="e.g., 'My Script'" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
                 </div>
                 <div class="form-group" style="margin-bottom: 20px;">
-                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Script Type</label>
-                    <select id="scriptType" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
-                        <option value="standard">Standard</option>
-                        <option value="premium">Premium</option>
-                        <option value="custom">Custom</option>
-                    </select>
-                </div>
-                <div class="form-group" style="margin-bottom: 20px;">
                     <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Script Content</label>
                     <textarea id="scriptContent" rows="10" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-family: monospace;" placeholder="Paste your Lua script here..."></textarea>
                 </div>
@@ -2851,6 +2586,35 @@ DASHBOARD_TEMPLATE = """
                 <button class="btn-primary" id="createScriptSubmit">
                     <i class="fas fa-plus"></i>
                     Create Script
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Host Script Modal -->
+    <div class="modal-overlay" id="hostScriptModal">
+        <div class="modal" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3>Host a Script</h3>
+                <button class="modal-close" id="closeHostModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Script Content</label>
+                    <textarea id="hostContent" rows="10" style="width: 100%; padding: 12px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-family: monospace;" placeholder="Paste your Lua script here..."></textarea>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label style="display: flex; align-items: center; gap: 10px; color: var(--text-secondary);">
+                        <input type="checkbox" id="enhancedProtection">
+                        Enhanced Protection (Anti-debug + Anti-tamper)
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="cancelHostBtn">Cancel</button>
+                <button class="btn-primary" id="hostSubmit">
+                    <i class="fas fa-upload"></i>
+                    Host Script
                 </button>
             </div>
         </div>
@@ -2933,7 +2697,7 @@ DASHBOARD_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Generate Loader Modal -->
+    <!-- View Loader Modal -->
     <div class="modal-overlay" id="loaderModal">
         <div class="modal" style="max-width: 700px;">
             <div class="modal-header">
@@ -2941,13 +2705,13 @@ DASHBOARD_TEMPLATE = """
                 <button class="modal-close" id="closeLoaderModal">&times;</button>
             </div>
             <div class="modal-body">
-                <p>Copy this military-grade loader and paste it at the bottom of your script:</p>
+                <p>Copy this loader and give it to your users:</p>
                 <div class="loader-preview">
                     <pre id="loaderCode">Loading...</pre>
                 </div>
                 <p style="color: var(--text-secondary); margin-top: 10px;">
                     <i class="fas fa-info-circle"></i>
-                    This loader includes node selection, anti-tamper, and memory self-destruct.
+                    Enhanced protection includes anti-debug, anti-tamper, and environment checks.
                 </p>
             </div>
             <div class="modal-footer">
@@ -2995,6 +2759,7 @@ DASHBOARD_TEMPLATE = """
         const createKeyModal = document.getElementById('createKeyModal');
         const viewKeysModal = document.getElementById('viewKeysModal');
         const loaderModal = document.getElementById('loaderModal');
+        const hostScriptModal = document.getElementById('hostScriptModal');
 
         // ========== UTILITY FUNCTIONS ==========
         function showToast(message, type = 'success') {
@@ -3048,7 +2813,8 @@ DASHBOARD_TEMPLATE = """
                 await Promise.all([
                     loadStats(),
                     loadScripts(),
-                    loadKeys()
+                    loadKeys(),
+                    loadHostedFiles()
                 ]);
                 
                 initCharts();
@@ -3107,18 +2873,14 @@ DASHBOARD_TEMPLATE = """
                                 <div class="script-stat-value">${script.active_keys}</div>
                             </div>
                             <div class="script-stat">
-                                <div class="script-stat-label">Chunks</div>
-                                <div class="script-stat-value">${script.chunk_count}</div>
+                                <div class="script-stat-label">Created</div>
+                                <div class="script-stat-value">${new Date(script.created_at).toLocaleDateString()}</div>
                             </div>
                         </div>
                         <div class="script-actions">
                             <button class="btn-success" onclick="showGenerateKeyModal('${script.id}', '${script.name}')">
                                 <i class="fas fa-plus"></i>
                                 Key
-                            </button>
-                            <button class="btn-primary" onclick="generateLoader('${script.id}')">
-                                <i class="fas fa-download"></i>
-                                Loader
                             </button>
                             <button class="btn-secondary" onclick="viewScriptKeys('${script.id}', '${script.name}')">
                                 <i class="fas fa-eye"></i>
@@ -3141,6 +2903,57 @@ DASHBOARD_TEMPLATE = """
                 
             } catch (error) {
                 console.error('Failed to load scripts:', error);
+            }
+        }
+
+        async function loadHostedFiles() {
+            try {
+                const response = await apiCall('/api/myfiles');
+                const container = document.getElementById('hostedFilesContainer');
+                
+                if (!response.files || response.files.length === 0) {
+                    container.innerHTML = `
+                        <div style="text-align: center; padding: 40px;">
+                            <i class="fas fa-file" style="font-size: 3rem; opacity: 0.5; margin-bottom: 10px;"></i>
+                            <p>No hosted files yet. Click "Host Script" to upload one.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Loader URL</th>
+                                <th>Main URL</th>
+                                <th>Enhanced</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${response.files.map(file => `
+                                <tr>
+                                    <td><code>${file.loader_url}</code></td>
+                                    <td><code>${file.main_url}</code></td>
+                                    <td>${file.enhanced ? '✅ Yes' : '❌ No'}</td>
+                                    <td>${new Date(file.created_at).toLocaleString()}</td>
+                                    <td>
+                                        <button class="btn-icon" onclick="copyUrl('${window.location.origin}${file.loader_url}')" title="Copy Loader URL">
+                                            <i class="fas fa-copy"></i>
+                                        </button>
+                                        <button class="btn-icon" onclick="viewLoader('${window.location.origin}${file.loader_url}')" title="View Loader">
+                                            <i class="fas fa-eye"></i>
+                                        </button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch (error) {
+                console.error('Failed to load hosted files:', error);
             }
         }
 
@@ -3280,7 +3093,6 @@ DASHBOARD_TEMPLATE = """
 
         document.getElementById('createScriptSubmit').addEventListener('click', async () => {
             const name = document.getElementById('scriptName').value;
-            const scriptType = document.getElementById('scriptType').value;
             const content = document.getElementById('scriptContent').value;
             
             if (!name) {
@@ -3296,14 +3108,61 @@ DASHBOARD_TEMPLATE = """
             try {
                 await apiCall('/api/scripts/create', 'POST', { 
                     name, 
-                    script_type: scriptType,
-                    content: content
+                    content
                 });
                 createScriptModal.classList.remove('show');
                 document.getElementById('scriptName').value = '';
                 document.getElementById('scriptContent').value = '';
                 showToast('Script created successfully!');
                 await loadScripts();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+
+        // ========== HOST SCRIPT ACTIONS ==========
+        document.getElementById('hostScriptBtn').addEventListener('click', () => {
+            hostScriptModal.classList.add('show');
+        });
+
+        document.getElementById('closeHostModal').addEventListener('click', () => {
+            hostScriptModal.classList.remove('show');
+        });
+
+        document.getElementById('cancelHostBtn').addEventListener('click', () => {
+            hostScriptModal.classList.remove('show');
+        });
+
+        document.getElementById('hostSubmit').addEventListener('click', async () => {
+            const content = document.getElementById('hostContent').value;
+            const enhanced = document.getElementById('enhancedProtection').checked;
+            
+            if (!content) {
+                showToast('Please enter script content', 'error');
+                return;
+            }
+            
+            try {
+                const result = await apiCall('/api/hostscript', 'POST', {
+                    content: content,
+                    enhanced: enhanced
+                });
+                
+                hostScriptModal.classList.remove('show');
+                document.getElementById('hostContent').value = '';
+                document.getElementById('enhancedProtection').checked = false;
+                
+                showToast('Script hosted successfully!');
+                await loadHostedFiles();
+                
+                // Show the loader
+                const loaderUrl = window.location.origin + result.loader_url;
+                document.getElementById('loaderCode').textContent = `-- Copy this loader and give it to your users
+local loaderUrl = "${loaderUrl}"
+local response = request({Url = loaderUrl})
+loadstring(response.Body)()`;
+                loaderModal.classList.add('show');
+                
             } catch (error) {
                 showToast(error.message, 'error');
             }
@@ -3462,90 +3321,20 @@ DASHBOARD_TEMPLATE = """
             createKeyModal.classList.add('show');
         });
 
-        // ========== LOADER GENERATION ==========
-        window.generateLoader = async (scriptId) => {
+        // ========== UTILITY FUNCTIONS ==========
+        window.copyUrl = (url) => {
+            navigator.clipboard.writeText(url);
+            showToast('URL copied to clipboard!');
+        };
+
+        window.viewLoader = async (url) => {
             try {
-                // Get script info for chunk count
-                const scriptInfo = await apiCall('/api/scripts/' + scriptId);
-                
-                const loaderTemplate = `-- =============================================
--- AUTHY MILITARY-GRADE PROTECTED LOADER
--- SCRIPT ID: ${scriptInfo.id}
--- CHUNKS: ${scriptInfo.chunk_count}
--- GENERATED: ${new Date().toISOString()}
--- =============================================
-
-local a = {"us-1","eu-1","asia-1"}
-local b,c,d
-
--- Anti-debug / Anti-hook measures
-local e = (debug and debug.getinfo) or (getfenv and getfenv)
-if e then
-    -- Anti-debug: exit if being debugged
-    return
-end
-
--- Check for executor integrity
-local f = (syn and syn.crypt) or (crypt and crypt.encrypt) or (game and game:GetService)
-if not f then
-    return -- Invalid environment
-end
-
--- Node selection (load balancing)
-for g,h in ipairs(a) do
-    local i = request({
-        Url = "https://authy-o0pm.onrender.com/api/v1/nodes/get",
-        Method = "GET",
-        Headers = {
-            ["X-Real-IP"] = game:GetService("HttpService"):JSONEncode({})
-        }
-    })
-    if i and i.StatusCode == 200 then
-        local j = game:GetService("HttpService"):JSONDecode(i.Body)
-        if j and j.node then
-            c = j.node
-            break
-        end
-    end
-    task.wait(0.1)
-end
-
-if not c then
-    -- No nodes available - kick user
-    local k = "No available nodes. Please try again later."
-    pcall(function()
-        game:GetService("Players").LocalPlayer:Kick(k)
-    end)
-    return
-end
-
--- Decryption function (XOR with rolling key)
-local function l(m,n)
-    local o = ""
-    for p = 1, #m do
-        local q = string.byte(m, p)
-        local r = string.byte(n, ((p-1) % #n) + 1)
-        o = o .. string.char(bit32 and bit32.bxor(q, r) or q ~ r)
-    end
-    return o
-end
-
--- Main execution - will fetch encrypted chunks from server
-local function s()
-    -- This is where the actual script will be fetched
-    -- The real implementation would call your chunk endpoints
-    print("Protected script loaded via node: " .. c)
-end
-
-s()
-
--- Self-destruct
-collectgarbage()`;
-                
-                document.getElementById('loaderCode').textContent = loaderTemplate;
+                const response = await fetch(url);
+                const text = await response.text();
+                document.getElementById('loaderCode').textContent = text;
                 loaderModal.classList.add('show');
             } catch (error) {
-                showToast(error.message, 'error');
+                showToast('Failed to load loader: ' + error.message, 'error');
             }
         };
 

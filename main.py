@@ -12,8 +12,7 @@ from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
@@ -72,12 +71,11 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         print(f"Password verification error: {e}")
         return False
 
-# ========== CRYPTOGRAPHY FUNCTIONS ==========
 def generate_encryption_key(salt: bytes = None) -> tuple:
     """Generate a Fernet encryption key with optional salt"""
     if not salt:
         salt = os.urandom(16)
-    kdf = PBKDF2(
+    kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
@@ -85,7 +83,6 @@ def generate_encryption_key(salt: bytes = None) -> tuple:
     )
     key = base64.urlsafe_b64encode(kdf.derive(SECRET_KEY.encode()))
     return Fernet(key), salt
-
 def encrypt_chunk(data: str, key: Fernet) -> str:
     """Encrypt a chunk of data"""
     return key.encrypt(data.encode()).decode()

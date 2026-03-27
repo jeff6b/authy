@@ -11,7 +11,7 @@ app = FastAPI()
 # ===== CONNECT TO DB =====
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-conn = psycopg2.connect(DATABASE_URL)
+conn = psycopg2.connect(DATABASE_URL, sslmode="require")
 cur = conn.cursor()
 
 # ===== CREATE TABLE IF NOT EXISTS =====

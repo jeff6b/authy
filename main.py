@@ -1,31 +1,50 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
-import psycopg2
-import os
-import random
-import string
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, PlainTextResponse
+import psycopg2, os, random, string, time, hmac, hashlib, secrets
 from datetime import datetime, timedelta
 
 app = FastAPI()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ===== UTILS =====
+SECRET = "CHANGE_THIS_TO_LONG_RANDOM_SECRET"
+
+# ===== DB =====
 def db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-def generate_key(length=20):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-
-# ===== INIT TABLE (adds columns if missing) =====
+# ===== INIT =====
 def init():
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-    ALTER TABLE keys
-    ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+    CREATE TABLE IF NOT EXISTS keys (
+        key TEXT PRIMARY KEY,
+        hwid TEXT,
+        expires_at TIMESTAMP,
+        status TEXT DEFAULT 'active'
+    );
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        key TEXT,
+        hwid TEXT,
+        created_at TIMESTAMP,
+        last_seen TIMESTAMP,
+        active BOOLEAN
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+        id INT PRIMARY KEY DEFAULT 1,
+        killswitch BOOLEAN DEFAULT FALSE
+    );
+    """)
+
+    cur.execute("INSERT INTO settings (id) VALUES (1) ON CONFLICT DO NOTHING;")
 
     conn.commit()
     cur.close()
@@ -33,19 +52,28 @@ def init():
 
 init()
 
-# ===== CREATE KEY =====
+# ===== UTILS =====
+def gen_key():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=20))
+
+def verify_sig(token, hwid, ts, sig):
+    msg = f"{token}:{hwid}:{ts}"
+    expected = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+# ===== GEN KEY =====
 @app.get("/gen")
 def gen():
     conn = db()
     cur = conn.cursor()
 
-    key = generate_key()
-    expires = datetime.utcnow() + timedelta(days=7)
+    key = gen_key()
+    exp = datetime.utcnow() + timedelta(days=7)
 
     cur.execute("""
-    INSERT INTO keys (key, script_id, expires_at, status)
-    VALUES (%s, %s, %s, %s)
-    """, (key, 1, expires, "active"))
+    INSERT INTO keys (key, expires_at, status)
+    VALUES (%s, %s, %s)
+    """, (key, exp, "active"))
 
     conn.commit()
     cur.close()
@@ -59,64 +87,97 @@ def auth(key: str, hwid: str):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("""
-    SELECT hwid, expires_at, status FROM keys WHERE key=%s
-    """, (key,))
+    # killswitch
+    cur.execute("SELECT killswitch FROM settings WHERE id=1")
+    if cur.fetchone()[0]:
+        return {"success": False, "reason": "killswitch"}
+
+    cur.execute("SELECT hwid, expires_at, status FROM keys WHERE key=%s", (key,))
     row = cur.fetchone()
 
     if not row:
         return {"success": False}
 
-    stored_hwid, expires, status = row
+    shwid, exp, status = row
 
-    if status != "active":
+    if status != "active" or datetime.utcnow() > exp:
         return {"success": False}
 
-    if datetime.utcnow() > expires:
+    if shwid and shwid != hwid:
         return {"success": False}
 
-    if stored_hwid and stored_hwid != hwid:
-        return {"success": False}
-
-    if not stored_hwid:
+    if not shwid:
         cur.execute("UPDATE keys SET hwid=%s WHERE key=%s", (hwid, key))
+
+    # create session
+    token = secrets.token_hex(16)
+
+    cur.execute("""
+    INSERT INTO sessions (token, key, hwid, created_at, last_seen, active)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    """, (token, key, hwid, datetime.utcnow(), datetime.utcnow(), True))
 
     conn.commit()
     cur.close()
     conn.close()
 
-    return {"success": True}
+    return {"success": True, "token": token}
 
 # ===== HEARTBEAT =====
 @app.get("/heartbeat")
-def heartbeat(key: str):
+def heartbeat(token: str, hwid: str, ts: int, sig: str):
+    if abs(time.time() - ts) > 10:
+        return {"status": "invalid"}
+
+    if not verify_sig(token, hwid, ts, sig):
+        return {"status": "invalid"}
+
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("""
-    UPDATE keys SET last_seen=%s WHERE key=%s
-    """, (datetime.utcnow(), key))
+    cur.execute("SELECT active FROM sessions WHERE token=%s", (token,))
+    row = cur.fetchone()
+
+    if not row or not row[0]:
+        return {"status": "revoked"}
+
+    cur.execute("SELECT killswitch FROM settings WHERE id=1")
+    if cur.fetchone()[0]:
+        return {"status": "killswitch"}
+
+    cur.execute("UPDATE sessions SET last_seen=%s WHERE token=%s",
+                (datetime.utcnow(), token))
 
     conn.commit()
-
-    # return status
-    cur.execute("SELECT status FROM keys WHERE key=%s", (key,))
-    status = cur.fetchone()
-
     cur.close()
     conn.close()
 
-    return {"status": status[0] if status else "invalid"}
+    return {"status": "active"}
 
-# ===== KICK (REVOKE) =====
+# ===== KICK =====
 @app.get("/kick")
 def kick(key: str):
     conn = db()
     cur = conn.cursor()
 
+    cur.execute("UPDATE sessions SET active=false WHERE key=%s", (key,))
     cur.execute("UPDATE keys SET status='revoked' WHERE key=%s", (key,))
-    conn.commit()
 
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"ok": True}
+
+# ===== KILLSWITCH =====
+@app.get("/killswitch")
+def ks():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("UPDATE settings SET killswitch = NOT killswitch WHERE id=1")
+
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -124,51 +185,121 @@ def kick(key: str):
 
 # ===== DASHBOARD =====
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
+def dash():
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("""
-    SELECT key, hwid, status, last_seen FROM keys ORDER BY last_seen DESC NULLS LAST
-    """)
+    cur.execute("SELECT key, hwid, status FROM keys")
     rows = cur.fetchall()
+
+    cur.execute("SELECT killswitch FROM settings WHERE id=1")
+    ks = cur.fetchone()[0]
 
     cur.close()
     conn.close()
 
-    html = """
-    <html><body style="background:#0f0f0f;color:white;font-family:sans-serif">
-    <h1>Dashboard</h1>
-    <button onclick="gen()">Generate Key</button>
-    <table border="1" style="width:100%;color:white">
-    <tr><th>Key</th><th>HWID</th><th>Status</th><th>Last Seen</th><th>Action</th></tr>
-    """
+    return f"""
+<html>
+<head>
+<style>
+body {{background:#0b0b0b;color:white;font-family:Segoe UI}}
+.tab {{padding:10px;cursor:pointer;display:inline-block}}
+.active {{background:#222}}
+table {{width:100%;margin-top:10px}}
+td,th {{padding:6px}}
+button {{background:#333;color:white;border:none;padding:6px}}
+textarea {{background:#111;color:white}}
+</style>
+</head>
 
-    for k, hwid, status, last_seen in rows:
-        html += f"""
-        <tr>
-        <td>{k}</td>
-        <td>{hwid}</td>
-        <td>{status}</td>
-        <td>{last_seen}</td>
-        <td><button onclick="kick('{k}')">Kick</button></td>
-        </tr>
-        """
+<body>
 
-    html += """
-    </table>
+<h2>Auth Dashboard</h2>
 
-    <script>
-    function gen() {
-        fetch('/gen').then(r=>r.text()).then(alert)
-    }
+<div>
+<span class="tab active" onclick="show('dash')">Dashboard</span>
+<span class="tab" onclick="show('loader')">Loader</span>
+<span class="tab" onclick="show('settings')">Settings</span>
+</div>
 
-    function kick(k) {
-        fetch('/kick?key='+k).then(()=>location.reload())
-    }
-    </script>
+<div id="dash">
+<button onclick="gen()">Generate Key</button>
+<table border=1>
+<tr><th>Key</th><th>HWID</th><th>Status</th><th>Action</th></tr>
+{''.join(f"<tr><td>{k}</td><td>{h}</td><td>{s}</td><td><button onclick=\\"kick('{k}')\\">Kick</button></td></tr>" for k,h,s in rows)}
+</table>
+</div>
 
-    </body></html>
-    """
+<div id="loader" style="display:none">
+<textarea id="code" style="width:100%;height:250px"></textarea><br>
+<button onclick="copy()">Copy Loader</button>
+</div>
 
-    return html
+<div id="settings" style="display:none">
+<button onclick="toggle()">KillSwitch: {"ON" if ks else "OFF"}</button>
+</div>
+
+<script>
+function show(id){{
+["dash","loader","settings"].forEach(x=>document.getElementById(x).style.display="none")
+document.getElementById(id).style.display="block"
+}}
+
+function gen(){{fetch('/gen').then(r=>r.text()).then(alert)}}
+function kick(k){{fetch('/kick?key='+k).then(()=>location.reload())}}
+function toggle(){{fetch('/killswitch').then(()=>location.reload())}}
+
+document.getElementById("code").value = `
+local key = "PUT_KEY"
+local hwid = (gethwid and gethwid()) or game:GetService("RbxAnalyticsService"):GetClientId()
+local HttpService = game:GetService("HttpService")
+
+local base = location.origin
+
+local res = game:HttpGet(base.."/auth?key="..key.."&hwid="..hwid)
+local data = HttpService:JSONDecode(res)
+
+if not data.success then
+    game.Players.LocalPlayer:Kick(data.reason or "Auth Failed")
+    return
+end
+
+local token = data.token
+
+local function sign(ts)
+    return "" -- replace with your obfuscation later
+end
+
+task.spawn(function()
+    while true do
+        task.wait(5)
+        local ts = os.time()
+        local sig = sign(ts)
+        local url = base.."/heartbeat?token="..token.."&hwid="..hwid.."&ts="..ts.."&sig="..sig
+
+        local ok, res = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        if ok then
+            local d = HttpService:JSONDecode(res)
+            if d.status ~= "active" then
+                game.Players.LocalPlayer:Kick(d.status)
+                break
+            end
+        else
+            game.Players.LocalPlayer:Kick("Connection Lost")
+            break
+        end
+    end
+end)
+`;
+
+function copy(){{
+navigator.clipboard.writeText(document.getElementById("code").value)
+}}
+</script>
+
+</body>
+</html>
+"""

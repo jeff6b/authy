@@ -28,19 +28,23 @@ conn.commit()
 def generate_key(length=20):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# ===== CREATE KEY =====
 @app.get("/gen")
 def gen():
-    key = generate_key()
-    expires = datetime.utcnow() + timedelta(days=7)
+    try:
+        key = generate_key()
+        expires = datetime.utcnow() + timedelta(days=7)
 
-    cur.execute(
-        "INSERT INTO keys (key, expires_at) VALUES (%s, %s)",
-        (key, expires)
-    )
-    conn.commit()
+        cur.execute(
+            "INSERT INTO keys (key, expires_at) VALUES (%s, %s)",
+            (key, expires)
+        )
+        conn.commit()
 
-    return PlainTextResponse(key)
+        return PlainTextResponse(key)
+
+    except Exception as e:
+        print("ERROR:", e)
+        return PlainTextResponse("error", status_code=500)
 
 # ===== AUTH =====
 @app.get("/auth")

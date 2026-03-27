@@ -1,139 +1,101 @@
-package main
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
+import psycopg2
+import os
+import random
+import string
+from datetime import datetime, timedelta
 
-import (
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
-	"math/rand"
-	"net/http"
-	"os"
-	"time"
+app = FastAPI()
 
-	_ "github.com/lib/pq"
+# ===== CONNECT TO DB =====
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+conn = psycopg2.connect(DATABASE_URL)
+cur = conn.cursor()
+
+# ===== CREATE TABLE IF NOT EXISTS =====
+cur.execute("""
+CREATE TABLE IF NOT EXISTS keys (
+    key TEXT PRIMARY KEY,
+    hwid TEXT,
+    expires_at TIMESTAMP
 )
+""")
+conn.commit()
 
-var db *sql.DB
+# ===== GENERATE KEY =====
+def generate_key(length=20):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-// ===== INIT DB =====
-func initDB() {
-	connStr := os.Getenv("DATABASE_URL")
+# ===== CREATE KEY =====
+@app.get("/gen")
+def gen():
+    key = generate_key()
+    expires = datetime.utcnow() + timedelta(days=7)
 
-	var err error
-	db, err = sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatal(err)
-	}
+    cur.execute(
+        "INSERT INTO keys (key, expires_at) VALUES (%s, %s)",
+        (key, expires)
+    )
+    conn.commit()
 
-	err = db.Ping()
-	if err != nil {
-		log.Fatal("DB connection failed:", err)
-	}
+    return PlainTextResponse(key)
 
-	fmt.Println("Connected to DB")
-}
+# ===== AUTH =====
+@app.get("/auth")
+def auth(key: str, hwid: str):
+    cur.execute("SELECT hwid, expires_at FROM keys WHERE key=%s", (key,))
+    result = cur.fetchone()
 
-// ===== GENERATE RANDOM KEY =====
-func generateKey() string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 20)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(b)
-}
+    if not result:
+        return {"success": False}
 
-// ===== CREATE KEY IN DB =====
-func createKey() string {
-	key := generateKey()
+    stored_hwid, expires_at = result
 
-	_, err := db.Exec(
-		"INSERT INTO keys(key, expires_at) VALUES($1, NOW() + INTERVAL '7 days')",
-		key,
-	)
+    # Expired
+    if datetime.utcnow() > expires_at:
+        return {"success": False}
 
-	if err != nil {
-		log.Println("Insert error:", err)
-	}
+    # HWID mismatch
+    if stored_hwid and stored_hwid != hwid:
+        return {"success": False}
 
-	return key
-}
+    # Bind HWID if first time
+    if not stored_hwid:
+        cur.execute("UPDATE keys SET hwid=%s WHERE key=%s", (hwid, key))
+        conn.commit()
 
-// ===== AUTH HANDLER =====
-func authHandler(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Query().Get("key")
-	hwid := r.URL.Query().Get("hwid")
+    return {"success": True}
 
-	var storedHWID sql.NullString
-	var expiresAt time.Time
+# ===== PANEL =====
+@app.get("/", response_class=HTMLResponse)
+def panel():
+    return """
+    <html>
+    <body style="background:#0f0f0f;color:white;text-align:center;font-family:sans-serif">
+        <h1>Key System</h1>
+        <button onclick="gen()">Generate Key</button>
+        <p id="key"></p>
 
-	err := db.QueryRow(
-		"SELECT hwid, expires_at FROM keys WHERE key=$1",
-		key,
-	).Scan(&storedHWID, &expiresAt)
+        <button onclick="copyLoader()">Copy Loader</button>
 
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"success":false}`))
-		return
-	}
+        <script>
+        let currentKey = "";
 
-	// Expiration check
-	if time.Now().After(expiresAt) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"success":false}`))
-		return
-	}
+        function gen() {
+            fetch('/gen')
+            .then(res => res.text())
+            .then(k => {
+                currentKey = k;
+                document.getElementById('key').innerText = k;
+            });
+        }
 
-	// HWID mismatch
-	if storedHWID.Valid && storedHWID.String != hwid {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"success":false}`))
-		return
-	}
+        function copyLoader() {
+            if (!currentKey) return alert("Generate a key first");
 
-	// Bind HWID if empty
-	if !storedHWID.Valid {
-		_, err := db.Exec("UPDATE keys SET hwid=$1 WHERE key=$2", hwid, key)
-		if err != nil {
-			log.Println(err)
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"success":true}`))
-}
-
-// ===== PANEL PAGE =====
-func panelHandler(w http.ResponseWriter, r *http.Request) {
-	html := `
-	<html>
-	<head>
-	<title>Key System</title>
-	</head>
-	<body style="background:#0f0f0f;color:white;font-family:sans-serif;text-align:center">
-		<h1>Key Generator</h1>
-		<button onclick="gen()">Generate Key</button>
-		<p id="key"></p>
-
-		<button onclick="copyLoader()">Copy Loader</button>
-
-		<script>
-		let currentKey = "";
-
-		function gen() {
-			fetch('/gen')
-			.then(res => res.text())
-			.then(k => {
-				currentKey = k;
-				document.getElementById('key').innerText = k;
-			});
-		}
-
-		function copyLoader() {
-			if (!currentKey) return alert("Generate a key first");
-
-			const loader = `
+            const loader = `
 local script_key = "` + currentKey + `"
 local hwid = game:GetService("RbxAnalyticsService"):GetClientId()
 
@@ -148,32 +110,10 @@ if not data.success then
 end
 `
 
-			navigator.clipboard.writeText(loader);
-			alert("Loader copied!");
-		}
-		</script>
-	</body>
-	</html>
-	`
-	fmt.Fprint(w, html)
-}
-
-// ===== GENERATE KEY ENDPOINT =====
-func genHandler(w http.ResponseWriter, r *http.Request) {
-	key := createKey()
-	fmt.Fprint(w, key)
-}
-
-// ===== MAIN =====
-func main() {
-	rand.Seed(time.Now().UnixNano())
-
-	initDB()
-
-	http.HandleFunc("/", panelHandler)
-	http.HandleFunc("/gen", genHandler)
-	http.HandleFunc("/auth", authHandler)
-
-	log.Println("Server running on :10000")
-	http.ListenAndServe(":10000", nil)
-}
+            navigator.clipboard.writeText(loader);
+            alert("Loader copied!");
+        }
+        </script>
+    </body>
+    </html>
+    """

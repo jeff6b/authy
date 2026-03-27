@@ -14,25 +14,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def generate_key(length=20):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# ===== ENSURE TABLE EXISTS =====
-def init_db():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS keys (
-        key TEXT PRIMARY KEY,
-        hwid TEXT,
-        expires_at TIMESTAMP
-    )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-init_db()
-
 # ===== GENERATE KEY =====
 @app.get("/gen")
 def gen():
@@ -43,10 +24,12 @@ def gen():
         key = generate_key()
         expires = datetime.utcnow() + timedelta(days=7)
 
-        cur.execute(
-            "INSERT INTO keys (key, expires_at) VALUES (%s, %s)",
-            (key, expires)
-        )
+        # IMPORTANT: includes script_id + status
+        cur.execute("""
+        INSERT INTO keys (key, script_id, expires_at, status)
+        VALUES (%s, %s, %s, %s)
+        """, (key, 1, expires, "active"))
+
         conn.commit()
 
         cur.close()
@@ -65,13 +48,22 @@ def auth(key: str, hwid: str):
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         cur = conn.cursor()
 
-        cur.execute("SELECT hwid, expires_at FROM keys WHERE key=%s", (key,))
+        cur.execute("""
+        SELECT hwid, expires_at, status
+        FROM keys
+        WHERE key=%s
+        """, (key,))
+
         result = cur.fetchone()
 
         if not result:
             return {"success": False}
 
-        stored_hwid, expires_at = result
+        stored_hwid, expires_at, status = result
+
+        # Status check
+        if status != "active":
+            return {"success": False}
 
         # Expired
         if datetime.utcnow() > expires_at:
@@ -126,7 +118,7 @@ def panel():
             const loader = `
 local script_key = "` + currentKey + `"
 
--- try executor HWID first
+-- executor hwid if available
 local hwid = (gethwid and gethwid()) or game:GetService("RbxAnalyticsService"):GetClientId()
 
 local url = "https://YOUR-RENDER-URL/auth?key=" .. script_key .. "&hwid=" .. hwid

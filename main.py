@@ -70,10 +70,8 @@ def gen():
     key = gen_key()
     exp = datetime.utcnow() + timedelta(days=7)
 
-    cur.execute("""
-    INSERT INTO keys (key, expires_at, status)
-    VALUES (%s, %s, %s)
-    """, (key, exp, "active"))
+    cur.execute("INSERT INTO keys (key, expires_at, status) VALUES (%s, %s, %s)",
+                (key, exp, "active"))
 
     conn.commit()
     cur.close()
@@ -87,7 +85,6 @@ def auth(key: str, hwid: str):
     conn = db()
     cur = conn.cursor()
 
-    # killswitch
     cur.execute("SELECT killswitch FROM settings WHERE id=1")
     if cur.fetchone()[0]:
         return {"success": False, "reason": "killswitch"}
@@ -109,7 +106,6 @@ def auth(key: str, hwid: str):
     if not shwid:
         cur.execute("UPDATE keys SET hwid=%s WHERE key=%s", (hwid, key))
 
-    # create session
     token = secrets.token_hex(16)
 
     cur.execute("""
@@ -198,15 +194,25 @@ def dash():
     cur.close()
     conn.close()
 
+    # ✅ FIXED: build rows separately
+    table_rows = ""
+    for k, h, s in rows:
+        table_rows += f"""
+        <tr>
+            <td>{k}</td>
+            <td>{h}</td>
+            <td>{s}</td>
+            <td><button onclick="kickKey('{k}')">Kick</button></td>
+        </tr>
+        """
+
     return f"""
 <html>
 <head>
 <style>
 body {{background:#0b0b0b;color:white;font-family:Segoe UI}}
 .tab {{padding:10px;cursor:pointer;display:inline-block}}
-.active {{background:#222}}
 table {{width:100%;margin-top:10px}}
-td,th {{padding:6px}}
 button {{background:#333;color:white;border:none;padding:6px}}
 textarea {{background:#111;color:white}}
 </style>
@@ -216,87 +222,27 @@ textarea {{background:#111;color:white}}
 
 <h2>Auth Dashboard</h2>
 
-<div>
-<span class="tab active" onclick="show('dash')">Dashboard</span>
-<span class="tab" onclick="show('loader')">Loader</span>
-<span class="tab" onclick="show('settings')">Settings</span>
-</div>
-
-<div id="dash">
 <button onclick="gen()">Generate Key</button>
+
 <table border=1>
 <tr><th>Key</th><th>HWID</th><th>Status</th><th>Action</th></tr>
-{''.join(f"<tr><td>{k}</td><td>{h}</td><td>{s}</td><td><button onclick=\\"kick('{k}')\\">Kick</button></td></tr>" for k,h,s in rows)}
+{table_rows}
 </table>
-</div>
 
-<div id="loader" style="display:none">
-<textarea id="code" style="width:100%;height:250px"></textarea><br>
-<button onclick="copy()">Copy Loader</button>
-</div>
-
-<div id="settings" style="display:none">
+<br>
 <button onclick="toggle()">KillSwitch: {"ON" if ks else "OFF"}</button>
-</div>
 
 <script>
-function show(id){{
-["dash","loader","settings"].forEach(x=>document.getElementById(x).style.display="none")
-document.getElementById(id).style.display="block"
+function gen() {{
+    fetch('/gen').then(r=>r.text()).then(alert)
 }}
 
-function gen(){{fetch('/gen').then(r=>r.text()).then(alert)}}
-function kick(k){{fetch('/kick?key='+k).then(()=>location.reload())}}
-function toggle(){{fetch('/killswitch').then(()=>location.reload())}}
+function kickKey(k) {{
+    fetch('/kick?key='+k).then(()=>location.reload())
+}}
 
-document.getElementById("code").value = `
-local key = "PUT_KEY"
-local hwid = (gethwid and gethwid()) or game:GetService("RbxAnalyticsService"):GetClientId()
-local HttpService = game:GetService("HttpService")
-
-local base = location.origin
-
-local res = game:HttpGet(base.."/auth?key="..key.."&hwid="..hwid)
-local data = HttpService:JSONDecode(res)
-
-if not data.success then
-    game.Players.LocalPlayer:Kick(data.reason or "Auth Failed")
-    return
-end
-
-local token = data.token
-
-local function sign(ts)
-    return "" -- replace with your obfuscation later
-end
-
-task.spawn(function()
-    while true do
-        task.wait(5)
-        local ts = os.time()
-        local sig = sign(ts)
-        local url = base.."/heartbeat?token="..token.."&hwid="..hwid.."&ts="..ts.."&sig="..sig
-
-        local ok, res = pcall(function()
-            return game:HttpGet(url)
-        end)
-
-        if ok then
-            local d = HttpService:JSONDecode(res)
-            if d.status ~= "active" then
-                game.Players.LocalPlayer:Kick(d.status)
-                break
-            end
-        else
-            game.Players.LocalPlayer:Kick("Connection Lost")
-            break
-        end
-    end
-end)
-`;
-
-function copy(){{
-navigator.clipboard.writeText(document.getElementById("code").value)
+function toggle() {{
+    fetch('/killswitch').then(()=>location.reload())
 }}
 </script>
 

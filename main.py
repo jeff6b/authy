@@ -194,58 +194,169 @@ def dash():
     cur.close()
     conn.close()
 
-    # ✅ FIXED: build rows separately
+    # Build rows separately
     table_rows = ""
     for k, h, s in rows:
+        # Handle None values for HWID
+        hwid_display = h if h else "Not bound"
         table_rows += f"""
         <tr>
             <td>{k}</td>
-            <td>{h}</td>
+            <td>{hwid_display}</td>
             <td>{s}</td>
             <td><button onclick="kickKey('{k}')">Kick</button></td>
         </tr>
         """
 
-    return f"""
+    html_content = f"""
+<!DOCTYPE html>
 <html>
 <head>
-<style>
-body {{background:#0b0b0b;color:white;font-family:Segoe UI}}
-.tab {{padding:10px;cursor:pointer;display:inline-block}}
-table {{width:100%;margin-top:10px}}
-button {{background:#333;color:white;border:none;padding:6px}}
-textarea {{background:#111;color:white}}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auth Dashboard</title>
+    <style>
+        body {{
+            background: #0b0b0b;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        h2 {{
+            color: #4CAF50;
+            margin-bottom: 20px;
+        }}
+        .btn {{
+            background: #333;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 4px;
+            margin: 5px;
+            transition: background 0.3s;
+        }}
+        .btn:hover {{
+            background: #555;
+        }}
+        .btn-danger {{
+            background: #dc3545;
+        }}
+        .btn-danger:hover {{
+            background: #c82333;
+        }}
+        .btn-success {{
+            background: #28a745;
+        }}
+        .btn-success:hover {{
+            background: #218838;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background: #1a1a1a;
+        }}
+        th, td {{
+            border: 1px solid #333;
+            padding: 12px;
+            text-align: left;
+        }}
+        th {{
+            background: #2c2c2c;
+            color: #4CAF50;
+        }}
+        tr:hover {{
+            background: #252525;
+        }}
+        .killswitch {{
+            margin-top: 20px;
+            padding: 15px;
+            background: #1a1a1a;
+            border-radius: 4px;
+        }}
+    </style>
 </head>
-
 <body>
+    <div class="container">
+        <h2>🔐 Authentication Dashboard</h2>
+        
+        <div>
+            <button class="btn btn-success" onclick="generateKey()">✨ Generate New Key</button>
+        </div>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>License Key</th>
+                    <th>HWID</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {table_rows}
+            </tbody>
+        </table>
+        
+        <div class="killswitch">
+            <button class="btn {'btn-danger' if ks else 'btn'}" onclick="toggleKillswitch()">
+                🛡️ KillSwitch: {'🔴 ACTIVE' if ks else '🟢 INACTIVE'}
+            </button>
+        </div>
+    </div>
 
-<h2>Auth Dashboard</h2>
+    <script>
+        async function generateKey() {{
+            try {{
+                const response = await fetch('/gen');
+                const key = await response.text();
+                alert('New license key generated:\\n\\n' + key + '\\n\\nThis key expires in 7 days.');
+                location.reload();
+            }} catch (error) {{
+                alert('Error generating key: ' + error.message);
+            }}
+        }}
 
-<button onclick="gen()">Generate Key</button>
+        async function kickKey(key) {{
+            if (confirm('Are you sure you want to revoke this key? This action cannot be undone.')) {{
+                try {{
+                    const response = await fetch('/kick?key=' + encodeURIComponent(key));
+                    const result = await response.json();
+                    if (result.ok) {{
+                        alert('Key revoked successfully');
+                        location.reload();
+                    }} else {{
+                        alert('Failed to revoke key');
+                    }}
+                }} catch (error) {{
+                    alert('Error revoking key: ' + error.message);
+                }}
+            }}
+        }}
 
-<table border=1>
-<tr><th>Key</th><th>HWID</th><th>Status</th><th>Action</th></tr>
-{table_rows}
-</table>
-
-<br>
-<button onclick="toggle()">KillSwitch: {"ON" if ks else "OFF"}</button>
-
-<script>
-function gen() {{
-    fetch('/gen').then(r=>r.text()).then(alert)
-}}
-
-function kickKey(k) {{
-    fetch('/kick?key='+k).then(()=>location.reload())
-}}
-
-function toggle() {{
-    fetch('/killswitch').then(()=>location.reload())
-}}
-</script>
-
+        async function toggleKillswitch() {{
+            try {{
+                const response = await fetch('/killswitch');
+                const result = await response.json();
+                if (result.ok) {{
+                    alert('KillSwitch toggled successfully');
+                    location.reload();
+                }} else {{
+                    alert('Failed to toggle KillSwitch');
+                }}
+            }} catch (error) {{
+                alert('Error toggling KillSwitch: ' + error.message);
+            }}
+        }}
+    </script>
 </body>
 </html>
-"""
+    """
+
+    return HTMLResponse(content=html_content)

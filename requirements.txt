@@ -1,3 +1,6 @@
 fastapi
-uvicorn
-psycopg2-binary
+uvicorn[standard]
+mss
+pillow
+customtkinter
+requests

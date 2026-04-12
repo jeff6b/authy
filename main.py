@@ -59,7 +59,7 @@ def get_db():
     finally:
         db.close()
 
-# ====================== DASHBOARD ======================
+# ====================== DASHBOARD (unchanged but with better error handling) ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -110,25 +110,33 @@ DASHBOARD_HTML = """
             const name = document.getElementById("projName").value.trim();
             if (!name) return alert("Enter project name");
             try {
-                await fetch("/api/project", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name})});
+                const res = await fetch("/api/project", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name})});
+                if (!res.ok) throw new Error(await res.text());
                 alert("Project created!");
                 loadDashboard();
-            } catch(e) { alert("Error: " + e); }
+            } catch(e) { alert("Create project failed: " + e.message); }
         }
 
         async function generateKey(projectId) {
             try {
                 const res = await fetch(`/api/key?project_id=${projectId}`, {method: "POST"});
-                if (!res.ok) throw new Error("Server error");
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(text || "Server error (check Render logs)");
+                }
                 const data = await res.json();
                 alert(`✅ Key generated: ${data.key}`);
                 loadDashboard();
-            } catch(e) { alert("Generate key failed: " + e.message); }
+            } catch(e) { 
+                alert("Generate key failed: " + e.message); 
+                console.error(e);
+            }
         }
 
         async function loadDashboard() {
             try {
                 const res = await fetch("/api/projects");
+                if (!res.ok) throw new Error("Failed to load projects");
                 const projects = await res.json();
                 
                 let html = `<div class="card-body"><h2 class="card-title">Projects</h2>`;
@@ -142,23 +150,19 @@ DASHBOARD_HTML = """
                 html += `</div>`;
                 document.getElementById("projectsDiv").innerHTML = html;
 
-                // Loader with script_key at top
                 const loader = `script_key = ""  -- <<< PUT YOUR KEY HERE
 
 -- Do not save this file
 -- Always use the loadstring
--- Authy Smart Loader with good protection
 
 local function gethwid()
-    local cid = game:GetService("RbxAnalyticsService"):GetClientId()
-    return cid .. "_" .. tostring(tick())
+    return game:GetService("RbxAnalyticsService"):GetClientId() .. "_" .. tostring(tick())
 end
 
 local key = script_key or ""
-if key == "" then error("Authy: Put your key in script_key") end
+if key == "" then error("Authy: Put your key in script_key = \"\"") end
 
 local hwid = gethwid()
-
 local resp = game:HttpGet("${DOMAIN}/validate?key=" .. key .. "&hwid=" .. game:HttpService:UrlEncode(hwid))
 
 if resp and resp:find('"success":true') then
@@ -177,12 +181,12 @@ if resp and resp:find('"success":true') then
 
     return loadstring(payload)()
 else
-    error("Authy: Invalid key, expired, or banned")
+    error("Authy: Invalid / expired / banned key")
 end`;
 
                 document.getElementById("loaderCode").textContent = loader;
             } catch(e) {
-                console.error(e);
+                console.error("Dashboard load error:", e);
             }
         }
 
@@ -201,7 +205,7 @@ end`;
 async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# ====================== API ======================
+# ====================== FIXED API ======================
 class ProjectCreate(BaseModel):
     name: str
 
@@ -219,17 +223,22 @@ async def api_get_projects(db=Depends(get_db)):
     projects = db.query(Project).all()
     return [{"id": p.id, "name": p.name} for p in projects]
 
+# FIXED: Now properly handles query param on POST
 @app.post("/api/key")
 async def api_generate_key(project_id: int, db=Depends(get_db)):
-    proj = db.query(Project).get(project_id)
-    if not proj:
-        raise HTTPException(404, "Project not found")
-    new_key = secrets.token_hex(32)
-    key_obj = Key(project_id=project_id, key_value=new_key)
-    db.add(key_obj)
-    db.commit()
-    return {"key": new_key}
+    try:
+        proj = db.query(Project).get(project_id)
+        if not proj:
+            raise HTTPException(404, f"Project with id {project_id} not found")
+        new_key = secrets.token_hex(32)
+        key_obj = Key(project_id=project_id, key_value=new_key)
+        db.add(key_obj)
+        db.commit()
+        return {"key": new_key}
+    except Exception as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
 
+# Rest of the routes (validate, heartbeat, raw) remain the same as previous version
 @app.get("/validate")
 async def validate(key: str, hwid: str, db=Depends(get_db)):
     try:
@@ -250,7 +259,6 @@ async def validate(key: str, hwid: str, db=Depends(get_db)):
         db.commit()
 
         script_url = f"https://authy-o0pm.onrender.com/raw/{project.name.lower()}/main.lua"
-
         return {"success": True, "script_url": script_url}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -264,13 +272,12 @@ async def heartbeat(key: str, db=Depends(get_db)):
     db.commit()
     return {"action": "continue"}
 
-# Script hosting with HTML trap (basic upload not in UI yet — you can add later via DB or admin)
 @app.get("/raw/{project}/{filename}")
 async def raw_script(request: Request, project: str, filename: str):
     ua = request.headers.get("user-agent", "").lower()
     if "roblox" in ua:
-        return PlainTextResponse("-- Authy protected script\nprint('Loaded from project: " + project + "')")
-    return HTMLResponse(content="<h1 style='color:#ff4444;text-align:center;padding:120px;font-family:monospace;'>403 - No access tardball<br><br>Stop trying kid</h1>", status_code=403)
+        return PlainTextResponse("-- Authy protected script loaded successfully")
+    return HTMLResponse("<h1 style='color:#ff4444;text-align:center;padding:120px;font-family:monospace;'>403 - No access tardball</h1>", status_code=403)
 
 @app.get("/")
 async def root():

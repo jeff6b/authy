@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Form
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
@@ -29,6 +29,7 @@ class Project(Base):
     created_at = Column(DateTime, default=func.now())
 
     keys = relationship("Key", back_populates="project")
+    scripts = relationship("Script", back_populates="project")
 
 class Key(Base):
     __tablename__ = "keys"
@@ -41,6 +42,14 @@ class Key(Base):
     last_heartbeat = Column(DateTime, nullable=True)
     project = relationship("Project", back_populates="keys")
 
+class Script(Base):
+    __tablename__ = "scripts"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"))
+    name = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    project = relationship("Project", back_populates="scripts")
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -50,7 +59,7 @@ def get_db():
     finally:
         db.close()
 
-# ====================== BEAUTIFUL DASHBOARD ======================
+# ====================== DASHBOARD ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -59,7 +68,6 @@ DASHBOARD_HTML = """
     <title>Authy Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet">
-    <script>tailwind.config = {content: ["*"]}</script>
 </head>
 <body class="bg-base-300 min-h-screen">
     <div class="navbar bg-base-100 shadow-xl">
@@ -72,7 +80,7 @@ DASHBOARD_HTML = """
         <!-- Create Project -->
         <div class="card bg-base-100 shadow-2xl mb-10">
             <div class="card-body">
-                <h2 class="card-title text-2xl">Create New Project</h2>
+                <h2 class="card-title">Create New Project</h2>
                 <div class="flex gap-3">
                     <input id="projName" type="text" placeholder="e.g. SilentAim v2" class="input input-bordered flex-1" />
                     <button onclick="createProject()" class="btn btn-success">Create</button>
@@ -85,12 +93,12 @@ DASHBOARD_HTML = """
             <div id="keysDiv" class="card bg-base-100 shadow-2xl"></div>
         </div>
 
-        <!-- Loader Section -->
+        <!-- Loader -->
         <div class="card bg-base-100 shadow-2xl mt-10">
             <div class="card-body">
-                <h2 class="card-title">🚀 Public Loader (Copy & Give to Users)</h2>
-                <pre id="loaderCode" class="mockup-code bg-base-200 p-6 text-sm overflow-auto max-h-96 whitespace-pre-wrap"></pre>
-                <button onclick="copyLoader()" class="btn btn-primary btn-block mt-6 text-lg">Copy Loader to Clipboard</button>
+                <h2 class="card-title">🚀 Public Loader</h2>
+                <pre id="loaderCode" class="mockup-code bg-base-200 p-6 text-sm overflow-auto max-h-96 whitespace-pre-wrap font-mono"></pre>
+                <button onclick="copyLoader()" class="btn btn-primary btn-block mt-6">Copy Loader</button>
             </div>
         </div>
     </div>
@@ -100,49 +108,55 @@ DASHBOARD_HTML = """
 
         async function createProject() {
             const name = document.getElementById("projName").value.trim();
-            if (!name) return alert("Please enter a project name");
-            await fetch("/api/project", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({name: name})
-            });
-            alert("Project created!");
-            loadDashboard();
+            if (!name) return alert("Enter project name");
+            try {
+                await fetch("/api/project", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name})});
+                alert("Project created!");
+                loadDashboard();
+            } catch(e) { alert("Error: " + e); }
         }
 
         async function generateKey(projectId) {
-            const res = await fetch(`/api/key?project_id=${projectId}`, {method: "POST"});
-            const data = await res.json();
-            alert(`✅ New Key: ${data.key}\n\nSave this key!`);
-            loadDashboard();
+            try {
+                const res = await fetch(`/api/key?project_id=${projectId}`, {method: "POST"});
+                if (!res.ok) throw new Error("Server error");
+                const data = await res.json();
+                alert(`✅ Key generated: ${data.key}`);
+                loadDashboard();
+            } catch(e) { alert("Generate key failed: " + e.message); }
         }
 
         async function loadDashboard() {
-            // Load projects
-            const res = await fetch("/api/projects");
-            const projects = await res.json();
-            
-            let projHTML = `<div class="card-body"><h2 class="card-title">Your Projects</h2>`;
-            projects.forEach(p => {
-                projHTML += `
-                    <div class="flex justify-between items-center p-4 border-b last:border-none">
-                        <span class="font-medium">${p.name}</span>
-                        <button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button>
-                    </div>`;
-            });
-            projHTML += `</div>`;
-            document.getElementById("projectsDiv").innerHTML = projHTML;
+            try {
+                const res = await fetch("/api/projects");
+                const projects = await res.json();
+                
+                let html = `<div class="card-body"><h2 class="card-title">Projects</h2>`;
+                projects.forEach(p => {
+                    html += `
+                        <div class="p-4 border-b flex justify-between items-center">
+                            <span>${p.name}</span>
+                            <button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button>
+                        </div>`;
+                });
+                html += `</div>`;
+                document.getElementById("projectsDiv").innerHTML = html;
 
-            // Smart Loader
-            const loader = `-- Do not save this file
+                // Loader with script_key at top
+                const loader = `script_key = ""  -- <<< PUT YOUR KEY HERE
+
+-- Do not save this file
 -- Always use the loadstring
--- Authy Smart Loader
+-- Authy Smart Loader with good protection
 
 local function gethwid()
-    return game:GetService("RbxAnalyticsService"):GetClientId() .. "_" .. tostring(tick())
+    local cid = game:GetService("RbxAnalyticsService"):GetClientId()
+    return cid .. "_" .. tostring(tick())
 end
 
-local key = script_key or "PUT_YOUR_KEY_HERE"
+local key = script_key or ""
+if key == "" then error("Authy: Put your key in script_key") end
+
 local hwid = gethwid()
 
 local resp = game:HttpGet("${DOMAIN}/validate?key=" .. key .. "&hwid=" .. game:HttpService:UrlEncode(hwid))
@@ -150,7 +164,7 @@ local resp = game:HttpGet("${DOMAIN}/validate?key=" .. key .. "&hwid=" .. game:H
 if resp and resp:find('"success":true') then
     local data = game:HttpService:JSONDecode(resp)
     local scriptUrl = data.script_url
-    
+
     pcall(makefolder, "authy_cache")
     local payload = game:HttpGet(scriptUrl)
     pcall(writefile, "authy_cache/init.lua", payload)
@@ -163,18 +177,20 @@ if resp and resp:find('"success":true') then
 
     return loadstring(payload)()
 else
-    error("Authy: Invalid / expired / banned key")
+    error("Authy: Invalid key, expired, or banned")
 end`;
 
-            document.getElementById("loaderCode").textContent = loader;
+                document.getElementById("loaderCode").textContent = loader;
+            } catch(e) {
+                console.error(e);
+            }
         }
 
         function copyLoader() {
             navigator.clipboard.writeText(document.getElementById("loaderCode").textContent);
-            alert("✅ Loader copied! Paste it as loadstring.");
+            alert("✅ Loader copied! Put your key at the top.");
         }
 
-        // Auto load
         loadDashboard();
     </script>
 </body>
@@ -192,11 +208,11 @@ class ProjectCreate(BaseModel):
 @app.post("/api/project")
 async def api_create_project(data: ProjectCreate, db=Depends(get_db)):
     if db.query(Project).filter(Project.name == data.name).first():
-        raise HTTPException(400, "Project with this name already exists")
+        raise HTTPException(400, "Project already exists")
     proj = Project(name=data.name)
     db.add(proj)
     db.commit()
-    return {"success": True, "id": proj.id}
+    return {"success": True}
 
 @app.get("/api/projects")
 async def api_get_projects(db=Depends(get_db)):
@@ -216,25 +232,28 @@ async def api_generate_key(project_id: int, db=Depends(get_db)):
 
 @app.get("/validate")
 async def validate(key: str, hwid: str, db=Depends(get_db)):
-    key_obj = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
-    if not key_obj:
-        raise HTTPException(401, "Invalid key")
+    try:
+        key_obj = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
+        if not key_obj:
+            raise HTTPException(401, "Invalid key")
 
-    project = db.query(Project).get(key_obj.project_id)
-    if not project or project.killswitch:
-        raise HTTPException(403, "Access denied")
+        project = db.query(Project).get(key_obj.project_id)
+        if not project or project.killswitch:
+            raise HTTPException(403, "Access denied")
 
-    if key_obj.expires_at and key_obj.expires_at < datetime.utcnow():
-        raise HTTPException(403, "Key expired")
+        if key_obj.expires_at and key_obj.expires_at < datetime.utcnow():
+            raise HTTPException(403, "Key expired")
 
-    key_obj.last_heartbeat = datetime.utcnow()
-    if not key_obj.hwid:
-        key_obj.hwid = hwid
-    db.commit()
+        key_obj.last_heartbeat = datetime.utcnow()
+        if not key_obj.hwid:
+            key_obj.hwid = hwid
+        db.commit()
 
-    script_url = f"https://authy-o0pm.onrender.com/raw/{project.name.lower()}/script.lua"
+        script_url = f"https://authy-o0pm.onrender.com/raw/{project.name.lower()}/main.lua"
 
-    return {"success": True, "script_url": script_url, "project": project.name}
+        return {"success": True, "script_url": script_url}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.get("/heartbeat")
 async def heartbeat(key: str, db=Depends(get_db)):
@@ -245,18 +264,14 @@ async def heartbeat(key: str, db=Depends(get_db)):
     db.commit()
     return {"action": "continue"}
 
-# HTML Trap
+# Script hosting with HTML trap (basic upload not in UI yet — you can add later via DB or admin)
 @app.get("/raw/{project}/{filename}")
 async def raw_script(request: Request, project: str, filename: str):
     ua = request.headers.get("user-agent", "").lower()
     if "roblox" in ua:
-        return PlainTextResponse("-- Authy protected script loaded\nprint('Welcome to ' .. script_name or 'the script')")
-    return HTMLResponse("<h1 style='color:#ff4444;text-align:center;padding:120px;font-family:monospace;'>403 - No access tardball<br><br>You shouldn't be here dumbass</h1>", status_code=403)
+        return PlainTextResponse("-- Authy protected script\nprint('Loaded from project: " + project + "')")
+    return HTMLResponse(content="<h1 style='color:#ff4444;text-align:center;padding:120px;font-family:monospace;'>403 - No access tardball<br><br>Stop trying kid</h1>", status_code=403)
 
 @app.get("/")
 async def root():
     return RedirectResponse("/dashboard")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)

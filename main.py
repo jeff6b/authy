@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, Depends, Form
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
@@ -59,7 +59,7 @@ def get_db():
     finally:
         db.close()
 
-# ====================== DASHBOARD (unchanged but with better error handling) ======================
+# ====================== TABBED DASHBOARD ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -75,26 +75,61 @@ DASHBOARD_HTML = """
     </div>
 
     <div class="max-w-6xl mx-auto p-8">
-        <h1 class="text-5xl font-bold text-center mb-10">Authy Control Panel</h1>
+        <h1 class="text-5xl font-bold text-center mb-8">Authy Control Panel</h1>
 
-        <!-- Create Project -->
-        <div class="card bg-base-100 shadow-2xl mb-10">
-            <div class="card-body">
-                <h2 class="card-title">Create New Project</h2>
-                <div class="flex gap-3">
-                    <input id="projName" type="text" placeholder="e.g. SilentAim v2" class="input input-bordered flex-1" />
-                    <button onclick="createProject()" class="btn btn-success">Create</button>
+        <!-- Tabs -->
+        <div class="tabs tabs-boxed justify-center mb-8">
+            <a href="#overview" class="tab tab-active" onclick="switchTab(0)">Overview</a>
+            <a href="#projects" class="tab" onclick="switchTab(1)">Projects & Keys</a>
+            <a href="#hosting" class="tab" onclick="switchTab(2)">Hosting Files</a>
+            <a href="#settings" class="tab" onclick="switchTab(3)">Settings</a>
+        </div>
+
+        <!-- Tab Contents -->
+        <div id="tab0" class="tab-content">
+            <div class="card bg-base-100 shadow-2xl p-8 text-center">
+                <h2 class="text-3xl mb-4">Welcome to Authy</h2>
+                <p class="opacity-70">Create projects, generate keys, upload scripts, and manage your loaders.</p>
+                <button onclick="window.location.reload()" class="btn btn-primary mt-6">Refresh Dashboard</button>
+            </div>
+        </div>
+
+        <div id="tab1" class="tab-content hidden">
+            <!-- Create Project -->
+            <div class="card bg-base-100 shadow-2xl mb-8">
+                <div class="card-body">
+                    <h2 class="card-title">Create New Project</h2>
+                    <div class="flex gap-3">
+                        <input id="projName" type="text" placeholder="e.g. SilentAim v2" class="input input-bordered flex-1" />
+                        <button onclick="createProject()" class="btn btn-success">Create</button>
+                    </div>
+                </div>
+            </div>
+            <div id="projectsDiv" class="card bg-base-100 shadow-2xl"></div>
+        </div>
+
+        <div id="tab2" class="tab-content hidden">
+            <div class="card bg-base-100 shadow-2xl">
+                <div class="card-body">
+                    <h2 class="card-title">Upload Script (Hosting)</h2>
+                    <select id="projectSelect" class="select select-bordered w-full mb-4"></select>
+                    <input id="scriptName" type="text" placeholder="Script name (e.g. main.lua)" class="input input-bordered w-full mb-4" />
+                    <textarea id="scriptContent" placeholder="Paste your Lua script here..." class="textarea textarea-bordered w-full h-64"></textarea>
+                    <button onclick="uploadScript()" class="btn btn-primary mt-4 w-full">Upload Script</button>
                 </div>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-            <div id="projectsDiv" class="card bg-base-100 shadow-2xl"></div>
-            <div id="keysDiv" class="card bg-base-100 shadow-2xl"></div>
+        <div id="tab3" class="tab-content hidden">
+            <div class="card bg-base-100 shadow-2xl p-8">
+                <h2 class="card-title mb-4">Settings</h2>
+                <button onclick="recreateDB()" class="btn btn-error">Reset Database (Dev Only)</button>
+                <p class="text-xs opacity-60 mt-4">This will drop and recreate all tables.</p>
+            </div>
         </div>
 
-        <!-- Loader -->
-        <div class="card bg-base-100 shadow-2xl mt-10">
+        <!-- Loader (always visible) -->
+        <div class="card bg-base-100 shadow-2xl mt-12">
             <div class="card-body">
                 <h2 class="card-title">🚀 Public Loader</h2>
                 <pre id="loaderCode" class="mockup-code bg-base-200 p-6 text-sm overflow-auto max-h-96 whitespace-pre-wrap font-mono"></pre>
@@ -106,6 +141,17 @@ DASHBOARD_HTML = """
     <script>
         const DOMAIN = "https://authy-o0pm.onrender.com";
 
+        function switchTab(n) {
+            document.querySelectorAll('.tab-content').forEach((el, i) => {
+                el.classList.toggle('hidden', i !== n);
+            });
+            document.querySelectorAll('.tab').forEach((el, i) => {
+                el.classList.toggle('tab-active', i === n);
+            });
+            if (n === 1) loadProjects();
+            if (n === 2) loadProjectsForSelect();
+        }
+
         async function createProject() {
             const name = document.getElementById("projName").value.trim();
             if (!name) return alert("Enter project name");
@@ -113,44 +159,71 @@ DASHBOARD_HTML = """
                 const res = await fetch("/api/project", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name})});
                 if (!res.ok) throw new Error(await res.text());
                 alert("Project created!");
-                loadDashboard();
-            } catch(e) { alert("Create project failed: " + e.message); }
+                loadProjects();
+            } catch(e) { alert("Error: " + e.message); }
         }
 
         async function generateKey(projectId) {
             try {
                 const res = await fetch(`/api/key?project_id=${projectId}`, {method: "POST"});
-                if (!res.ok) {
-                    const text = await res.text();
-                    throw new Error(text || "Server error (check Render logs)");
-                }
+                if (!res.ok) throw new Error(await res.text());
                 const data = await res.json();
-                alert(`✅ Key generated: ${data.key}`);
-                loadDashboard();
-            } catch(e) { 
-                alert("Generate key failed: " + e.message); 
-                console.error(e);
-            }
+                alert(`✅ Key: ${data.key}`);
+                loadProjects();
+            } catch(e) { alert("Generate key failed: " + e.message); }
         }
 
-        async function loadDashboard() {
-            try {
-                const res = await fetch("/api/projects");
-                if (!res.ok) throw new Error("Failed to load projects");
-                const projects = await res.json();
-                
-                let html = `<div class="card-body"><h2 class="card-title">Projects</h2>`;
-                projects.forEach(p => {
-                    html += `
-                        <div class="p-4 border-b flex justify-between items-center">
-                            <span>${p.name}</span>
-                            <button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button>
-                        </div>`;
-                });
-                html += `</div>`;
-                document.getElementById("projectsDiv").innerHTML = html;
+        async function loadProjects() {
+            const res = await fetch("/api/projects");
+            const projects = await res.json();
+            let html = `<div class="card-body"><h2 class="card-title">Projects & Keys</h2>`;
+            projects.forEach(p => {
+                html += `<div class="p-4 border-b flex justify-between"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`;
+            });
+            html += `</div>`;
+            document.getElementById("projectsDiv").innerHTML = html;
+        }
 
-                const loader = `script_key = ""  -- <<< PUT YOUR KEY HERE
+        async function loadProjectsForSelect() {
+            const res = await fetch("/api/projects");
+            const projects = await res.json();
+            let html = `<option value="">Select Project</option>`;
+            projects.forEach(p => html += `<option value="${p.id}">${p.name}</option>`);
+            document.getElementById("projectSelect").innerHTML = html;
+        }
+
+        async function uploadScript() {
+            const projectId = document.getElementById("projectSelect").value;
+            const name = document.getElementById("scriptName").value.trim();
+            const content = document.getElementById("scriptContent").value.trim();
+            if (!projectId || !name || !content) return alert("Fill all fields");
+            try {
+                const res = await fetch("/api/script", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({project_id: parseInt(projectId), name, content})
+                });
+                if (!res.ok) throw new Error(await res.text());
+                alert("Script uploaded successfully!");
+            } catch(e) { alert("Upload failed: " + e.message); }
+        }
+
+        async function recreateDB() {
+            if (!confirm("This will DELETE ALL data. Continue?")) return;
+            try {
+                const res = await fetch("/recreate-db");
+                alert(await res.text());
+                window.location.reload();
+            } catch(e) { alert("Reset failed"); }
+        }
+
+        function copyLoader() {
+            navigator.clipboard.writeText(document.getElementById("loaderCode").textContent);
+            alert("✅ Loader copied!");
+        }
+
+        // Load loader code
+        const loader = `script_key = ""  -- <<< PUT YOUR KEY HERE
 
 -- Do not save this file
 -- Always use the loadstring
@@ -160,7 +233,7 @@ local function gethwid()
 end
 
 local key = script_key or ""
-if key == "" then error("Authy: Put your key in script_key = \"\"") end
+if key == "" then error("Authy: script_key is empty") end
 
 local hwid = gethwid()
 local resp = game:HttpGet("${DOMAIN}/validate?key=" .. key .. "&hwid=" .. game:HttpService:UrlEncode(hwid))
@@ -170,6 +243,9 @@ if resp and resp:find('"success":true') then
     local scriptUrl = data.script_url
 
     pcall(makefolder, "authy_cache")
+    local oldFiles = listfiles("authy_cache")
+    for _, f in pairs(oldFiles) do pcall(delfile, f) end
+
     local payload = game:HttpGet(scriptUrl)
     pcall(writefile, "authy_cache/init.lua", payload)
 
@@ -181,21 +257,13 @@ if resp and resp:find('"success":true') then
 
     return loadstring(payload)()
 else
-    error("Authy: Invalid / expired / banned key")
+    error("Authy: Invalid key or server error")
 end`;
 
-                document.getElementById("loaderCode").textContent = loader;
-            } catch(e) {
-                console.error("Dashboard load error:", e);
-            }
-        }
+        document.getElementById("loaderCode").textContent = loader;
 
-        function copyLoader() {
-            navigator.clipboard.writeText(document.getElementById("loaderCode").textContent);
-            alert("✅ Loader copied! Put your key at the top.");
-        }
-
-        loadDashboard();
+        // Default tab
+        switchTab(1);
     </script>
 </body>
 </html>
@@ -205,7 +273,7 @@ end`;
 async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# ====================== FIXED API ======================
+# ====================== API ======================
 class ProjectCreate(BaseModel):
     name: str
 
@@ -223,45 +291,52 @@ async def api_get_projects(db=Depends(get_db)):
     projects = db.query(Project).all()
     return [{"id": p.id, "name": p.name} for p in projects]
 
-# FIXED: Now properly handles query param on POST
 @app.post("/api/key")
 async def api_generate_key(project_id: int, db=Depends(get_db)):
-    try:
-        proj = db.query(Project).get(project_id)
-        if not proj:
-            raise HTTPException(404, f"Project with id {project_id} not found")
-        new_key = secrets.token_hex(32)
-        key_obj = Key(project_id=project_id, key_value=new_key)
-        db.add(key_obj)
-        db.commit()
-        return {"key": new_key}
-    except Exception as e:
-        raise HTTPException(500, f"Database error: {str(e)}")
+    proj = db.query(Project).get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    new_key = secrets.token_hex(32)
+    key_obj = Key(project_id=project_id, key_value=new_key)
+    db.add(key_obj)
+    db.commit()
+    return {"key": new_key}
 
-# Rest of the routes (validate, heartbeat, raw) remain the same as previous version
+class ScriptUpload(BaseModel):
+    project_id: int
+    name: str
+    content: str
+
+@app.post("/api/script")
+async def api_upload_script(data: ScriptUpload, db=Depends(get_db)):
+    proj = db.query(Project).get(data.project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    script = Script(project_id=data.project_id, name=data.name, content=data.content)
+    db.add(script)
+    db.commit()
+    return {"success": True}
+
 @app.get("/validate")
 async def validate(key: str, hwid: str, db=Depends(get_db)):
-    try:
-        key_obj = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
-        if not key_obj:
-            raise HTTPException(401, "Invalid key")
+    key_obj = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
+    if not key_obj:
+        raise HTTPException(401, "Invalid key")
 
-        project = db.query(Project).get(key_obj.project_id)
-        if not project or project.killswitch:
-            raise HTTPException(403, "Access denied")
+    project = db.query(Project).get(key_obj.project_id)
+    if not project or project.killswitch:
+        raise HTTPException(403, "Access denied")
 
-        if key_obj.expires_at and key_obj.expires_at < datetime.utcnow():
-            raise HTTPException(403, "Key expired")
+    if key_obj.expires_at and key_obj.expires_at < datetime.utcnow():
+        raise HTTPException(403, "Key expired")
 
-        key_obj.last_heartbeat = datetime.utcnow()
-        if not key_obj.hwid:
-            key_obj.hwid = hwid
-        db.commit()
+    key_obj.last_heartbeat = datetime.utcnow()
+    if not key_obj.hwid:
+        key_obj.hwid = hwid
+    db.commit()
 
-        script_url = f"https://authy-o0pm.onrender.com/raw/{project.name.lower()}/main.lua"
-        return {"success": True, "script_url": script_url}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    script_url = f"https://authy-o0pm.onrender.com/raw/{project.name.lower()}/main.lua"
+    return {"success": True, "script_url": script_url}
 
 @app.get("/heartbeat")
 async def heartbeat(key: str, db=Depends(get_db)):
@@ -272,12 +347,21 @@ async def heartbeat(key: str, db=Depends(get_db)):
     db.commit()
     return {"action": "continue"}
 
+# HTML Trap for scripts
 @app.get("/raw/{project}/{filename}")
 async def raw_script(request: Request, project: str, filename: str):
     ua = request.headers.get("user-agent", "").lower()
     if "roblox" in ua:
-        return PlainTextResponse("-- Authy protected script loaded successfully")
+        # In production, fetch real script from DB by project name
+        return PlainTextResponse("-- Authy protected script loaded\nprint('Welcome from project: " + project + "')")
     return HTMLResponse("<h1 style='color:#ff4444;text-align:center;padding:120px;font-family:monospace;'>403 - No access tardball</h1>", status_code=403)
+
+# DB Reset (for fixing column issues)
+@app.get("/recreate-db")
+async def recreate_db(db=Depends(get_db)):
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    return "Database reset successfully. All tables recreated."
 
 @app.get("/")
 async def root():

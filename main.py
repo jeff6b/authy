@@ -45,22 +45,16 @@ class Script(Base):
     name = Column(String(200), nullable=False)
     content = Column(Text, nullable=False)
 
-Base.metadata.create_all(bind=engine)
-
-# Auto-fix database columns
-def fix_database():
+# Force recreate tables if columns are missing (safe for dev)
+def reset_and_create_tables():
     try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                ALTER TABLE keys ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id);
-                ALTER TABLE keys ADD COLUMN IF NOT EXISTS key_value VARCHAR(64) UNIQUE;
-            """))
-            conn.commit()
-            print("✅ Database auto-fixed")
-    except:
-        pass
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        print("✅ Tables recreated with correct columns")
+    except Exception as e:
+        print("Table reset failed:", e)
 
-fix_database()
+reset_and_create_tables()
 
 def get_db():
     db = SessionLocal()
@@ -69,7 +63,7 @@ def get_db():
     finally:
         db.close()
 
-# ====================== DASHBOARD ======================
+# ====================== DASHBOARD WITH ERROR PANEL ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -99,7 +93,6 @@ DASHBOARD_HTML = """
     <div class="max-w-5xl mx-auto p-6">
         <h1 class="text-5xl font-bold text-center mb-8">Authy Control Panel</h1>
 
-        <!-- Tabs -->
         <div class="flex justify-center gap-2 mb-10 bg-base-100 p-2 rounded-box shadow">
             <div onclick="switchTab(0)" id="t0" class="tab tab-active">Overview</div>
             <div onclick="switchTab(1)" id="t1" class="tab">Projects & Keys</div>
@@ -108,8 +101,8 @@ DASHBOARD_HTML = """
 
         <!-- Overview -->
         <div id="c0" class="tab-content active card bg-base-100 shadow-xl p-12 text-center">
-            <h2 class="text-4xl">Welcome to Authy</h2>
-            <p class="mt-6 opacity-70">Errors will show in the bottom left panel</p>
+            <h2 class="text-4xl">Authy Dashboard</h2>
+            <p class="mt-6 opacity-70">Check the bottom left error panel for details</p>
         </div>
 
         <!-- Projects & Keys -->
@@ -126,7 +119,7 @@ DASHBOARD_HTML = """
             <div class="card-body">
                 <select id="selProj" class="select select-bordered w-full mb-4"></select>
                 <input id="sname" placeholder="main.lua" class="input input-bordered w-full mb-4">
-                <textarea id="scode" class="textarea textarea-bordered w-full h-64 font-mono" placeholder="Paste your Lua script..."></textarea>
+                <textarea id="scode" class="textarea textarea-bordered w-full h-64 font-mono" placeholder="Paste Lua script..."></textarea>
                 <button onclick="uploadScript()" class="btn btn-primary w-full mt-4">Upload Script</button>
             </div>
         </div>
@@ -141,9 +134,9 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- ERROR PANEL - Bottom Left -->
+    <!-- ERROR PANEL -->
     <div id="errorPanel">
-        <div class="flex justify-between items-center mb-3 border-b border-red-500 pb-2">
+        <div class="flex justify-between mb-3 border-b border-red-500 pb-2">
             <strong class="text-red-400">Error Log</strong>
             <button onclick="copyErrors()" class="btn btn-xs btn-error">Copy All</button>
         </div>
@@ -161,52 +154,40 @@ DASHBOARD_HTML = """
         }
 
         function copyErrors() {
-            if (errors.length === 0) return alert("No errors to copy");
+            if (errors.length === 0) return alert("No errors");
             navigator.clipboard.writeText(errors.join('\\n\\n'));
-            alert("✅ Errors copied to clipboard!");
+            alert("✅ Errors copied!");
         }
 
         function switchTab(n) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.getElementById('c' + n).classList.add('active');
-            document.querySelectorAll('.tab').forEach((el, i) => el.classList.toggle('tab-active', i === n));
+            document.querySelectorAll('.tab').forEach((el,i) => el.classList.toggle('tab-active', i===n));
             if (n === 1) loadProjects();
             if (n === 2) loadSelect();
         }
 
         async function createProj() {
             const name = document.getElementById("pname").value.trim();
-            if (!name) return alert("Enter project name");
+            if (!name) return alert("Enter name");
             try {
-                const res = await fetch("/api/project", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({name})
-                });
+                const res = await fetch("/api/project", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name})});
                 if (res.ok) {
                     alert("Project created!");
                     loadProjects();
-                } else {
-                    logError("Create Project: " + await res.text());
-                }
-            } catch(e) {
-                logError("Create Project failed: " + e);
-            }
+                } else logError("Create Project: " + await res.text());
+            } catch(e) { logError("Create failed: " + e); }
         }
 
         async function generateKey(pid) {
             try {
-                const res = await fetch(`/api/key?project_id=${pid}`, {method: "POST"});
+                const res = await fetch(`/api/key?project_id=${pid}`, {method:"POST"});
                 if (res.ok) {
                     const data = await res.json();
                     alert("✅ Key: " + data.key);
                     loadProjects();
-                } else {
-                    logError("Generate Key: " + await res.text());
-                }
-            } catch(e) {
-                logError("Generate Key error: " + e);
-            }
+                } else logError("Generate Key: " + await res.text());
+            } catch(e) { logError("Generate Key error: " + e); }
         }
 
         async function loadProjects() {
@@ -214,13 +195,9 @@ DASHBOARD_HTML = """
                 const res = await fetch("/api/projects");
                 const ps = await res.json();
                 let html = "";
-                ps.forEach(p => {
-                    html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`;
-                });
-                document.getElementById("projList").innerHTML = html || "<p>No projects yet</p>";
-            } catch(e) {
-                logError("Load Projects: " + e);
-            }
+                ps.forEach(p => html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`);
+                document.getElementById("projList").innerHTML = html || "<p>No projects</p>";
+            } catch(e) { logError("Load Projects: " + e); }
         }
 
         async function loadSelect() {
@@ -230,27 +207,19 @@ DASHBOARD_HTML = """
                 let html = "<option value=''>Select Project</option>";
                 ps.forEach(p => html += `<option value="${p.id}">${p.name}</option>`);
                 document.getElementById("selProj").innerHTML = html;
-            } catch(e) {
-                logError("Load Select: " + e);
-            }
+            } catch(e) { logError("Load Select: " + e); }
         }
 
         async function uploadScript() {
             const pid = document.getElementById("selProj").value;
             const name = document.getElementById("sname").value.trim();
             const content = document.getElementById("scode").value.trim();
-            if (!pid || !name || !content) return alert("Fill all fields");
+            if (!pid || !name || !content) return alert("Fill all");
             try {
-                const res = await fetch("/api/script", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({project_id: parseInt(pid), name, content})
-                });
+                const res = await fetch("/api/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({project_id:parseInt(pid), name, content})});
                 if (res.ok) alert("Script uploaded!");
-                else logError("Upload Script: " + await res.text());
-            } catch(e) {
-                logError("Upload Script failed: " + e);
-            }
+                else logError("Upload: " + await res.text());
+            } catch(e) { logError("Upload failed: " + e); }
         }
 
         function copyLoader() {
@@ -258,14 +227,13 @@ DASHBOARD_HTML = """
             alert("✅ Loader copied!");
         }
 
-        // Loader Code
         document.getElementById("loaderPre").textContent = `script_key = ""  -- <<< PUT YOUR KEY HERE
 
 -- Do not save this file
 -- Always use the loadstring
 
 local key = script_key or ""
-if key == "" then error("Authy: Put your key in script_key") end
+if key == "" then error("Put your key") end
 
 local resp = game:HttpGet("https://authy-o0pm.onrender.com/validate?key=" .. key)
 
@@ -273,10 +241,9 @@ if resp and resp:find('"success"') then
     local data = game:HttpService:JSONDecode(resp)
     return loadstring(game:HttpGet(data.script_url))()
 else
-    error("Authy: Authentication failed")
+    error("Auth failed")
 end`;
 
-        // Start on Projects tab
         switchTab(1);
     </script>
 </body>
@@ -287,7 +254,7 @@ end`;
 async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# API
+# API Routes
 class ProjectCreate(BaseModel):
     name: str
 

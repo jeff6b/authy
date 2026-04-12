@@ -47,28 +47,18 @@ class Script(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# Auto-fix missing columns (safe - won't delete data)
+# Auto-fix database columns
 def fix_database():
     try:
         with engine.connect() as conn:
-            # Fix keys table
             conn.execute(text("""
-                DO $$ 
-                BEGIN 
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                                   WHERE table_name='keys' AND column_name='key_value') THEN
-                        ALTER TABLE keys ADD COLUMN key_value VARCHAR(64) UNIQUE;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                                   WHERE table_name='keys' AND column_name='project_id') THEN
-                        ALTER TABLE keys ADD COLUMN project_id INTEGER REFERENCES projects(id);
-                    END IF;
-                END $$;
+                ALTER TABLE keys ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id);
+                ALTER TABLE keys ADD COLUMN IF NOT EXISTS key_value VARCHAR(64) UNIQUE;
             """))
             conn.commit()
-            print("✅ Database columns fixed automatically")
-    except Exception as e:
-        print("Auto-fix skipped:", e)
+            print("✅ Database auto-fixed")
+    except:
+        pass
 
 fix_database()
 
@@ -79,7 +69,7 @@ def get_db():
     finally:
         db.close()
 
-# ====================== DASHBOARD WITH ERROR PANEL ======================
+# ====================== DASHBOARD ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -96,8 +86,8 @@ DASHBOARD_HTML = """
         #errorPanel {
             position: fixed; bottom: 20px; left: 20px; width: 420px;
             background: #1f2937; border: 2px solid #ef4444; border-radius: 12px;
-            padding: 14px; font-size: 13px; max-height: 45vh; overflow-y: auto;
-            z-index: 10000; box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+            padding: 14px; max-height: 45vh; overflow-y: auto; z-index: 9999;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.6);
         }
     </style>
 </head>
@@ -109,7 +99,8 @@ DASHBOARD_HTML = """
     <div class="max-w-5xl mx-auto p-6">
         <h1 class="text-5xl font-bold text-center mb-8">Authy Control Panel</h1>
 
-        <div class="flex justify-center gap-2 mb-10 bg-base-100 p-2 rounded-box">
+        <!-- Tabs -->
+        <div class="flex justify-center gap-2 mb-10 bg-base-100 p-2 rounded-box shadow">
             <div onclick="switchTab(0)" id="t0" class="tab tab-active">Overview</div>
             <div onclick="switchTab(1)" id="t1" class="tab">Projects & Keys</div>
             <div onclick="switchTab(2)" id="t2" class="tab">Host Script</div>
@@ -117,8 +108,8 @@ DASHBOARD_HTML = """
 
         <!-- Overview -->
         <div id="c0" class="tab-content active card bg-base-100 shadow-xl p-12 text-center">
-            <h2 class="text-4xl">Authy Dashboard</h2>
-            <p class="mt-4 opacity-70">Check the bottom-left error panel for details</p>
+            <h2 class="text-4xl">Welcome to Authy</h2>
+            <p class="mt-6 opacity-70">Errors will show in the bottom left panel</p>
         </div>
 
         <!-- Projects & Keys -->
@@ -135,7 +126,7 @@ DASHBOARD_HTML = """
             <div class="card-body">
                 <select id="selProj" class="select select-bordered w-full mb-4"></select>
                 <input id="sname" placeholder="main.lua" class="input input-bordered w-full mb-4">
-                <textarea id="scode" class="textarea textarea-bordered w-full h-64 font-mono" placeholder="Paste Lua script..."></textarea>
+                <textarea id="scode" class="textarea textarea-bordered w-full h-64 font-mono" placeholder="Paste your Lua script..."></textarea>
                 <button onclick="uploadScript()" class="btn btn-primary w-full mt-4">Upload Script</button>
             </div>
         </div>
@@ -150,10 +141,10 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- ERROR PANEL -->
+    <!-- ERROR PANEL - Bottom Left -->
     <div id="errorPanel">
-        <div class="flex justify-between mb-3 border-b border-red-500 pb-2">
-            <strong class="text-red-400">Live Error Log</strong>
+        <div class="flex justify-between items-center mb-3 border-b border-red-500 pb-2">
+            <strong class="text-red-400">Error Log</strong>
             <button onclick="copyErrors()" class="btn btn-xs btn-error">Copy All</button>
         </div>
         <div id="errorLog" class="font-mono text-xs text-red-300 whitespace-pre-wrap"></div>
@@ -166,64 +157,82 @@ DASHBOARD_HTML = """
             const time = new Date().toLocaleTimeString();
             errors.unshift(`[${time}] ${msg}`);
             if (errors.length > 30) errors.pop();
-            document.getElementById("errorLog").textContent = errors.join('\n\n');
+            document.getElementById("errorLog").textContent = errors.join('\\n\\n');
         }
 
         function copyErrors() {
-            if (errors.length === 0) return alert("No errors logged");
-            navigator.clipboard.writeText(errors.join('\n\n'));
-            alert("✅ All errors copied!");
+            if (errors.length === 0) return alert("No errors to copy");
+            navigator.clipboard.writeText(errors.join('\\n\\n'));
+            alert("✅ Errors copied to clipboard!");
         }
 
         function switchTab(n) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.getElementById('c' + n).classList.add('active');
-            document.querySelectorAll('.tab').forEach((el,i) => el.classList.toggle('tab-active', i===n));
+            document.querySelectorAll('.tab').forEach((el, i) => el.classList.toggle('tab-active', i === n));
             if (n === 1) loadProjects();
             if (n === 2) loadSelect();
         }
 
         async function createProj() {
             const name = document.getElementById("pname").value.trim();
-            if (!name) return alert("Enter name");
+            if (!name) return alert("Enter project name");
             try {
-                const r = await fetch("/api/project", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name})});
-                if (r.ok) { alert("Created!"); loadProjects(); }
-                else logError("Create Project: " + await r.text());
-            } catch(e) { logError("Create failed: " + e); }
+                const res = await fetch("/api/project", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({name})
+                });
+                if (res.ok) {
+                    alert("Project created!");
+                    loadProjects();
+                } else {
+                    logError("Create Project: " + await res.text());
+                }
+            } catch(e) {
+                logError("Create Project failed: " + e);
+            }
         }
 
         async function generateKey(pid) {
             try {
-                const r = await fetch(`/api/key?project_id=${pid}`, {method:"POST"});
-                if (r.ok) {
-                    const d = await r.json();
-                    alert("Key: " + d.key);
+                const res = await fetch(`/api/key?project_id=${pid}`, {method: "POST"});
+                if (res.ok) {
+                    const data = await res.json();
+                    alert("✅ Key: " + data.key);
                     loadProjects();
                 } else {
-                    logError("Generate Key: " + await r.text());
+                    logError("Generate Key: " + await res.text());
                 }
-            } catch(e) { logError("Generate Key error: " + e); }
+            } catch(e) {
+                logError("Generate Key error: " + e);
+            }
         }
 
         async function loadProjects() {
             try {
-                const r = await fetch("/api/projects");
-                const ps = await r.json();
+                const res = await fetch("/api/projects");
+                const ps = await res.json();
                 let html = "";
-                ps.forEach(p => html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`);
-                document.getElementById("projList").innerHTML = html || "<p>No projects</p>";
-            } catch(e) { logError("Load projects: " + e); }
+                ps.forEach(p => {
+                    html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`;
+                });
+                document.getElementById("projList").innerHTML = html || "<p>No projects yet</p>";
+            } catch(e) {
+                logError("Load Projects: " + e);
+            }
         }
 
         async function loadSelect() {
             try {
-                const r = await fetch("/api/projects");
-                const ps = await r.json();
-                let html = "<option value=''>Select project</option>";
+                const res = await fetch("/api/projects");
+                const ps = await res.json();
+                let html = "<option value=''>Select Project</option>";
                 ps.forEach(p => html += `<option value="${p.id}">${p.name}</option>`);
                 document.getElementById("selProj").innerHTML = html;
-            } catch(e) { logError("Load select: " + e); }
+            } catch(e) {
+                logError("Load Select: " + e);
+            }
         }
 
         async function uploadScript() {
@@ -232,24 +241,31 @@ DASHBOARD_HTML = """
             const content = document.getElementById("scode").value.trim();
             if (!pid || !name || !content) return alert("Fill all fields");
             try {
-                const r = await fetch("/api/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({project_id:parseInt(pid), name, content})});
-                if (r.ok) alert("Script uploaded!");
-                else logError("Upload: " + await r.text());
-            } catch(e) { logError("Upload error: " + e); }
+                const res = await fetch("/api/script", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({project_id: parseInt(pid), name, content})
+                });
+                if (res.ok) alert("Script uploaded!");
+                else logError("Upload Script: " + await res.text());
+            } catch(e) {
+                logError("Upload Script failed: " + e);
+            }
         }
 
         function copyLoader() {
             navigator.clipboard.writeText(document.getElementById("loaderPre").textContent);
-            alert("Loader copied!");
+            alert("✅ Loader copied!");
         }
 
-        document.getElementById("loaderPre").textContent = `script_key = ""  -- PUT YOUR KEY HERE
+        // Loader Code
+        document.getElementById("loaderPre").textContent = `script_key = ""  -- <<< PUT YOUR KEY HERE
 
 -- Do not save this file
 -- Always use the loadstring
 
 local key = script_key or ""
-if key == "" then error("Put your key") end
+if key == "" then error("Authy: Put your key in script_key") end
 
 local resp = game:HttpGet("https://authy-o0pm.onrender.com/validate?key=" .. key)
 
@@ -257,9 +273,10 @@ if resp and resp:find('"success"') then
     local data = game:HttpService:JSONDecode(resp)
     return loadstring(game:HttpGet(data.script_url))()
 else
-    error("Auth failed")
+    error("Authy: Authentication failed")
 end`;
 
+        // Start on Projects tab
         switchTab(1);
     </script>
 </body>

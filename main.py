@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 from pydantic import BaseModel
 from datetime import datetime
 import os
@@ -20,7 +20,7 @@ app = FastAPI(title="Authy")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Models
+# ====================== MODELS ======================
 class Project(Base):
     __tablename__ = "projects"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,7 +38,39 @@ class Key(Base):
     banned = Column(Boolean, default=False)
     last_heartbeat = Column(DateTime, nullable=True)
 
+class Script(Base):
+    __tablename__ = "scripts"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"))
+    name = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+
 Base.metadata.create_all(bind=engine)
+
+# Auto-fix missing columns (safe - won't delete data)
+def fix_database():
+    try:
+        with engine.connect() as conn:
+            # Fix keys table
+            conn.execute(text("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name='keys' AND column_name='key_value') THEN
+                        ALTER TABLE keys ADD COLUMN key_value VARCHAR(64) UNIQUE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name='keys' AND column_name='project_id') THEN
+                        ALTER TABLE keys ADD COLUMN project_id INTEGER REFERENCES projects(id);
+                    END IF;
+                END $$;
+            """))
+            conn.commit()
+            print("✅ Database columns fixed automatically")
+    except Exception as e:
+        print("Auto-fix skipped:", e)
+
+fix_database()
 
 def get_db():
     db = SessionLocal()
@@ -62,19 +94,10 @@ DASHBOARD_HTML = """
         .tab { cursor: pointer; padding: 12px 24px; }
         .tab-active { background-color: #4f46e5; color: white; border-radius: 8px; }
         #errorPanel {
-            position: fixed;
-            bottom: 20px;
-            left: 20px;
-            width: 380px;
-            background: #1f2937;
-            border: 1px solid #ef4444;
-            border-radius: 12px;
-            padding: 12px;
-            font-size: 13px;
-            max-height: 40vh;
-            overflow-y: auto;
-            z-index: 9999;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            position: fixed; bottom: 20px; left: 20px; width: 420px;
+            background: #1f2937; border: 2px solid #ef4444; border-radius: 12px;
+            padding: 14px; font-size: 13px; max-height: 45vh; overflow-y: auto;
+            z-index: 10000; box-shadow: 0 10px 40px rgba(0,0,0,0.6);
         }
     </style>
 </head>
@@ -86,8 +109,7 @@ DASHBOARD_HTML = """
     <div class="max-w-5xl mx-auto p-6">
         <h1 class="text-5xl font-bold text-center mb-8">Authy Control Panel</h1>
 
-        <!-- Tabs -->
-        <div class="flex justify-center mb-10 bg-base-100 p-2 rounded-box shadow">
+        <div class="flex justify-center gap-2 mb-10 bg-base-100 p-2 rounded-box">
             <div onclick="switchTab(0)" id="t0" class="tab tab-active">Overview</div>
             <div onclick="switchTab(1)" id="t1" class="tab">Projects & Keys</div>
             <div onclick="switchTab(2)" id="t2" class="tab">Host Script</div>
@@ -95,8 +117,8 @@ DASHBOARD_HTML = """
 
         <!-- Overview -->
         <div id="c0" class="tab-content active card bg-base-100 shadow-xl p-12 text-center">
-            <h2 class="text-4xl">Welcome to Authy</h2>
-            <p class="mt-6 opacity-70">Use the tabs above. Errors will appear in the bottom left panel.</p>
+            <h2 class="text-4xl">Authy Dashboard</h2>
+            <p class="mt-4 opacity-70">Check the bottom-left error panel for details</p>
         </div>
 
         <!-- Projects & Keys -->
@@ -128,14 +150,13 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- ERROR PANEL - Bottom Left -->
+    <!-- ERROR PANEL -->
     <div id="errorPanel">
-        <div class="flex justify-between items-center mb-2 border-b border-red-500 pb-2">
-            <strong class="text-red-400">Error Log</strong>
-            <button onclick="copyErrors()" class="btn btn-xs btn-error">Copy All Errors</button>
+        <div class="flex justify-between mb-3 border-b border-red-500 pb-2">
+            <strong class="text-red-400">Live Error Log</strong>
+            <button onclick="copyErrors()" class="btn btn-xs btn-error">Copy All</button>
         </div>
-        <div id="errorLog" class="text-red-300 font-mono text-xs whitespace-pre-wrap"></div>
-        <div class="text-[10px] text-gray-500 mt-2">Check this panel for detailed errors</div>
+        <div id="errorLog" class="font-mono text-xs text-red-300 whitespace-pre-wrap"></div>
     </div>
 
     <script>
@@ -144,14 +165,14 @@ DASHBOARD_HTML = """
         function logError(msg) {
             const time = new Date().toLocaleTimeString();
             errors.unshift(`[${time}] ${msg}`);
-            if (errors.length > 20) errors.pop();
-            document.getElementById("errorLog").textContent = errors.join("\\n\\n");
+            if (errors.length > 30) errors.pop();
+            document.getElementById("errorLog").textContent = errors.join('\n\n');
         }
 
         function copyErrors() {
-            if (errors.length === 0) return alert("No errors to copy");
-            navigator.clipboard.writeText(errors.join("\\n\\n"));
-            alert("✅ All errors copied to clipboard!");
+            if (errors.length === 0) return alert("No errors logged");
+            navigator.clipboard.writeText(errors.join('\n\n'));
+            alert("✅ All errors copied!");
         }
 
         function switchTab(n) {
@@ -159,70 +180,50 @@ DASHBOARD_HTML = """
             document.getElementById('c' + n).classList.add('active');
             document.querySelectorAll('.tab').forEach((el,i) => el.classList.toggle('tab-active', i===n));
             if (n === 1) loadProjects();
-            if (n === 2) loadProjectsForSelect();
+            if (n === 2) loadSelect();
         }
 
         async function createProj() {
             const name = document.getElementById("pname").value.trim();
-            if (!name) return alert("Enter project name");
+            if (!name) return alert("Enter name");
             try {
-                const res = await fetch("/api/project", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name})});
-                if (res.ok) {
-                    alert("Project created!");
-                    loadProjects();
-                } else {
-                    const err = await res.text();
-                    logError("Create Project: " + err);
-                    alert("Error: " + err);
-                }
-            } catch(e) {
-                logError("Create Project failed: " + e);
-                alert("Request failed");
-            }
+                const r = await fetch("/api/project", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name})});
+                if (r.ok) { alert("Created!"); loadProjects(); }
+                else logError("Create Project: " + await r.text());
+            } catch(e) { logError("Create failed: " + e); }
         }
 
         async function generateKey(pid) {
             try {
-                const res = await fetch(`/api/key?project_id=${pid}`, {method:"POST"});
-                if (res.ok) {
-                    const data = await res.json();
-                    alert(`✅ Key: ${data.key}`);
+                const r = await fetch(`/api/key?project_id=${pid}`, {method:"POST"});
+                if (r.ok) {
+                    const d = await r.json();
+                    alert("Key: " + d.key);
                     loadProjects();
                 } else {
-                    const err = await res.text();
-                    logError("Generate Key: " + err);
-                    alert("Error: " + err);
+                    logError("Generate Key: " + await r.text());
                 }
-            } catch(e) {
-                logError("Generate Key failed: " + e);
-                alert("Request failed");
-            }
+            } catch(e) { logError("Generate Key error: " + e); }
         }
 
         async function loadProjects() {
             try {
-                const res = await fetch("/api/projects");
-                const ps = await res.json();
+                const r = await fetch("/api/projects");
+                const ps = await r.json();
                 let html = "";
-                ps.forEach(p => {
-                    html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`;
-                });
-                document.getElementById("projList").innerHTML = html || "<p class='p-6 text-center opacity-60'>No projects yet</p>";
-            } catch(e) {
-                logError("Load Projects: " + e);
-            }
+                ps.forEach(p => html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`);
+                document.getElementById("projList").innerHTML = html || "<p>No projects</p>";
+            } catch(e) { logError("Load projects: " + e); }
         }
 
-        async function loadProjectsForSelect() {
+        async function loadSelect() {
             try {
-                const res = await fetch("/api/projects");
-                const ps = await res.json();
-                let html = "<option value=''>Select Project</option>";
+                const r = await fetch("/api/projects");
+                const ps = await r.json();
+                let html = "<option value=''>Select project</option>";
                 ps.forEach(p => html += `<option value="${p.id}">${p.name}</option>`);
                 document.getElementById("selProj").innerHTML = html;
-            } catch(e) {
-                logError("Load Select: " + e);
-            }
+            } catch(e) { logError("Load select: " + e); }
         }
 
         async function uploadScript() {
@@ -231,32 +232,24 @@ DASHBOARD_HTML = """
             const content = document.getElementById("scode").value.trim();
             if (!pid || !name || !content) return alert("Fill all fields");
             try {
-                const res = await fetch("/api/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({project_id: parseInt(pid), name, content})});
-                if (res.ok) alert("Script uploaded!");
-                else {
-                    const err = await res.text();
-                    logError("Upload Script: " + err);
-                    alert("Error: " + err);
-                }
-            } catch(e) {
-                logError("Upload Script failed: " + e);
-                alert("Request failed");
-            }
+                const r = await fetch("/api/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({project_id:parseInt(pid), name, content})});
+                if (r.ok) alert("Script uploaded!");
+                else logError("Upload: " + await r.text());
+            } catch(e) { logError("Upload error: " + e); }
         }
 
         function copyLoader() {
             navigator.clipboard.writeText(document.getElementById("loaderPre").textContent);
-            alert("✅ Loader copied!");
+            alert("Loader copied!");
         }
 
-        // Loader
-        document.getElementById("loaderPre").textContent = `script_key = ""  -- <<< PUT YOUR KEY HERE
+        document.getElementById("loaderPre").textContent = `script_key = ""  -- PUT YOUR KEY HERE
 
 -- Do not save this file
 -- Always use the loadstring
 
 local key = script_key or ""
-if key == "" then error("Authy: Put your key in script_key") end
+if key == "" then error("Put your key") end
 
 local resp = game:HttpGet("https://authy-o0pm.onrender.com/validate?key=" .. key)
 
@@ -264,10 +257,9 @@ if resp and resp:find('"success"') then
     local data = game:HttpService:JSONDecode(resp)
     return loadstring(game:HttpGet(data.script_url))()
 else
-    error("Authy: Failed to authenticate")
+    error("Auth failed")
 end`;
 
-        // Start on Projects tab
         switchTab(1);
     </script>
 </body>
@@ -278,7 +270,7 @@ end`;
 async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# API Routes
+# API
 class ProjectCreate(BaseModel):
     name: str
 
@@ -297,17 +289,13 @@ async def get_projects(db=Depends(get_db)):
 
 @app.post("/api/key")
 async def generate_key(project_id: int, db=Depends(get_db)):
-    try:
-        proj = db.query(Project).get(project_id)
-        if not proj:
-            raise HTTPException(404, "Project not found")
-        new_key = secrets.token_hex(32)
-        k = Key(project_id=project_id, key_value=new_key)
-        db.add(k)
-        db.commit()
-        return {"key": new_key}
-    except Exception as e:
-        raise HTTPException(500, f"Database error: {str(e)}")
+    proj = db.query(Project).get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    k = Key(project_id=project_id, key_value=secrets.token_hex(32))
+    db.add(k)
+    db.commit()
+    return {"key": k.key_value}
 
 class ScriptCreate(BaseModel):
     project_id: int
@@ -316,28 +304,23 @@ class ScriptCreate(BaseModel):
 
 @app.post("/api/script")
 async def upload_script(data: ScriptCreate, db=Depends(get_db)):
-    try:
-        if not db.query(Project).get(data.project_id):
-            raise HTTPException(404, "Project not found")
-        s = Script(project_id=data.project_id, name=data.name, content=data.content)
-        db.add(s)
-        db.commit()
-        return {"success": True}
-    except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
+    proj = db.query(Project).get(data.project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    s = Script(project_id=data.project_id, name=data.name, content=data.content)
+    db.add(s)
+    db.commit()
+    return {"success": True}
 
 @app.get("/validate")
 async def validate(key: str, db=Depends(get_db)):
-    try:
-        k = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
-        if not k:
-            raise HTTPException(401, "Invalid key")
-        proj = db.query(Project).get(k.project_id)
-        if not proj:
-            raise HTTPException(403, "Project not found")
-        return {"success": True, "script_url": f"https://authy-o0pm.onrender.com/raw/default/main.lua"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    k = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
+    if not k:
+        raise HTTPException(401, "Invalid key")
+    proj = db.query(Project).get(k.project_id)
+    if not proj:
+        raise HTTPException(403, "Project not found")
+    return {"success": True, "script_url": f"https://authy-o0pm.onrender.com/raw/default/main.lua"}
 
 @app.get("/raw/{project}/{filename}")
 async def raw_script(request: Request, project: str, filename: str):

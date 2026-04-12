@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, Depends, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
@@ -10,7 +10,6 @@ from datetime import datetime
 import os
 import secrets
 
-# ========================= CONFIG =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require")
 
 engine = create_engine(DATABASE_URL)
@@ -19,15 +18,9 @@ Base = declarative_base()
 
 app = FastAPI(title="Authy")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ========================= MODELS =========================
+# ====================== MODELS ======================
 class Project(Base):
     __tablename__ = "projects"
     id = Column(Integer, primary_key=True, index=True)
@@ -36,7 +29,6 @@ class Project(Base):
     created_at = Column(DateTime, default=func.now())
 
     keys = relationship("Key", back_populates="project")
-    scripts = relationship("Script", back_populates="project")
 
 class Key(Base):
     __tablename__ = "keys"
@@ -49,14 +41,6 @@ class Key(Base):
     last_heartbeat = Column(DateTime, nullable=True)
     project = relationship("Project", back_populates="keys")
 
-class Script(Base):
-    __tablename__ = "scripts"
-    id = Column(Integer, primary_key=True, index=True)
-    project_id = Column(Integer, ForeignKey("projects.id"))
-    name = Column(String(200), nullable=False)
-    content = Column(Text, nullable=False)
-    project = relationship("Project", back_populates="scripts")
-
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -66,59 +50,47 @@ def get_db():
     finally:
         db.close()
 
-# ========================= DASHBOARD HTML (Beautiful Frontend) =========================
+# ====================== BEAUTIFUL DASHBOARD ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Authy Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet" type="text/css" />
-    <script>
-        tailwind.config = { content: ["*"], theme: { extend: {} } }
-    </script>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet">
+    <script>tailwind.config = {content: ["*"]}</script>
 </head>
 <body class="bg-base-300 min-h-screen">
     <div class="navbar bg-base-100 shadow-xl">
-        <div class="flex-1">
-            <a href="/" class="btn btn-ghost text-2xl font-bold">🔐 Authy</a>
-        </div>
-        <div class="flex-none">
-            <a href="/dashboard" class="btn btn-primary">Dashboard</a>
-        </div>
+        <div class="flex-1"><a href="/dashboard" class="btn btn-ghost text-3xl font-bold">🔐 Authy</a></div>
     </div>
 
-    <div class="container mx-auto p-6 max-w-7xl">
-        <h1 class="text-4xl font-bold mb-8 text-center">Authy Control Panel</h1>
+    <div class="max-w-6xl mx-auto p-8">
+        <h1 class="text-5xl font-bold text-center mb-10">Authy Control Panel</h1>
 
         <!-- Create Project -->
-        <div class="card bg-base-100 shadow-xl mb-8">
+        <div class="card bg-base-100 shadow-2xl mb-10">
             <div class="card-body">
-                <h2 class="card-title">Create New Project</h2>
-                <div class="form-control">
-                    <input id="projectName" type="text" placeholder="Project Name (e.g. MyCoolScript)" class="input input-bordered w-full" />
-                    <button onclick="createProject()" class="btn btn-success mt-4">Create Project</button>
+                <h2 class="card-title text-2xl">Create New Project</h2>
+                <div class="flex gap-3">
+                    <input id="projName" type="text" placeholder="e.g. SilentAim v2" class="input input-bordered flex-1" />
+                    <button onclick="createProject()" class="btn btn-success">Create</button>
                 </div>
             </div>
         </div>
 
-        <!-- Projects & Keys -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div id="projectsList" class="card bg-base-100 shadow-xl"></div>
-            <div id="keysList" class="card bg-base-100 shadow-xl"></div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div id="projectsDiv" class="card bg-base-100 shadow-2xl"></div>
+            <div id="keysDiv" class="card bg-base-100 shadow-2xl"></div>
         </div>
 
-        <!-- Loader Generator -->
-        <div class="card bg-base-100 shadow-xl mt-8">
+        <!-- Loader Section -->
+        <div class="card bg-base-100 shadow-2xl mt-10">
             <div class="card-body">
-                <h2 class="card-title">🚀 Public Loader</h2>
-                <p class="text-sm opacity-70">Copy this loader and give it to users</p>
-                <div class="mockup-code mt-4">
-                    <pre id="loaderCode" class="text-xs overflow-auto max-h-96 p-4"></pre>
-                </div>
-                <button onclick="copyLoader()" class="btn btn-primary mt-4 w-full">Copy Loader to Clipboard</button>
+                <h2 class="card-title">🚀 Public Loader (Copy & Give to Users)</h2>
+                <pre id="loaderCode" class="mockup-code bg-base-200 p-6 text-sm overflow-auto max-h-96 whitespace-pre-wrap"></pre>
+                <button onclick="copyLoader()" class="btn btn-primary btn-block mt-6 text-lg">Copy Loader to Clipboard</button>
             </div>
         </div>
     </div>
@@ -126,59 +98,83 @@ DASHBOARD_HTML = """
     <script>
         const DOMAIN = "https://authy-o0pm.onrender.com";
 
-        async function loadDashboard() {
-            // In real version fetch from /api/projects and /api/keys
-            // For now we show static + loader
-            document.getElementById("projectsList").innerHTML = `
-                <div class="card-body">
-                    <h2 class="card-title">Projects</h2>
-                    <p class="opacity-60">Create a project above to get started</p>
-                </div>`;
+        async function createProject() {
+            const name = document.getElementById("projName").value.trim();
+            if (!name) return alert("Please enter a project name");
+            await fetch("/api/project", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({name: name})
+            });
+            alert("Project created!");
+            loadDashboard();
+        }
 
-            // Generate loader
+        async function generateKey(projectId) {
+            const res = await fetch(`/api/key?project_id=${projectId}`, {method: "POST"});
+            const data = await res.json();
+            alert(`✅ New Key: ${data.key}\n\nSave this key!`);
+            loadDashboard();
+        }
+
+        async function loadDashboard() {
+            // Load projects
+            const res = await fetch("/api/projects");
+            const projects = await res.json();
+            
+            let projHTML = `<div class="card-body"><h2 class="card-title">Your Projects</h2>`;
+            projects.forEach(p => {
+                projHTML += `
+                    <div class="flex justify-between items-center p-4 border-b last:border-none">
+                        <span class="font-medium">${p.name}</span>
+                        <button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button>
+                    </div>`;
+            });
+            projHTML += `</div>`;
+            document.getElementById("projectsDiv").innerHTML = projHTML;
+
+            // Smart Loader
             const loader = `-- Do not save this file
 -- Always use the loadstring
--- Authy Loader - Protected
+-- Authy Smart Loader
 
 local function gethwid()
-    local clientId = tostring(game:GetService("RbxAnalyticsService"):GetClientId())
-    local extra = syn and syn.request or http_request or request
-    return game:HttpService:JSONEncode({cid = clientId, ts = tick()})
+    return game:GetService("RbxAnalyticsService"):GetClientId() .. "_" .. tostring(tick())
 end
 
 local key = script_key or "PUT_YOUR_KEY_HERE"
 local hwid = gethwid()
 
-local res = game:HttpGet(DOMAIN.."/validate?key="..key.."&hwid="..game:HttpService:UrlEncode(hwid))
+local resp = game:HttpGet("${DOMAIN}/validate?key=" .. key .. "&hwid=" .. game:HttpService:UrlEncode(hwid))
 
-if res and res:find("success") then
-    local scriptUrl = DOMAIN.."/raw/project/script.lua"  -- update per project
-    local payload = game:HttpGet(scriptUrl)
+if resp and resp:find('"success":true') then
+    local data = game:HttpService:JSONDecode(resp)
+    local scriptUrl = data.script_url
     
     pcall(makefolder, "authy_cache")
+    local payload = game:HttpGet(scriptUrl)
     pcall(writefile, "authy_cache/init.lua", payload)
-    
+
     spawn(function()
         while wait(60) do
-            game:HttpGet(DOMAIN.."/heartbeat?key="..key.."&hwid="..game:HttpService:UrlEncode(hwid))
+            game:HttpGet("${DOMAIN}/heartbeat?key=" .. key)
         end
     end)
-    
+
     return loadstring(payload)()
 else
-    error("Authy: Invalid key or banned")
+    error("Authy: Invalid / expired / banned key")
 end`;
 
             document.getElementById("loaderCode").textContent = loader;
         }
 
         function copyLoader() {
-            const code = document.getElementById("loaderCode").textContent;
-            navigator.clipboard.writeText(code);
-            alert("✅ Loader copied! Paste it into your script.");
+            navigator.clipboard.writeText(document.getElementById("loaderCode").textContent);
+            alert("✅ Loader copied! Paste it as loadstring.");
         }
 
-        // Initial load
+        // Auto load
         loadDashboard();
     </script>
 </body>
@@ -186,54 +182,80 @@ end`;
 """
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
+async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# ========================= HTML TRAP =========================
-@app.get("/raw/{project}/{filename}")
-async def raw_script(request: Request, project: str, filename: str):
-    ua = request.headers.get("user-agent", "").lower()
-    if "roblox" in ua or request.headers.get("x-authy-client") == "loader":
-        return PlainTextResponse("-- Authy protected script\n-- Loaded successfully")
-    return HTMLResponse(content="""
-    <!DOCTYPE html>
-    <html><head><title>403</title><style>body{background:#111;color:#f44;font-family:monospace;text-align:center;padding:100px;}</style></head>
-    <body><h1>403 - No access tardball</h1><p>You shouldn't be here dumbass</p></body></html>
-    """, status_code=403)
+# ====================== API ======================
+class ProjectCreate(BaseModel):
+    name: str
 
-# ========================= API =========================
-class ValidateRequest(BaseModel):
-    key: str
-    hwid: str
+@app.post("/api/project")
+async def api_create_project(data: ProjectCreate, db=Depends(get_db)):
+    if db.query(Project).filter(Project.name == data.name).first():
+        raise HTTPException(400, "Project with this name already exists")
+    proj = Project(name=data.name)
+    db.add(proj)
+    db.commit()
+    return {"success": True, "id": proj.id}
 
-@app.post("/validate")
-async def validate(data: ValidateRequest, db=Depends(get_db)):
-    key_obj = db.query(Key).filter(Key.key_value == data.key, Key.banned == False).first()
+@app.get("/api/projects")
+async def api_get_projects(db=Depends(get_db)):
+    projects = db.query(Project).all()
+    return [{"id": p.id, "name": p.name} for p in projects]
+
+@app.post("/api/key")
+async def api_generate_key(project_id: int, db=Depends(get_db)):
+    proj = db.query(Project).get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    new_key = secrets.token_hex(32)
+    key_obj = Key(project_id=project_id, key_value=new_key)
+    db.add(key_obj)
+    db.commit()
+    return {"key": new_key}
+
+@app.get("/validate")
+async def validate(key: str, hwid: str, db=Depends(get_db)):
+    key_obj = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
     if not key_obj:
         raise HTTPException(401, "Invalid key")
+
+    project = db.query(Project).get(key_obj.project_id)
+    if not project or project.killswitch:
+        raise HTTPException(403, "Access denied")
 
     if key_obj.expires_at and key_obj.expires_at < datetime.utcnow():
         raise HTTPException(403, "Key expired")
 
     key_obj.last_heartbeat = datetime.utcnow()
     if not key_obj.hwid:
-        key_obj.hwid = data.hwid
+        key_obj.hwid = hwid
     db.commit()
 
-    return {"success": True, "message": "Authenticated"}
+    script_url = f"https://authy-o0pm.onrender.com/raw/{project.name.lower()}/script.lua"
 
-@app.post("/heartbeat")
-async def heartbeat(data: ValidateRequest, db=Depends(get_db)):
-    key_obj = db.query(Key).filter(Key.key_value == data.key).first()
-    if not key_obj or key_obj.banned:
+    return {"success": True, "script_url": script_url, "project": project.name}
+
+@app.get("/heartbeat")
+async def heartbeat(key: str, db=Depends(get_db)):
+    key_obj = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
+    if not key_obj:
         return {"action": "kick"}
     key_obj.last_heartbeat = datetime.utcnow()
     db.commit()
     return {"action": "continue"}
 
+# HTML Trap
+@app.get("/raw/{project}/{filename}")
+async def raw_script(request: Request, project: str, filename: str):
+    ua = request.headers.get("user-agent", "").lower()
+    if "roblox" in ua:
+        return PlainTextResponse("-- Authy protected script loaded\nprint('Welcome to ' .. script_name or 'the script')")
+    return HTMLResponse("<h1 style='color:#ff4444;text-align:center;padding:120px;font-family:monospace;'>403 - No access tardball<br><br>You shouldn't be here dumbass</h1>", status_code=403)
+
 @app.get("/")
 async def root():
-    return {"message": "Authy Backend Running - Visit /dashboard"}
+    return RedirectResponse("/dashboard")
 
 if __name__ == "__main__":
     import uvicorn

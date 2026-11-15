@@ -3,8 +3,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.sql import func
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import secrets
 
@@ -19,8 +18,6 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 app = FastAPI()
-
-ONLINE_WINDOW = 15  # seconds since last heartbeat = online
 
 class Key(Base):
     __tablename__ = "keys"
@@ -71,7 +68,7 @@ DASHBOARD = """
       <h1 class="text-3xl font-bold tracking-tight">Keys</h1>
       <p class="text-sm opacity-50 mt-1">Right-click a key for actions.</p>
     </div>
-    <button onclick="generate()" id="genBtn" class="btn btn-primary btn-sm">Generate Key</button>
+    <button id="genBtn" class="btn btn-primary btn-sm">Generate Key</button>
   </div>
 
   <div id="list" class="space-y-2"></div>
@@ -93,50 +90,57 @@ async function load() {
   const now = Date.now();
   list.innerHTML = currentKeys.map(k => {
     const online = k.last_seen && (now - new Date(k.last_seen).getTime()) < 15000;
-    return `
-    <div class="key-row flex items-center gap-3 bg-base-100 rounded-lg px-4 py-3"
-         oncontextmenu="showCtx(event, ${k.id}, ${online})">
-      <span class="w-2 h-2 rounded-full ${online ? 'dot-on' : 'dot-off'}"></span>
-      <code class="flex-1 text-sm font-mono truncate">${k.key_value}</code>
-      <span class="text-xs opacity-40">${online ? 'online' : 'offline'}</span>
-    </div>`;
+    const cls = online ? "dot-on" : "dot-off";
+    const label = online ? "online" : "offline";
+    return '<div class="key-row flex items-center gap-3 bg-base-100 rounded-lg px-4 py-3" data-id="' + k.id + '" data-online="' + online + '">' +
+      '<span class="w-2 h-2 rounded-full ' + cls + '"></span>' +
+      '<code class="flex-1 text-sm font-mono truncate">' + k.key_value + '</code>' +
+      '<span class="text-xs opacity-40">' + label + '</span>' +
+    '</div>';
   }).join('');
 }
 
 function showCtx(e, id, online) {
   e.preventDefault();
   const ctx = document.getElementById("ctx");
-  ctx.innerHTML = `
-    <button onclick="copyKey(${id})">Copy key</button>
-    <button onclick="deleteKey(${id})">Delete key</button>
-    <button class="danger" onclick="kickKey(${id})" ${online ? '' : 'disabled style="opacity:0.4"}>Kick from game</button>
-  `;
+  ctx.innerHTML =
+    '<button data-act="copy" data-id="' + id + '">Copy key</button>' +
+    '<button data-act="delete" data-id="' + id + '">Delete key</button>' +
+    '<button class="danger" data-act="kick" data-id="' + id + '"' + (online ? '' : ' disabled style="opacity:0.4"') + '>Kick from game</button>';
   ctx.style.left = e.pageX + "px";
   ctx.style.top = e.pageY + "px";
   ctx.classList.remove("hidden");
 }
 
+document.getElementById("list").addEventListener("contextmenu", (e) => {
+  const row = e.target.closest(".key-row");
+  if (!row) return;
+  showCtx(e, parseInt(row.dataset.id), row.dataset.online === "true");
+});
+
+document.getElementById("ctx").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn || btn.disabled) return;
+  const id = parseInt(btn.dataset.id);
+  const act = btn.dataset.act;
+  document.getElementById("ctx").classList.add("hidden");
+  if (act === "copy") {
+    const k = currentKeys.find(x => x.id === id);
+    if (k) await navigator.clipboard.writeText(k.key_value);
+  } else if (act === "delete") {
+    if (!confirm("Delete this key?")) return;
+    await fetch("/api/keys/" + id, {method: "DELETE"});
+    load();
+  } else if (act === "kick") {
+    if (!confirm("Kick this user from the game?")) return;
+    await fetch("/api/keys/" + id + "/kick", {method: "POST"});
+    load();
+  }
+});
+
 document.addEventListener("click", () => document.getElementById("ctx").classList.add("hidden"));
 
-function findKey(id) { return currentKeys.find(k => k.id === id); }
-
-async function copyKey(id) {
-  await navigator.clipboard.writeText(findKey(id).key_value);
-}
-
-async function deleteKey(id) {
-  if (!confirm("Delete this key?")) return;
-  await fetch("/api/keys/" + id, {method: "DELETE"});
-  load();
-}
-
-async function kickKey(id) {
-  if (!confirm("Kick this user from the game?")) return;
-  await fetch("/api/keys/" + id + "/kick", {method: "POST"});
-  load();
-}
-
-async function generate() {
+document.getElementById("genBtn").addEventListener("click", async () => {
   const btn = document.getElementById("genBtn");
   btn.disabled = true;
   btn.textContent = "Generating...";
@@ -144,10 +148,10 @@ async function generate() {
   btn.disabled = false;
   btn.textContent = "Generate Key";
   load();
-}
+});
 
 load();
-setInterval(load, 3000);  // refresh every 3s
+setInterval(load, 3000);
 </script>
 </body>
 </html>

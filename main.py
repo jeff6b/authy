@@ -3,8 +3,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.sql import func, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import func
 from pydantic import BaseModel
 from datetime import datetime
 import os
@@ -12,7 +12,7 @@ import secrets
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require")
 
-engine = create_engine(DATABASE_URL, echo=False)
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -45,16 +45,8 @@ class Script(Base):
     name = Column(String(200), nullable=False)
     content = Column(Text, nullable=False)
 
-# Force recreate tables if columns are missing (safe for dev)
-def reset_and_create_tables():
-    try:
-        Base.metadata.drop_all(bind=engine)
-        Base.metadata.create_all(bind=engine)
-        print("✅ Tables recreated with correct columns")
-    except Exception as e:
-        print("Table reset failed:", e)
-
-reset_and_create_tables()
+# Create tables only if they don't exist. Never drop.
+Base.metadata.create_all(bind=engine)
 
 def get_db():
     db = SessionLocal()
@@ -63,102 +55,91 @@ def get_db():
     finally:
         db.close()
 
-# ====================== DASHBOARD WITH ERROR PANEL ======================
+# ====================== DASHBOARD ======================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
-    <title>Authy Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authy</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet">
     <style>
         .tab-content { display: none; }
         .tab-content.active { display: block; }
-        .tab { cursor: pointer; padding: 12px 24px; }
-        .tab-active { background-color: #4f46e5; color: white; border-radius: 8px; }
-        #errorPanel {
-            position: fixed; bottom: 20px; left: 20px; width: 420px;
-            background: #1f2937; border: 2px solid #ef4444; border-radius: 12px;
-            padding: 14px; max-height: 45vh; overflow-y: auto; z-index: 9999;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.6);
-        }
+        .tab { cursor: pointer; padding: 10px 20px; border-radius: 8px; font-weight: 500; }
+        .tab-active { background-color: #4f46e5; color: white; }
     </style>
 </head>
 <body class="bg-base-300 min-h-screen">
-    <div class="navbar bg-base-100 shadow-xl">
-        <div class="flex-1"><a href="/dashboard" class="btn btn-ghost text-3xl font-bold">🔐 Authy</a></div>
+    <div class="navbar bg-base-100 shadow-lg border-b border-base-content/10">
+        <div class="flex-1 px-4">
+            <a href="/dashboard" class="text-2xl font-bold tracking-tight">Authy</a>
+        </div>
+        <div class="flex-none px-4">
+            <span class="text-xs opacity-50">v1.0</span>
+        </div>
     </div>
 
-    <div class="max-w-5xl mx-auto p-6">
-        <h1 class="text-5xl font-bold text-center mb-8">Authy Control Panel</h1>
-
-        <div class="flex justify-center gap-2 mb-10 bg-base-100 p-2 rounded-box shadow">
+    <div class="max-w-4xl mx-auto p-6">
+        <div class="flex gap-1 mb-8 bg-base-100 p-1.5 rounded-xl shadow-sm w-fit mx-auto">
             <div onclick="switchTab(0)" id="t0" class="tab tab-active">Overview</div>
-            <div onclick="switchTab(1)" id="t1" class="tab">Projects & Keys</div>
-            <div onclick="switchTab(2)" id="t2" class="tab">Host Script</div>
+            <div onclick="switchTab(1)" id="t1" class="tab">Projects</div>
+            <div onclick="switchTab(2)" id="t2" class="tab">Scripts</div>
         </div>
 
         <!-- Overview -->
-        <div id="c0" class="tab-content active card bg-base-100 shadow-xl p-12 text-center">
-            <h2 class="text-4xl">Authy Dashboard</h2>
-            <p class="mt-6 opacity-70">Check the bottom left error panel for details</p>
-        </div>
-
-        <!-- Projects & Keys -->
-        <div id="c1" class="tab-content card bg-base-100 shadow-xl">
-            <div class="card-body">
-                <input id="pname" placeholder="Project name" class="input input-bordered w-full mb-4">
-                <button onclick="createProj()" class="btn btn-success w-full">Create Project</button>
+        <div id="c0" class="tab-content active">
+            <div class="card bg-base-100 shadow-sm">
+                <div class="card-body items-center text-center py-16">
+                    <h2 class="text-3xl font-semibold">Welcome to Authy</h2>
+                    <p class="opacity-60 mt-2 max-w-md">Manage projects, generate keys, and host scripts. All in one place.</p>
+                    <button onclick="switchTab(1)" class="btn btn-primary mt-6">Get Started</button>
+                </div>
             </div>
-            <div id="projList" class="p-6"></div>
         </div>
 
-        <!-- Host Script -->
-        <div id="c2" class="tab-content card bg-base-100 shadow-xl">
-            <div class="card-body">
-                <select id="selProj" class="select select-bordered w-full mb-4"></select>
-                <input id="sname" placeholder="main.lua" class="input input-bordered w-full mb-4">
-                <textarea id="scode" class="textarea textarea-bordered w-full h-64 font-mono" placeholder="Paste Lua script..."></textarea>
-                <button onclick="uploadScript()" class="btn btn-primary w-full mt-4">Upload Script</button>
+        <!-- Projects -->
+        <div id="c1" class="tab-content">
+            <div class="card bg-base-100 shadow-sm mb-6">
+                <div class="card-body">
+                    <h2 class="card-title text-lg">Create Project</h2>
+                    <div class="flex gap-3 mt-2">
+                        <input id="pname" placeholder="Project name" class="input input-bordered flex-1">
+                        <button onclick="createProj()" class="btn btn-primary">Create</button>
+                    </div>
+                </div>
+            </div>
+            <div id="projList"></div>
+        </div>
+
+        <!-- Scripts -->
+        <div id="c2" class="tab-content">
+            <div class="card bg-base-100 shadow-sm">
+                <div class="card-body">
+                    <h2 class="card-title text-lg">Upload Script</h2>
+                    <select id="selProj" class="select select-bordered w-full mt-2 mb-3"></select>
+                    <input id="sname" placeholder="main.lua" class="input input-bordered w-full mb-3">
+                    <textarea id="scode" class="textarea textarea-bordered w-full h-64 font-mono text-sm" placeholder="Paste your Lua script here..."></textarea>
+                    <button onclick="uploadScript()" class="btn btn-primary w-full mt-3">Upload</button>
+                </div>
             </div>
         </div>
 
         <!-- Loader -->
-        <div class="card bg-base-100 shadow-xl mt-12">
+        <div class="card bg-base-100 shadow-sm mt-8">
             <div class="card-body">
-                <h2 class="card-title">Public Loader</h2>
-                <pre id="loaderPre" class="mockup-code bg-base-200 p-6 text-xs overflow-auto max-h-96"></pre>
-                <button onclick="copyLoader()" class="btn btn-primary w-full mt-4">Copy Loader</button>
+                <div class="flex justify-between items-center">
+                    <h2 class="card-title text-lg">Loader Script</h2>
+                    <button onclick="copyLoader()" class="btn btn-sm btn-ghost">Copy</button>
+                </div>
+                <pre id="loaderPre" class="bg-base-200 p-4 rounded-lg text-xs overflow-auto max-h-72 font-mono mt-2"></pre>
             </div>
         </div>
     </div>
 
-    <!-- ERROR PANEL -->
-    <div id="errorPanel">
-        <div class="flex justify-between mb-3 border-b border-red-500 pb-2">
-            <strong class="text-red-400">Error Log</strong>
-            <button onclick="copyErrors()" class="btn btn-xs btn-error">Copy All</button>
-        </div>
-        <div id="errorLog" class="font-mono text-xs text-red-300 whitespace-pre-wrap"></div>
-    </div>
-
     <script>
-        let errors = [];
-
-        function logError(msg) {
-            const time = new Date().toLocaleTimeString();
-            errors.unshift(`[${time}] ${msg}`);
-            if (errors.length > 30) errors.pop();
-            document.getElementById("errorLog").textContent = errors.join('\\n\\n');
-        }
-
-        function copyErrors() {
-            if (errors.length === 0) return alert("No errors");
-            navigator.clipboard.writeText(errors.join('\\n\\n'));
-            alert("✅ Errors copied!");
-        }
-
         function switchTab(n) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.getElementById('c' + n).classList.add('active');
@@ -169,82 +150,96 @@ DASHBOARD_HTML = """
 
         async function createProj() {
             const name = document.getElementById("pname").value.trim();
-            if (!name) return alert("Enter name");
-            try {
-                const res = await fetch("/api/project", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name})});
-                if (res.ok) {
-                    alert("Project created!");
-                    loadProjects();
-                } else logError("Create Project: " + await res.text());
-            } catch(e) { logError("Create failed: " + e); }
+            if (!name) return alert("Enter a project name");
+            const res = await fetch("/api/project", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({name})
+            });
+            if (res.ok) {
+                document.getElementById("pname").value = "";
+                loadProjects();
+            } else {
+                alert("Error: " + await res.text());
+            }
         }
 
         async function generateKey(pid) {
-            try {
-                const res = await fetch(`/api/key?project_id=${pid}`, {method:"POST"});
-                if (res.ok) {
-                    const data = await res.json();
-                    alert("✅ Key: " + data.key);
-                    loadProjects();
-                } else logError("Generate Key: " + await res.text());
-            } catch(e) { logError("Generate Key error: " + e); }
+            const res = await fetch(`/api/key?project_id=${pid}`, {method: "POST"});
+            if (res.ok) {
+                const data = await res.json();
+                await navigator.clipboard.writeText(data.key);
+                alert("Key generated and copied:\\n" + data.key);
+                loadProjects();
+            } else {
+                alert("Error: " + await res.text());
+            }
         }
 
         async function loadProjects() {
-            try {
-                const res = await fetch("/api/projects");
-                const ps = await res.json();
-                let html = "";
-                ps.forEach(p => html += `<div class="flex justify-between p-4 border-b"><span>${p.name}</span><button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button></div>`);
-                document.getElementById("projList").innerHTML = html || "<p>No projects</p>";
-            } catch(e) { logError("Load Projects: " + e); }
+            const res = await fetch("/api/projects");
+            const ps = await res.json();
+            let html = "";
+            if (ps.length === 0) {
+                html = '<div class="card bg-base-100 shadow-sm"><div class="card-body text-center opacity-60 py-8">No projects yet</div></div>';
+            } else {
+                ps.forEach(p => {
+                    html += `
+                    <div class="card bg-base-100 shadow-sm mb-3">
+                        <div class="card-body py-4 flex-row items-center justify-between">
+                            <div>
+                                <div class="font-semibold">${p.name}</div>
+                                <div class="text-xs opacity-50">ID: ${p.id}</div>
+                            </div>
+                            <button onclick="generateKey(${p.id})" class="btn btn-sm btn-primary">Generate Key</button>
+                        </div>
+                    </div>`;
+                });
+            }
+            document.getElementById("projList").innerHTML = html;
         }
 
         async function loadSelect() {
-            try {
-                const res = await fetch("/api/projects");
-                const ps = await res.json();
-                let html = "<option value=''>Select Project</option>";
-                ps.forEach(p => html += `<option value="${p.id}">${p.name}</option>`);
-                document.getElementById("selProj").innerHTML = html;
-            } catch(e) { logError("Load Select: " + e); }
+            const res = await fetch("/api/projects");
+            const ps = await res.json();
+            let html = "<option value=''>Select a project</option>";
+            ps.forEach(p => html += `<option value="${p.id}">${p.name}</option>`);
+            document.getElementById("selProj").innerHTML = html;
         }
 
         async function uploadScript() {
             const pid = document.getElementById("selProj").value;
             const name = document.getElementById("sname").value.trim();
             const content = document.getElementById("scode").value.trim();
-            if (!pid || !name || !content) return alert("Fill all");
-            try {
-                const res = await fetch("/api/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({project_id:parseInt(pid), name, content})});
-                if (res.ok) alert("Script uploaded!");
-                else logError("Upload: " + await res.text());
-            } catch(e) { logError("Upload failed: " + e); }
+            if (!pid || !name || !content) return alert("Fill in all fields");
+            const res = await fetch("/api/script", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({project_id: parseInt(pid), name, content})
+            });
+            if (res.ok) {
+                alert("Script uploaded");
+                document.getElementById("scode").value = "";
+            } else {
+                alert("Error: " + await res.text());
+            }
         }
 
         function copyLoader() {
             navigator.clipboard.writeText(document.getElementById("loaderPre").textContent);
-            alert("✅ Loader copied!");
+            alert("Copied");
         }
 
-        document.getElementById("loaderPre").textContent = `script_key = ""  -- <<< PUT YOUR KEY HERE
-
--- Do not save this file
--- Always use the loadstring
-
-local key = script_key or ""
-if key == "" then error("Put your key") end
+        document.getElementById("loaderPre").textContent =
+`local key = "PUT_YOUR_KEY_HERE"
 
 local resp = game:HttpGet("https://authy-o0pm.onrender.com/validate?key=" .. key)
-
-if resp and resp:find('"success"') then
-    local data = game:HttpService:JSONDecode(resp)
-    return loadstring(game:HttpGet(data.script_url))()
-else
+if not resp or resp:find("Invalid") or resp:find("expired") then
     error("Auth failed")
-end`;
+end
+loadstring(resp)()`;
 
-        switchTab(1);
+        switchTab(0);
     </script>
 </body>
 </html>
@@ -254,7 +249,7 @@ end`;
 async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# API Routes
+# ====================== API ======================
 class ProjectCreate(BaseModel):
     name: str
 
@@ -301,16 +296,21 @@ async def validate(key: str, db=Depends(get_db)):
     k = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()
     if not k:
         raise HTTPException(401, "Invalid key")
-    proj = db.query(Project).get(k.project_id)
-    if not proj:
-        raise HTTPException(403, "Project not found")
-    return {"success": True, "script_url": f"https://authy-o0pm.onrender.com/raw/default/main.lua"}
+    if k.expires_at and k.expires_at < datetime.utcnow():
+        raise HTTPException(401, "Key expired")
 
-@app.get("/raw/{project}/{filename}")
-async def raw_script(request: Request, project: str, filename: str):
-    if "roblox" in request.headers.get("user-agent", "").lower():
-        return PlainTextResponse("-- Authy protected script loaded")
-    return HTMLResponse("<h1>403 - No access tardball</h1>", status_code=403)
+    proj = db.query(Project).get(k.project_id)
+    if not proj or proj.killswitch:
+        raise HTTPException(403, "Project disabled")
+
+    script = db.query(Script).filter(Script.project_id == k.project_id).first()
+    if not script:
+        raise HTTPException(404, "No script uploaded for this project")
+
+    k.last_heartbeat = datetime.utcnow()
+    db.commit()
+
+    return PlainTextResponse(script.content)
 
 @app.get("/")
 async def root():

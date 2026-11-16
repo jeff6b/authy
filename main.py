@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse, HTMLResponse, Response
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey, text
+from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+from pyrate_limiter import Duration, Limiter, Rate
 import os
 import secrets
 import hashlib
@@ -16,10 +19,10 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-ONLINE_SECONDS = 6
-CHALLENGE_TTL = 60          # seconds
-SESSION_TTL = 3600          # seconds
-HEARTBEAT_GRACE = 90        # seconds
+CHALLENGE_TTL = 60
+SESSION_TTL = 3600
+MAX_FAILURES = 10
+FAILURE_WINDOW_MINUTES = 10
 
 # ==================== MODELS ====================
 class Server(Base):
@@ -41,8 +44,8 @@ class License(Base):
     id = Column(Integer, primary_key=True)
     server_id = Column(Integer, nullable=True)
     key_hash = Column(String(64), unique=True, nullable=False)
-    key_plain = Column(String(64), nullable=True)       # kept for /lookup display, remove if you want hash-only
-    status = Column(String(20), default="active")       # active | banned
+    key_plain = Column(String(64), nullable=True)
+    status = Column(String(20), default="active")
     expires_at = Column(DateTime, nullable=True)
     max_devices = Column(Integer, default=1)
     redeemed_by = Column(BigInteger, nullable=True)
@@ -121,16 +124,27 @@ def log_auth(db, license_id, ip, event, success, reason=None):
                    success=success, failure_reason=reason))
     db.commit()
 
-# ==================== FASTAPI ====================
+def recent_failures(db, license_id, minutes):
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    return db.query(AuthLog).filter(
+        AuthLog.license_id == license_id,
+        AuthLog.success == False,
+        AuthLog.created_at >= cutoff,
+    ).count()
+
+# ==================== APP ====================
 app = FastAPI()
 
-BLOCK_PAGE = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Not permitted</title>
+BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not permitted</title>
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
 </head><body><span>Not permitted mijo</span></body></html>"""
 
-# ---- v2 auth flow ----
-@app.post("/v2/auth/init")
+@app.on_event("startup")
+async def startup():
+    await FastAPILimiter.init(engine)
+
+# ---- v2 auth flow with rate limiting ----
+@app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(5, Duration.MINUTE))))])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
     ip = request.client.host if request.client else None
@@ -138,7 +152,8 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         raise HTTPException(400, "Missing license")
 
     key_hash = sha256(license_key)
-    lic = db.query(License).filter(License.key_hash == key_hash).first()
+    # Lock the license row to prevent device-limit race
+    lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
         log_auth(db, None, ip, "init", False, "not_found")
         raise HTTPException(401, "Invalid license")
@@ -149,12 +164,17 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         log_auth(db, lic.id, ip, "init", False, "expired")
         raise HTTPException(403, "License expired")
 
-    # Enforce device limit
+    # Auto-ban on repeated failures
+    if recent_failures(db, lic.id, FAILURE_WINDOW_MINUTES) >= MAX_FAILURES:
+        lic.status = "banned"
+        db.commit()
+        log_auth(db, lic.id, ip, "init", False, "auto_banned")
+        raise HTTPException(403, "License banned due to repeated failures")
+
     active_devices = db.query(Device).filter(
         Device.license_id == lic.id, Device.banned == False
     ).count()
     if active_devices >= (lic.max_devices or 1):
-        # Allow if all devices are stale (never heartbeat in 7 days) – optional
         stale_cutoff = datetime.utcnow() - timedelta(days=7)
         fresh = db.query(Device).filter(
             Device.license_id == lic.id,
@@ -165,7 +185,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
             log_auth(db, lic.id, ip, "init", False, "device_limit")
             raise HTTPException(403, "Device limit reached")
 
-    # Generate challenge
     raw_challenge = secrets.token_hex(32)
     ch = Challenge(
         challenge_hash=sha256(raw_challenge),
@@ -175,20 +194,17 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     db.commit()
     log_auth(db, lic.id, ip, "init", True)
 
-    return {
-        "challenge_id": ch.id,
-        "challenge": raw_challenge,
-        "expires_in": CHALLENGE_TTL,
-    }
+    return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
-@app.post("/v2/auth/verify")
+@app.post("/v2/auth/verify", dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(5, Duration.MINUTE))))])
 def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     challenge_id = payload.get("challenge_id")
     proof = (payload.get("proof") or "").strip()
+    license_key = (payload.get("license") or "").strip()
     ip = request.client.host if request.client else None
 
-    if not challenge_id or not proof:
-        raise HTTPException(400, "Missing challenge_id or proof")
+    if not challenge_id or not proof or not license_key:
+        raise HTTPException(400, "Missing fields")
 
     ch = db.query(Challenge).filter(Challenge.id == challenge_id).with_for_update().first()
     if not ch:
@@ -197,21 +213,20 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         raise HTTPException(401, "Challenge already used")
     if ch.expires_at < datetime.utcnow():
         raise HTTPException(401, "Challenge expired")
-
-    # proof is the raw challenge echoed back (see loader). Verify hash match.
     if sha256(proof) != ch.challenge_hash:
         log_auth(db, None, ip, "verify", False, "bad_proof")
         raise HTTPException(401, "Invalid proof")
 
-    # Resolve license from proof: we can't, so client must include key too.
-    license_key = (payload.get("license") or "").strip()
-    if not license_key:
-        raise HTTPException(400, "Missing license")
-    lic = db.query(License).filter(License.key_hash == sha256(license_key)).first()
+    lic = db.query(License).filter(License.key_hash == sha256(license_key)).with_for_update().first()
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
 
-    # Device: hash of license+proof acts as a stable device fingerprint.
+    # Auto-ban check
+    if recent_failures(db, lic.id, FAILURE_WINDOW_MINUTES) >= MAX_FAILURES:
+        lic.status = "banned"
+        db.commit()
+        raise HTTPException(403, "License banned due to repeated failures")
+
     device_hash = sha256(license_key + "|" + proof)[:128]
     dev = db.query(Device).filter(
         Device.license_id == lic.id, Device.device_hash == device_hash
@@ -224,11 +239,9 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         raise HTTPException(403, "Device banned")
     dev.last_seen = datetime.utcnow()
 
-    # Consume challenge
     ch.consumed_at = datetime.utcnow()
     ch.device_id = dev.id
 
-    # Issue session
     raw_token = secrets.token_hex(32)
     sess = Session(
         license_id=lic.id,
@@ -240,11 +253,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     db.commit()
     log_auth(db, lic.id, ip, "verify", True)
 
-    return {
-        "success": True,
-        "session_token": raw_token,
-        "expires_in": SESSION_TTL,
-    }
+    return {"success": True, "session_token": raw_token, "expires_in": SESSION_TTL}
 
 @app.post("/v2/auth/heartbeat")
 def auth_heartbeat(payload: dict, db=Depends(get_db)):
@@ -275,25 +284,17 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
     db.commit()
     return {"valid": True}
 
-@app.post("/v2/auth/logout")
-def auth_logout(payload: dict, db=Depends(get_db)):
-    raw_token = (payload.get("session_token") or "").strip()
-    if not raw_token:
-        raise HTTPException(400, "Missing token")
-    sess = db.query(Session).filter(Session.token_hash == sha256(raw_token)).first()
-    if sess:
-        sess.revoked = True
-        db.commit()
-    return {"success": True}
+# ---- script delivery (only after valid session) ----
+@app.get("/v2/script", response_class=PlainTextResponse)
+def serve_script(session_token: str, db=Depends(get_db)):
+    sess = db.query(Session).filter(Session.token_hash == sha256(session_token)).first()
+    if not sess or sess.revoked or sess.expires_at < datetime.utcnow():
+        raise HTTPException(401, "Invalid session")
 
-# ---- legacy simple endpoints (still used by /script) ----
-@app.get("/script", response_class=PlainTextResponse)
-def serve_script(key: str, db=Depends(get_db)):
-    lic = db.query(License).filter(License.key_hash == sha256(key), License.status == "active").first()
+    lic = db.query(License).filter(License.id == sess.license_id, License.status == "active").first()
     if not lic:
-        raise HTTPException(401, "Invalid key")
-    lic.last_used = datetime.utcnow()
-    db.commit()
+        raise HTTPException(403, "License inactive")
+
     if not lic.server_id:
         return ""
     s = db.query(Script).filter(Script.server_id == lic.server_id).first()

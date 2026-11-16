@@ -1,9 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse, HTMLResponse, Response
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey, text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
-from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from pyrate_limiter import Duration, Limiter, Rate
 import os
@@ -11,7 +10,9 @@ import secrets
 import hashlib
 
 # ==================== CONFIG ====================
-DATABASE_URL = "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require"
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -19,8 +20,8 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-CHALLENGE_TTL = 60
-SESSION_TTL = 3600
+CHALLENGE_TTL = 60          # seconds
+SESSION_TTL = 3600          # seconds
 MAX_FAILURES = 10
 FAILURE_WINDOW_MINUTES = 10
 
@@ -139,12 +140,12 @@ BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not perm
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
 </head><body><span>Not permitted mijo</span></body></html>"""
 
-@app.on_event("startup")
-async def startup():
-    await FastAPILimiter.init(engine)
+# Rate limiters (in-memory, per-process)
+init_limiter = Limiter(Rate(5, Duration.MINUTE))
+verify_limiter = Limiter(Rate(5, Duration.MINUTE))
 
-# ---- v2 auth flow with rate limiting ----
-@app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(5, Duration.MINUTE))))])
+# ---- v2 auth flow ----
+@app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
     ip = request.client.host if request.client else None
@@ -152,7 +153,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         raise HTTPException(400, "Missing license")
 
     key_hash = sha256(license_key)
-    # Lock the license row to prevent device-limit race
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
         log_auth(db, None, ip, "init", False, "not_found")
@@ -164,7 +164,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         log_auth(db, lic.id, ip, "init", False, "expired")
         raise HTTPException(403, "License expired")
 
-    # Auto-ban on repeated failures
     if recent_failures(db, lic.id, FAILURE_WINDOW_MINUTES) >= MAX_FAILURES:
         lic.status = "banned"
         db.commit()
@@ -196,7 +195,7 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
 
     return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
-@app.post("/v2/auth/verify", dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(5, Duration.MINUTE))))])
+@app.post("/v2/auth/verify", dependencies=[Depends(RateLimiter(limiter=verify_limiter))])
 def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     challenge_id = payload.get("challenge_id")
     proof = (payload.get("proof") or "").strip()
@@ -221,7 +220,6 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
 
-    # Auto-ban check
     if recent_failures(db, lic.id, FAILURE_WINDOW_MINUTES) >= MAX_FAILURES:
         lic.status = "banned"
         db.commit()

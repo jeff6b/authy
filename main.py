@@ -150,6 +150,10 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     raw_hwid = (payload.get("hwid") or "").strip()
     ip = request.client.host if request.client else None
 
+    print(f"[init] received: [{license_key}]")
+    print(f"[init] length: {len(license_key)}")
+    print(f"[init] hash: {sha256(license_key)}")
+
     if not license_key:
         raise HTTPException(400, "Missing license")
     if not raw_hwid:
@@ -158,6 +162,7 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     key_hash = sha256(license_key)
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
+        print(f"[init] no license found for hash {key_hash}")
         log_auth(db, None, ip, "init", False, "not_found")
         raise HTTPException(401, "Invalid license")
     if lic.status != "active":

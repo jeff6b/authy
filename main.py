@@ -94,6 +94,21 @@ def validate(key: str, hwid: str = None, db=Depends(get_db)):
     db.commit()
     return "valid"
 
+@app.get("/heartbeat", response_class=PlainTextResponse)
+def heartbeat(key: str, db=Depends(get_db)):
+    k = db.query(Key).filter(Key.key_value == key).first()
+    if not k:
+        return "invalid"
+    if k.banned:
+        return "banned"
+    if k.kick:
+        k.kick = False
+        db.commit()
+        return "kick"
+    k.last_seen = datetime.utcnow()
+    db.commit()
+    return "ok"
+
 @app.get("/script", response_class=PlainTextResponse)
 def serve_script(key: str, db=Depends(get_db)):
     k = db.query(Key).filter(Key.key_value == key, Key.banned == False).first()

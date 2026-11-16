@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse, HTMLResponse, Response
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey, text, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
 from fastapi_limiter.depends import RateLimiter
@@ -37,6 +37,9 @@ class Server(Base):
     panel_message_id = Column(BigInteger, nullable=True)
     panel_channel_id = Column(BigInteger, nullable=True)
     buyer_role = Column(String(100), nullable=True)
+    anti_tamper_enabled = Column(Boolean, default=False)
+    greeting_enabled = Column(Boolean, default=False)
+    greeting_message = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     linked_at = Column(DateTime, nullable=True)
 
@@ -50,6 +53,7 @@ class License(Base):
     expires_at = Column(DateTime, nullable=True)
     max_devices = Column(Integer, default=1)
     redeemed_by = Column(BigInteger, nullable=True)
+    redeemed_name = Column(String(100), nullable=True)
     redeemed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
@@ -111,6 +115,25 @@ class HostedFile(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# ==================== IDEMPOTENT MIGRATIONS ====================
+def run_migrations():
+    """Add new columns to existing tables without dropping data."""
+    stmts = [
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS redeemed_name VARCHAR(100)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS anti_tamper_enabled BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS greeting_enabled BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS greeting_message VARCHAR(200)",
+    ]
+    with engine.begin() as conn:
+        for s in stmts:
+            try:
+                conn.execute(text(s))
+            except Exception as e:
+                print(f"[migrate] skipped: {s} -> {e}")
+    print("[migrate] done")
+
+run_migrations()
+
 def get_db():
     db = SessionLocal()
     try:
@@ -150,10 +173,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     raw_hwid = (payload.get("hwid") or "").strip()
     ip = request.client.host if request.client else None
 
-    print(f"[init] received: [{license_key}]")
-    print(f"[init] length: {len(license_key)}")
-    print(f"[init] hash: {sha256(license_key)}")
-
     if not license_key:
         raise HTTPException(400, "Missing license")
     if not raw_hwid:
@@ -162,7 +181,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     key_hash = sha256(license_key)
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
-        print(f"[init] no license found for hash {key_hash}")
         log_auth(db, None, ip, "init", False, "not_found")
         raise HTTPException(401, "Invalid license")
     if lic.status != "active":
@@ -208,6 +226,8 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     challenge_id = payload.get("challenge_id")
     proof = (payload.get("proof") or "").strip()
     license_key = (payload.get("license") or "").strip()
+    discord_id = payload.get("discord_id")
+    discord_name = payload.get("discord_name")
     ip = request.client.host if request.client else None
 
     if not challenge_id or not proof or not license_key:
@@ -245,9 +265,19 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     if dev.banned:
         raise HTTPException(403, "Device banned")
 
+    # Optional: capture discord identity if loader sends it
+    if discord_id and not lic.redeemed_by:
+        try:
+            lic.redeemed_by = int(discord_id)
+        except (TypeError, ValueError):
+            pass
+    if discord_name and not lic.redeemed_name:
+        lic.redeemed_name = str(discord_name)[:100]
+
     dev.last_seen = datetime.utcnow()
     ch.consumed_at = datetime.utcnow()
     ch.device_id = dev.id
+    lic.last_used = datetime.utcnow()
 
     raw_token = secrets.token_hex(32)
     sess = Session(
@@ -260,7 +290,67 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     db.commit()
     log_auth(db, lic.id, ip, "verify", True)
 
-    return {"success": True, "session_token": raw_token, "expires_in": SESSION_TTL}
+    # ---- Gather everything the loader needs ----
+    server = db.query(Server).filter(Server.id == lic.server_id).first() if lic.server_id else None
+
+    # script_name from script table
+    script_name = "unknown"
+    if lic.server_id:
+        s = db.query(Script).filter(Script.server_id == lic.server_id).first()
+        if s and s.name:
+            script_name = s.name
+
+    # project_name: panel_name or guild name
+    project_name = "unknown"
+    if server:
+        project_name = server.panel_name or server.guild_name or "unknown"
+
+    # session_count: active sessions for this license
+    session_count = db.query(Session).filter(
+        Session.license_id == lic.id,
+        Session.revoked == False,
+        Session.expires_at > datetime.utcnow(),
+    ).count()
+
+    # time_left
+    time_left = None
+    if lic.expires_at:
+        delta = (lic.expires_at - datetime.utcnow()).total_seconds()
+        time_left = max(0, int(delta))
+
+    # execution count (auth log counting, no new column)
+    exec_count = db.query(AuthLog).filter(
+        AuthLog.license_id == lic.id,
+        AuthLog.event_type == "verify",
+        AuthLog.success == True,
+    ).count()
+
+    anti_tamper = bool(server.anti_tamper_enabled) if server else False
+    greeting_enabled = bool(server.greeting_enabled) if server else False
+    greeting_message = server.greeting_message if server else None
+
+    # Discord name: prefer stored redeemed_name, else what loader sent
+    resolved_discord_name = lic.redeemed_name or (str(discord_name)[:100] if discord_name else None)
+    resolved_discord_id = lic.redeemed_by or (int(discord_id) if discord_id and str(discord_id).isdigit() else None)
+
+    return {
+        "success": True,
+        "session_token": raw_token,
+        "session_id": sess.id,
+        "expires_in": SESSION_TTL,
+        # NEW fields
+        "anti_tamper": anti_tamper,
+        "greeting_enabled": greeting_enabled,
+        "greeting_message": greeting_message,
+        "discord_id": resolved_discord_id,
+        "discord_name": resolved_discord_name,
+        "hwid": ch.device_hash,
+        "time_left": time_left,
+        "session_count": session_count,
+        "script_name": script_name,
+        "project_name": project_name,
+        "key_executions": exec_count,
+    }
 
 @app.post("/v2/auth/heartbeat")
 def auth_heartbeat(payload: dict, db=Depends(get_db)):
@@ -284,12 +374,63 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
     if dev and dev.banned:
         return {"valid": False, "reason": "device_banned"}
 
+    # If tamper flag flipped true by loader, treat as revoked (client already kicked,
+    # but this makes the server-side state consistent)
+    if payload.get("tampered") is True:
+        sess.revoked = True
+        db.commit()
+        return {"valid": False, "reason": "tampered"}
+
     sess.last_heartbeat = datetime.utcnow()
     lic.last_used = datetime.utcnow()
     if dev:
         dev.last_seen = datetime.utcnow()
     db.commit()
-    return {"valid": True}
+    return {"valid": True, "alive": True}
+
+@app.post("/v2/auth/tamper")
+def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
+    """
+    Hardening: no rate limit on purpose. A real tamper should always go through.
+    Idempotent: returns success even if license already gone.
+    Deletes license + all sessions + all devices (permanent).
+    """
+    ip = request.client.host if request.client else None
+    license_key = (payload.get("license") or "").strip()
+    session_token = (payload.get("session_token") or "").strip()
+    reason = (payload.get("reason") or "unspecified")[:200]
+
+    lic = None
+    # Try session first (more reliable), then license key
+    if session_token:
+        sess = db.query(Session).filter(Session.token_hash == sha256(session_token)).first()
+        if sess:
+            lic = db.query(License).filter(License.id == sess.license_id).first()
+    if not lic and license_key:
+        lic = db.query(License).filter(License.key_hash == sha256(license_key)).first()
+
+    if not lic:
+        # Already gone — still return success so faked responses don't help
+        log_auth(db, None, ip, "tamper", True, f"already_gone:{reason}")
+        return {"success": True, "already_deleted": True}
+
+    lic_id = lic.id
+    try:
+        db.query(Session).filter(Session.license_id == lic_id).delete()
+        db.query(Device).filter(Device.license_id == lic_id).delete()
+        db.delete(lic)
+        db.commit()
+        log_auth(db, lic_id, ip, "tamper", True, reason)
+    except Exception as e:
+        db.rollback()
+        print(f"[tamper] error deleting lic {lic_id}: {e}")
+        # Still report success to avoid leaking state
+        try:
+            log_auth(db, lic_id, ip, "tamper", True, f"partial:{reason}")
+        except Exception:
+            pass
+
+    return {"success": True, "deleted": True}
 
 @app.get("/v2/script", response_class=PlainTextResponse)
 def serve_script(session_token: str, db=Depends(get_db)):

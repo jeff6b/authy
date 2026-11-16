@@ -20,8 +20,8 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-CHALLENGE_TTL = 60          # seconds
-SESSION_TTL = 3600          # seconds
+CHALLENGE_TTL = 60
+SESSION_TTL = 3600
 MAX_FAILURES = 10
 FAILURE_WINDOW_MINUTES = 10
 
@@ -77,6 +77,7 @@ class Challenge(Base):
     __tablename__ = "challenges"
     id = Column(Integer, primary_key=True)
     challenge_hash = Column(String(64), unique=True, nullable=False)
+    device_hash = Column(String(128), nullable=True)
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     expires_at = Column(DateTime, nullable=False)
     consumed_at = Column(DateTime, nullable=True)
@@ -140,17 +141,19 @@ BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not perm
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
 </head><body><span>Not permitted mijo</span></body></html>"""
 
-# Rate limiters (in-memory, per-process)
 init_limiter = Limiter(Rate(5, Duration.MINUTE))
 verify_limiter = Limiter(Rate(5, Duration.MINUTE))
 
-# ---- v2 auth flow ----
 @app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
+    raw_hwid = (payload.get("hwid") or "").strip()
     ip = request.client.host if request.client else None
+
     if not license_key:
         raise HTTPException(400, "Missing license")
+    if not raw_hwid:
+        raise HTTPException(400, "Missing hwid")
 
     key_hash = sha256(license_key)
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
@@ -170,23 +173,23 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         log_auth(db, lic.id, ip, "init", False, "auto_banned")
         raise HTTPException(403, "License banned due to repeated failures")
 
-    active_devices = db.query(Device).filter(
-        Device.license_id == lic.id, Device.banned == False
-    ).count()
-    if active_devices >= (lic.max_devices or 1):
-        stale_cutoff = datetime.utcnow() - timedelta(days=7)
-        fresh = db.query(Device).filter(
-            Device.license_id == lic.id,
-            Device.banned == False,
-            Device.last_seen >= stale_cutoff,
+    device_hash = sha256(license_key + "|" + raw_hwid)[:128]
+    existing_dev = db.query(Device).filter(
+        Device.license_id == lic.id, Device.device_hash == device_hash
+    ).first()
+
+    if not existing_dev:
+        active = db.query(Device).filter(
+            Device.license_id == lic.id, Device.banned == False
         ).count()
-        if fresh >= (lic.max_devices or 1):
+        if active >= (lic.max_devices or 1):
             log_auth(db, lic.id, ip, "init", False, "device_limit")
             raise HTTPException(403, "Device limit reached")
 
     raw_challenge = secrets.token_hex(32)
     ch = Challenge(
         challenge_hash=sha256(raw_challenge),
+        device_hash=device_hash,
         expires_at=datetime.utcnow() + timedelta(seconds=CHALLENGE_TTL),
     )
     db.add(ch)
@@ -215,6 +218,8 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     if sha256(proof) != ch.challenge_hash:
         log_auth(db, None, ip, "verify", False, "bad_proof")
         raise HTTPException(401, "Invalid proof")
+    if not ch.device_hash:
+        raise HTTPException(401, "Challenge has no device binding")
 
     lic = db.query(License).filter(License.key_hash == sha256(license_key)).with_for_update().first()
     if not lic or lic.status != "active":
@@ -225,18 +230,17 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         db.commit()
         raise HTTPException(403, "License banned due to repeated failures")
 
-    device_hash = sha256(license_key + "|" + proof)[:128]
     dev = db.query(Device).filter(
-        Device.license_id == lic.id, Device.device_hash == device_hash
+        Device.license_id == lic.id, Device.device_hash == ch.device_hash
     ).first()
     if not dev:
-        dev = Device(license_id=lic.id, device_hash=device_hash)
+        dev = Device(license_id=lic.id, device_hash=ch.device_hash)
         db.add(dev)
         db.flush()
     if dev.banned:
         raise HTTPException(403, "Device banned")
-    dev.last_seen = datetime.utcnow()
 
+    dev.last_seen = datetime.utcnow()
     ch.consumed_at = datetime.utcnow()
     ch.device_id = dev.id
 
@@ -282,7 +286,6 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
     db.commit()
     return {"valid": True}
 
-# ---- script delivery (only after valid session) ----
 @app.get("/v2/script", response_class=PlainTextResponse)
 def serve_script(session_token: str, db=Depends(get_db)):
     sess = db.query(Session).filter(Session.token_hash == sha256(session_token)).first()

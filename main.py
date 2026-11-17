@@ -76,7 +76,7 @@ class Session(Base):
     license_id = Column(Integer, ForeignKey("licenses.id"))
     device_id = Column(Integer, ForeignKey("devices.id"))
     token_hash = Column(String(64), unique=True, nullable=False)
-    secret_plain = Column(String(64), nullable=False) # NEW: HMAC Secret
+    secret_plain = Column(String(64), nullable=False) # HMAC Secret
     expires_at = Column(DateTime, nullable=False)
     last_heartbeat = Column(DateTime, default=datetime.utcnow)
     revoked = Column(Boolean, default=False)
@@ -119,7 +119,7 @@ class HostedFile(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ==================== MIGRATIONS & CLEANUP ====================
+# ==================== MIGRATIONS ====================
 def run_migrations():
     stmts = [
         "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS redeemed_name VARCHAR(100)",
@@ -141,6 +141,18 @@ def run_migrations():
 
 run_migrations()
 
+# ==================== APP INITIALIZATION ====================
+app = FastAPI()
+
+init_limiter = Limiter(Rate(5, Duration.MINUTE))
+verify_limiter = Limiter(Rate(5, Duration.MINUTE))
+script_limiter = Limiter(Rate(10, Duration.MINUTE))
+
+BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not permitted</title>
+<style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
+</head><body><span>Not permitted mijo</span></body></html>"""
+
+# ==================== BACKGROUND TASKS ====================
 async def db_cleanup_task():
     """Deletes old logs and expired sessions to prevent DB bloat."""
     while True:
@@ -161,6 +173,7 @@ async def db_cleanup_task():
 async def startup_event():
     asyncio.create_task(db_cleanup_task())
 
+# ==================== HELPERS ====================
 def get_db():
     db = SessionLocal()
     try:
@@ -184,17 +197,7 @@ def recent_failures(db, license_id, minutes):
         AuthLog.created_at >= cutoff,
     ).count()
 
-# ==================== APP ====================
-app = FastAPI()
-
-BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not permitted</title>
-<style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
-</head><body><span>Not permitted mijo</span></body></html>"""
-
-init_limiter = Limiter(Rate(5, Duration.MINUTE))
-verify_limiter = Limiter(Rate(5, Duration.MINUTE))
-script_limiter = Limiter(Rate(10, Duration.MINUTE))
-
+# ==================== ENDPOINTS ====================
 @app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()

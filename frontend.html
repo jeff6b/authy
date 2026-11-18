@@ -28,17 +28,18 @@
         .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 1.25rem; letter-spacing: -.02em; }
         .brand img { width: 58px; height: 58px; object-fit: contain; mix-blend-mode: lighten; }
         .brand b { color: var(--g); font-weight: 800; }
-        .tabs { display: flex; gap: 6px; padding: 5px; }
+        .tabs { display: flex; gap: 4px; padding: 5px; }
         .tab {
-            background: none; border: 0; color: var(--mute); font: 600 .93rem inherit;
-            font-family: inherit; padding: 9px 20px; border-radius: 8px; cursor: pointer; transition: .15s;
-            text-decoration: none;
+            background: none; border: 0; color: var(--mute); 
+            font: 500 0.85rem inherit; /* Smaller font weight and size */
+            font-family: inherit; padding: 6px 14px; border-radius: 6px; 
+            cursor: pointer; transition: .15s; text-decoration: none;
         }
         .tab:hover { color: #fff; }
-        .tab.on { background: var(--g); color: var(--on); }
+        .tab.on { color: #fff; font-weight: 600; } /* No green background, just brighter text */
         .dash {
-            justify-self: end; background: var(--g); color: var(--on); font: 700 .93rem inherit;
-            font-family: inherit; padding: 11px 22px; border: 0; border-radius: 10px;
+            justify-self: end; background: var(--g); color: var(--on); font: 700 .9rem inherit;
+            font-family: inherit; padding: 10px 20px; border: 0; border-radius: 8px;
             opacity: .35; cursor: not-allowed;
         }
         main { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 0 clamp(24px,6vw,90px) 8vh; }

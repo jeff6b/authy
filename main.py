@@ -15,6 +15,7 @@ import asyncio
 # ==================== CONFIG ====================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
+    # Ensure your production database URL is set in Render environment variables
     DATABASE_URL = "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require"
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
@@ -129,7 +130,7 @@ def run_migrations():
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS server_id INTEGER",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS name VARCHAR(200)",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
-        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)", # NEW
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)",
     ]
     with engine.begin() as conn:
         for s in stmts:
@@ -196,6 +197,20 @@ def recent_failures(db, license_id, minutes):
         AuthLog.success == False,
         AuthLog.created_at >= cutoff,
     ).count()
+
+# ==================== FRONTEND ====================
+@app.get("/", response_class=HTMLResponse)
+def serve_frontend():
+    # Get the path to the frontend.html file
+    file_path = os.path.join(os.path.dirname(__file__), "frontend.html")
+    
+    # Check if the file exists
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    
+    # Fallback if the file is missing
+    return "<h1>Frontend not found</h1><p>Please create frontend.html in the root directory.</p>"
 
 # ==================== ENDPOINTS ====================
 @app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])

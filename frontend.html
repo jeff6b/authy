@@ -29,16 +29,16 @@
         .brand img { width: 58px; height: 58px; object-fit: contain; mix-blend-mode: lighten; }
         .brand b { color: var(--g); font-weight: 800; }
         
-        /* Tabs styling updated */
-        .tabs { display: flex; gap: 6px; padding: 5px; }
+        /* Tabs styling updated to be smaller */
+        .tabs { display: flex; gap: 4px; padding: 5px; }
         .tab {
             background: none; border: 0; color: var(--mute); 
-            font: 500 0.75rem inherit; /* Much smaller font */
-            font-family: inherit; padding: 6px 12px; border-radius: 6px; 
+            font: 500 0.65rem inherit; /* Much smaller font */
+            font-family: inherit; padding: 4px 10px; border-radius: 6px; 
             cursor: pointer; transition: .15s; text-decoration: none;
+            letter-spacing: 0.02em;
         }
         .tab:hover { color: #fff; }
-        /* .tab.on has no special styling now */
         
         .dash {
             justify-self: end; background: var(--g); color: var(--on); font: 700 .9rem inherit;
@@ -49,6 +49,7 @@
         .hero { display: grid; grid-template-columns: minmax(0,.9fr) minmax(0,1.1fr); gap: 48px; align-items: center; padding-left: clamp(0px,4vw,60px); }
         .shot { width: 100%; height: auto; display: block; border-radius: 14px; opacity: .13; }
         .acts { display: flex; gap: 10px; margin-top: 26px; flex-wrap: wrap; }
+        
         .act {
             display: inline-flex; align-items: center; justify-content: center; height: 40px;
             padding: 0 20px; border-radius: 6px; font-family: inherit; font-size: .9rem;
@@ -56,8 +57,11 @@
         }
         .act.g { background: var(--g); color: var(--on); }
         .act.g:hover { transform: translateY(-2px); }
+        
+        /* Read docs button no longer turns green */
         .act.o { background: transparent; color: #fff; border-color: #2a2d33; }
-        .act.o:hover { border-color: var(--g); color: var(--g); }
+        .act.o:hover { border-color: #fff; } /* Just turns white, not green */
+        
         h1 { margin: 0; font-size: clamp(3rem,6.4vw,5.6rem); line-height: 1; letter-spacing: -.05em; font-weight: 800; }
         h1 span { color: var(--g); margin-left: .07em; }
         .desc { margin: 18px 0 0; max-width: 460px; color: var(--mute); font-size: 1.05rem; line-height: 1.55; }
@@ -74,7 +78,7 @@
             <img src="https://cdn.corenexis.com/f/I6Acgx8x.png" alt="">
         </div>
         <div class="tabs" role="tablist">
-            <a class="tab on" href="#">Home</a>
+            <a class="tab" href="#">Home</a>
             <a class="tab" href="#">Docs</a>
             <a class="tab" href="#">Plans</a>
             <a class="tab" href="https://discord.gg/usekeyframe" target="_blank" rel="noopener">Discord</a>
@@ -96,4 +100,4 @@
         </div>
     </main>
 </body>
-</html>
+</html

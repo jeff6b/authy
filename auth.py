@@ -5,6 +5,8 @@
 #   DISCORD_CLIENT_ID
 #   DISCORD_CLIENT_SECRET
 #   DISCORD_REDIRECT_URI   e.g. https://keyframe.rip/api/auth/discord/callback
+#   ENV                    "prod" (default) or "dev" — controls Secure cookies
+#   COOKIE_DOMAIN          optional, e.g. ".keyframe.rip" if you use www + apex
 #
 # Adds to requirements.txt: httpx
 
@@ -29,6 +31,13 @@ DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://keyframe.rip/
 
 WEB_SESSION_TTL = 60 * 60 * 24 * 7  # 7 days
 COOKIE_NAME     = "kf_session"
+STATE_COOKIE    = "kf_oauth_state"
+
+# In dev (http://localhost) Secure cookies are dropped by the browser.
+# Flip ENV=dev locally; leave unset (or "prod") in production.
+IS_PROD         = os.getenv("ENV", "prod").lower() != "dev"
+COOKIE_SECURE   = IS_PROD
+COOKIE_DOMAIN   = os.getenv("COOKIE_DOMAIN") or None  # e.g. ".keyframe.rip"
 
 
 # ==================== MODELS ====================
@@ -79,6 +88,27 @@ def get_db():
         db.close()
 
 
+# ==================== COOKIE HELPERS ====================
+def _set_cookie(resp, name: str, value: str, max_age: int):
+    kwargs = dict(
+        max_age=max_age,
+        httponly=True,
+        samesite="lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
+    if COOKIE_DOMAIN:
+        kwargs["domain"] = COOKIE_DOMAIN
+    resp.set_cookie(name, value, **kwargs)
+
+
+def _delete_cookie(resp, name: str):
+    kwargs = dict(path="/")
+    if COOKIE_DOMAIN:
+        kwargs["domain"] = COOKIE_DOMAIN
+    resp.delete_cookie(name, **kwargs)
+
+
 # ==================== SESSION HELPERS ====================
 def _new_session(db, user_id: int) -> str:
     raw = secrets.token_hex(32)
@@ -125,6 +155,9 @@ def _debug_env():
         "client_secret_set": bool(csec),
         "client_secret_len": len(csec or ""),
         "redirect_uri": ruri,
+        "env": os.getenv("ENV", "prod"),
+        "cookie_secure": COOKIE_SECURE,
+        "cookie_domain": COOKIE_DOMAIN,
         "pid": os.getpid(),
     }
 
@@ -144,16 +177,40 @@ def auth_discord():
         f"&state={state}"
     )
     resp = RedirectResponse(url, status_code=302)
-    resp.set_cookie("kf_oauth_state", state, max_age=600, httponly=True, samesite="lax", secure=True)
+    _set_cookie(resp, STATE_COOKIE, state, max_age=600)
     return resp
 
 
 @router.get("/auth/discord/callback")
-async def auth_discord_callback(request: Request, code: str = None, state: str = None, db: OrmSession = Depends(get_db)):
+async def auth_discord_callback(
+    request: Request,
+    code: str = None,
+    state: str = None,
+    db: OrmSession = Depends(get_db),
+):
+    cookie_state = request.cookies.get(STATE_COOKIE)
+
+    # Diagnostic logging — remove once OAuth is stable.
+    print(
+        f"[oauth] state_param={state!r} state_cookie={cookie_state!r} "
+        f"host={request.headers.get('host')} "
+        f"xfp={request.headers.get('x-forwarded-proto')} "
+        f"scheme={request.url.scheme} "
+        f"cookies={list(request.cookies.keys())}"
+    )
+
     if not code:
         raise HTTPException(400, "Missing code")
-    cookie_state = request.cookies.get("kf_oauth_state")
-    if not cookie_state or not state or cookie_state != state:
+    if not state:
+        raise HTTPException(400, "Missing state")
+    if not cookie_state:
+        raise HTTPException(
+            400,
+            "Missing state cookie — the browser did not send kf_oauth_state. "
+            "This usually means the cookie was set with Secure on an http:// URL, "
+            "or the cookie domain doesn't match the callback host.",
+        )
+    if not secrets.compare_digest(cookie_state, state):
         raise HTTPException(400, "Invalid state")
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -196,12 +253,8 @@ async def auth_discord_callback(request: Request, code: str = None, state: str =
     raw = _new_session(db, user.id)
 
     resp = RedirectResponse("/dashboard", status_code=302)
-    resp.delete_cookie("kf_oauth_state")
-    resp.set_cookie(
-        COOKIE_NAME, raw,
-        max_age=WEB_SESSION_TTL,
-        httponly=True, samesite="lax", secure=True,
-    )
+    _delete_cookie(resp, STATE_COOKIE)
+    _set_cookie(resp, COOKIE_NAME, raw, max_age=WEB_SESSION_TTL)
     return resp
 
 
@@ -213,7 +266,7 @@ def auth_logout(request: Request, db: OrmSession = Depends(get_db)):
         if ws:
             db.delete(ws); db.commit()
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(COOKIE_NAME)
+    _delete_cookie(resp, COOKIE_NAME)
     return resp
 
 

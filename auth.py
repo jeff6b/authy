@@ -1,7 +1,7 @@
 # auth.py — Discord OAuth + web sessions + server linking
 # TODO: remove hardcoded DATABASE_URL fallback in main.py before deploy (same warning)
 #
-# Required env vars on Render:
+# Required env vars on the WEB service (the one serving keyframe.rip):
 #   DISCORD_CLIENT_ID
 #   DISCORD_CLIENT_SECRET
 #   DISCORD_REDIRECT_URI   e.g. https://keyframe.rip/api/auth/discord/callback
@@ -111,6 +111,25 @@ def get_current_user(request: Request, db: OrmSession = Depends(get_db)) -> User
 router = APIRouter(prefix="/api")
 
 
+# ==================== DIAGNOSTIC (TEMPORARY) ====================
+# Visit https://keyframe.rip/api/auth/debug-env to see what the process
+# actually reads from environment variables. Remove this once OAuth works.
+@router.get("/auth/debug-env")
+def _debug_env():
+    cid = os.getenv("DISCORD_CLIENT_ID")
+    csec = os.getenv("DISCORD_CLIENT_SECRET")
+    ruri = os.getenv("DISCORD_REDIRECT_URI")
+    return {
+        "client_id_set": bool(cid),
+        "client_id_len": len(cid or ""),
+        "client_secret_set": bool(csec),
+        "client_secret_len": len(csec or ""),
+        "redirect_uri": ruri,
+        "pid": os.getpid(),
+    }
+
+
+# ==================== OAUTH ====================
 @router.get("/auth/discord")
 def auth_discord():
     if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
@@ -246,18 +265,9 @@ def link_server(payload: dict, user: User = Depends(get_current_user), db: OrmSe
     if existing and existing.id != s.id:
         raise HTTPException(409, "That guild is already linked to another server")
 
-    from sqlalchemy import text as _text
-    discord_name = None
-    try:
-        raw = str(gid)
-        with engine.begin() as conn:
-            pass
-    except Exception:
-        pass
-
     s.user_id  = user.id
     s.guild_id = gid
-    s.guild_name = discord_name or s.guild_name or f"Guild {gid}"
+    s.guild_name = s.guild_name or f"Guild {gid}"
     s.linked_at = datetime.utcnow()
     db.commit()
     return {"ok": True, "id": s.id, "guild_id": str(s.guild_id)}

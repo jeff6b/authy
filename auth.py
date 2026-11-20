@@ -27,7 +27,7 @@ from main import Base, engine, SessionLocal, Server, sha256
 # ==================== CONFIG ====================
 DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://keyframe.rip/api/auth/discord/callback")
+DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://authy-o0pm.onrender.com/api/auth/discord/callback")
 
 WEB_SESSION_TTL = 60 * 60 * 24 * 7  # 7 days
 COOKIE_NAME     = "kf_session"

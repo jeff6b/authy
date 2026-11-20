@@ -15,7 +15,6 @@ import asyncio
 # ==================== CONFIG ====================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    # Ensure your production database URL is set in Render environment variables
     DATABASE_URL = "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require"
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
@@ -46,9 +45,12 @@ class Server(Base):
     greeting_message = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     linked_at = Column(DateTime, nullable=True)
-    # ADDED (batch 2): owner of this server, set when linked via dashboard.
-    # Bot never reads this column; dashboard uses it to scope /api/servers.
     user_id = Column(Integer, nullable=True)
+    # Dashboard-only fields (not used by bot)
+    description = Column(Text, nullable=True)
+    freemium = Column(Boolean, default=False)
+    freemium_days = Column(String(64), nullable=True)  # "Mon,Tue,Wed"
+    integration_id = Column(String(64), nullable=True)
 
 class License(Base):
     __tablename__ = "licenses"
@@ -80,7 +82,7 @@ class Session(Base):
     license_id = Column(Integer, ForeignKey("licenses.id"))
     device_id = Column(Integer, ForeignKey("devices.id"))
     token_hash = Column(String(64), unique=True, nullable=False)
-    secret_plain = Column(String(64), nullable=False) # HMAC Secret
+    secret_plain = Column(String(64), nullable=False)
     expires_at = Column(DateTime, nullable=False)
     last_heartbeat = Column(DateTime, default=datetime.utcnow)
     revoked = Column(Boolean, default=False)
@@ -121,6 +123,15 @@ class HostedFile(Base):
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class Blocklist(Base):
+    __tablename__ = "blocklists"
+    id = Column(Integer, primary_key=True)
+    server_id = Column(Integer, nullable=True)
+    type = Column(String(16), nullable=False)  # "hwid" | "discord"
+    value = Column(String(128), nullable=False)
+    reason = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 # ==================== MIGRATIONS ====================
@@ -134,8 +145,12 @@ def run_migrations():
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS name VARCHAR(200)",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)",
-        # ADDED (batch 2): owner of a server, set when linked via dashboard.
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS user_id INTEGER",
+        # Dashboard-only fields
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS description TEXT",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_days VARCHAR(64)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS integration_id VARCHAR(64)",
     ]
     with engine.begin() as conn:
         for s in stmts:
@@ -160,7 +175,6 @@ BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not perm
 
 # ==================== BACKGROUND TASKS ====================
 async def db_cleanup_task():
-    """Deletes old logs and expired sessions to prevent DB bloat."""
     while True:
         try:
             db = SessionLocal()
@@ -173,7 +187,7 @@ async def db_cleanup_task():
             print("[cleanup] Old logs and sessions purged.")
         except Exception as e:
             print(f"[cleanup] Error: {e}")
-        await asyncio.sleep(3600) # Run every hour
+        await asyncio.sleep(3600)
 
 @app.on_event("startup")
 async def startup_event():
@@ -206,18 +220,13 @@ def recent_failures(db, license_id, minutes):
 # ==================== FRONTEND ====================
 @app.get("/", response_class=HTMLResponse)
 def serve_frontend():
-    # Get the path to the frontend.html file
     file_path = os.path.join(os.path.dirname(__file__), "frontend.html")
-
-    # Check if the file exists
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
-
-    # Fallback if the file is missing
     return "<h1>Frontend not found</h1><p>Please create frontend.html in the root directory.</p>"
 
-# ==================== ENDPOINTS ====================
+# ==================== AUTH ENDPOINTS (executor-facing) ====================
 @app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
@@ -290,7 +299,6 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     if ch.expires_at < datetime.utcnow():
         raise HTTPException(401, "Challenge expired")
 
-    # Timing safe comparison
     if not hmac.compare_digest(sha256(proof), ch.challenge_hash):
         log_auth(db, None, ip, "verify", False, "bad_proof")
         raise HTTPException(401, "Invalid proof")
@@ -323,7 +331,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     lic.last_used = datetime.utcnow()
 
     raw_token = secrets.token_hex(32)
-    raw_secret = secrets.token_hex(32) # NEW: HMAC Secret
+    raw_secret = secrets.token_hex(32)
 
     sess = Session(
         license_id=lic.id,
@@ -356,20 +364,18 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     anti_tamper = bool(server.anti_tamper_enabled) if server else False
     greeting_enabled = bool(server.greeting_enabled) if server else False
     greeting_message = server.greeting_message if server else None
-    resolved_discord_name = lic.redeemed_name
-    resolved_discord_id = lic.redeemed_by
 
     return {
         "success": True,
         "session_token": raw_token,
-        "session_secret": raw_secret, # Send secret to client for HMAC
+        "session_secret": raw_secret,
         "session_id": sess.id,
         "expires_in": SESSION_TTL,
         "anti_tamper": anti_tamper,
         "greeting_enabled": greeting_enabled,
         "greeting_message": greeting_message,
-        "discord_id": resolved_discord_id,
-        "discord_name": resolved_discord_name,
+        "discord_id": lic.redeemed_by,
+        "discord_name": lic.redeemed_name,
         "hwid": ch.device_hash,
         "time_left": time_left,
         "session_count": session_count,
@@ -448,7 +454,6 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
 
 @app.get("/v2/script", response_class=PlainTextResponse, dependencies=[Depends(RateLimiter(limiter=script_limiter))])
 def serve_script(session_token: str, timestamp: int, signature: str, db=Depends(get_db)):
-    # 1. Timestamp check (within 10 seconds)
     if abs(time.time() - timestamp) > 10:
         raise HTTPException(401, "Request expired")
 
@@ -456,7 +461,6 @@ def serve_script(session_token: str, timestamp: int, signature: str, db=Depends(
     if not sess or sess.revoked or sess.expires_at < datetime.utcnow():
         raise HTTPException(401, "Invalid session")
 
-    # 2. HMAC Signature check
     expected_sig = hmac.new(
         sess.secret_plain.encode(),
         f"{session_token}{timestamp}".encode(),
@@ -466,7 +470,6 @@ def serve_script(session_token: str, timestamp: int, signature: str, db=Depends(
     if not hmac.compare_digest(signature, expected_sig):
         raise HTTPException(401, "Invalid signature")
 
-    # 3. Heartbeat check (must have heartbeated within 60 seconds)
     if (datetime.utcnow() - sess.last_heartbeat).total_seconds() > 60:
         raise HTTPException(403, "Heartbeat timeout - script rejected")
 
@@ -490,10 +493,11 @@ def raw_file(token: str, request: Request, db=Depends(get_db)):
     return Response(content=f.content, media_type="text/plain")
 
 # ==================== WEB DASHBOARD (OAuth, /api/*) ====================
-# Imported at the bottom so auth.py can `from main import Base, engine, ...`
 from auth import router as auth_router
 app.include_router(auth_router)
 
+from dashboard_api import router as dashboard_router
+app.include_router(dashboard_router)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def serve_dashboard():
@@ -502,7 +506,6 @@ def serve_dashboard():
         with open(fp, "r", encoding="utf-8") as f:
             return f.read()
     return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
-
 
 if __name__ == "__main__":
     import uvicorn

@@ -46,6 +46,9 @@ class Server(Base):
     greeting_message = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     linked_at = Column(DateTime, nullable=True)
+    # ADDED (batch 2): owner of this server, set when linked via dashboard.
+    # Bot never reads this column; dashboard uses it to scope /api/servers.
+    user_id = Column(Integer, nullable=True)
 
 class License(Base):
     __tablename__ = "licenses"
@@ -131,6 +134,8 @@ def run_migrations():
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS name VARCHAR(200)",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)",
+        # ADDED (batch 2): owner of a server, set when linked via dashboard.
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS user_id INTEGER",
     ]
     with engine.begin() as conn:
         for s in stmts:
@@ -203,12 +208,12 @@ def recent_failures(db, license_id, minutes):
 def serve_frontend():
     # Get the path to the frontend.html file
     file_path = os.path.join(os.path.dirname(__file__), "frontend.html")
-    
+
     # Check if the file exists
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
-    
+
     # Fallback if the file is missing
     return "<h1>Frontend not found</h1><p>Please create frontend.html in the root directory.</p>"
 
@@ -284,12 +289,12 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         raise HTTPException(401, "Challenge already used")
     if ch.expires_at < datetime.utcnow():
         raise HTTPException(401, "Challenge expired")
-    
+
     # Timing safe comparison
     if not hmac.compare_digest(sha256(proof), ch.challenge_hash):
         log_auth(db, None, ip, "verify", False, "bad_proof")
         raise HTTPException(401, "Invalid proof")
-    
+
     if not ch.device_hash:
         raise HTTPException(401, "Challenge has no device binding")
 
@@ -319,7 +324,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
 
     raw_token = secrets.token_hex(32)
     raw_secret = secrets.token_hex(32) # NEW: HMAC Secret
-    
+
     sess = Session(
         license_id=lic.id,
         device_id=dev.id,
@@ -341,7 +346,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     session_count = db.query(Session).filter(
         Session.license_id == lic.id, Session.revoked == False, Session.expires_at > datetime.utcnow()
     ).count()
-    
+
     time_left = None
     if lic.expires_at:
         delta = (lic.expires_at - datetime.utcnow()).total_seconds()
@@ -483,6 +488,21 @@ def raw_file(token: str, request: Request, db=Depends(get_db)):
     if "mozilla" in ua and "text/html" in (request.headers.get("accept") or "").lower():
         return HTMLResponse(BLOCK_PAGE, status_code=200)
     return Response(content=f.content, media_type="text/plain")
+
+# ==================== WEB DASHBOARD (OAuth, /api/*) ====================
+# Imported at the bottom so auth.py can `from main import Base, engine, ...`
+from auth import router as auth_router
+app.include_router(auth_router)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def serve_dashboard():
+    fp = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    if os.path.exists(fp):
+        with open(fp, "r", encoding="utf-8") as f:
+            return f.read()
+    return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
+
 
 if __name__ == "__main__":
     import uvicorn

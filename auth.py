@@ -1,14 +1,4 @@
 # auth.py — Discord OAuth + web sessions + server linking
-# TODO: remove hardcoded DATABASE_URL fallback in main.py before deploy (same warning)
-#
-# Required env vars on the WEB service (the one serving keyframe.rip):
-#   DISCORD_CLIENT_ID
-#   DISCORD_CLIENT_SECRET
-#   DISCORD_REDIRECT_URI   e.g. https://keyframe.rip/api/auth/discord/callback
-#   ENV                    "prod" (default) or "dev" — controls Secure cookies
-#   COOKIE_DOMAIN          optional, e.g. ".keyframe.rip" if you use www + apex
-#
-# Adds to requirements.txt: httpx
 
 import os
 import secrets
@@ -29,15 +19,13 @@ DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://authy-o0pm.onrender.com/api/auth/discord/callback")
 
-WEB_SESSION_TTL = 60 * 60 * 24 * 7  # 7 days
+WEB_SESSION_TTL = 60 * 60 * 24 * 7
 COOKIE_NAME     = "kf_session"
 STATE_COOKIE    = "kf_oauth_state"
 
-# In dev (http://localhost) Secure cookies are dropped by the browser.
-# Flip ENV=dev locally; leave unset (or "prod") in production.
 IS_PROD         = os.getenv("ENV", "prod").lower() != "dev"
 COOKIE_SECURE   = IS_PROD
-COOKIE_DOMAIN   = os.getenv("COOKIE_DOMAIN") or None  # e.g. ".keyframe.rip"
+COOKIE_DOMAIN   = os.getenv("COOKIE_DOMAIN") or None
 
 
 # ==================== MODELS ====================
@@ -90,13 +78,8 @@ def get_db():
 
 # ==================== COOKIE HELPERS ====================
 def _set_cookie(resp, name: str, value: str, max_age: int):
-    kwargs = dict(
-        max_age=max_age,
-        httponly=True,
-        samesite="lax",
-        secure=COOKIE_SECURE,
-        path="/",
-    )
+    kwargs = dict(max_age=max_age, httponly=True, samesite="lax",
+                  secure=COOKIE_SECURE, path="/")
     if COOKIE_DOMAIN:
         kwargs["domain"] = COOKIE_DOMAIN
     resp.set_cookie(name, value, **kwargs)
@@ -141,27 +124,6 @@ def get_current_user(request: Request, db: OrmSession = Depends(get_db)) -> User
 router = APIRouter(prefix="/api")
 
 
-# ==================== DIAGNOSTIC (TEMPORARY) ====================
-# Visit https://keyframe.rip/api/auth/debug-env to see what the process
-# actually reads from environment variables. Remove this once OAuth works.
-@router.get("/auth/debug-env")
-def _debug_env():
-    cid = os.getenv("DISCORD_CLIENT_ID")
-    csec = os.getenv("DISCORD_CLIENT_SECRET")
-    ruri = os.getenv("DISCORD_REDIRECT_URI")
-    return {
-        "client_id_set": bool(cid),
-        "client_id_len": len(cid or ""),
-        "client_secret_set": bool(csec),
-        "client_secret_len": len(csec or ""),
-        "redirect_uri": ruri,
-        "env": os.getenv("ENV", "prod"),
-        "cookie_secure": COOKIE_SECURE,
-        "cookie_domain": COOKIE_DOMAIN,
-        "pid": os.getpid(),
-    }
-
-
 # ==================== OAUTH ====================
 @router.get("/auth/discord")
 def auth_discord():
@@ -189,27 +151,12 @@ async def auth_discord_callback(
     db: OrmSession = Depends(get_db),
 ):
     cookie_state = request.cookies.get(STATE_COOKIE)
-
-    # Diagnostic logging — remove once OAuth is stable.
-    print(
-        f"[oauth] state_param={state!r} state_cookie={cookie_state!r} "
-        f"host={request.headers.get('host')} "
-        f"xfp={request.headers.get('x-forwarded-proto')} "
-        f"scheme={request.url.scheme} "
-        f"cookies={list(request.cookies.keys())}"
-    )
-
     if not code:
         raise HTTPException(400, "Missing code")
     if not state:
         raise HTTPException(400, "Missing state")
     if not cookie_state:
-        raise HTTPException(
-            400,
-            "Missing state cookie — the browser did not send kf_oauth_state. "
-            "This usually means the cookie was set with Secure on an http:// URL, "
-            "or the cookie domain doesn't match the callback host.",
-        )
+        raise HTTPException(400, "Missing state cookie")
     if not secrets.compare_digest(cookie_state, state):
         raise HTTPException(400, "Invalid state")
 
@@ -280,7 +227,7 @@ def me(user: User = Depends(get_current_user)):
     }
 
 
-# ==================== SERVERS (linked to current user) ====================
+# ==================== SERVERS (linking) ====================
 @router.get("/servers")
 def list_servers(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     rows = db.query(Server).filter(Server.user_id == user.id).all()

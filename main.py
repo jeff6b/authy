@@ -30,6 +30,9 @@ SESSION_TTL = 3600
 MAX_FAILURES = 10
 FAILURE_WINDOW_MINUTES = 10
 
+# >>> CHANGED: public base URL used to build absolute claim callbacks
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 # ==================== MODELS ====================
 class Server(Base):
     __tablename__ = "servers"
@@ -271,6 +274,8 @@ async def db_cleanup_task():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(db_cleanup_task())
+    if not PUBLIC_BASE_URL:
+        print("[startup] WARNING: PUBLIC_BASE_URL is not set. Work.ink/Linkvertise callbacks will not work.")
 
 # ==================== HELPERS ====================
 def get_db():
@@ -657,7 +662,7 @@ document.getElementById('list').addEventListener('click', async function(e){{
     var r = await fetch('/api/claim/start', {{
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
-      body: JSON.stringify({{ integration_id: +b.dataset.id, base_url: location.origin }})
+      body: JSON.stringify({{ integration_id: +b.dataset.id }})
     }});
     var d = await r.json();
     if (!r.ok) throw new Error(d.detail || 'Failed');
@@ -701,7 +706,8 @@ async def claim_page(slug: str, db=Depends(get_db)):
 
 @app.post("/api/claim/start", dependencies=[Depends(claim_limit)])
 async def claim_start(payload: dict, db=Depends(get_db)):
-    from dashboard_api import Integration, ClaimSession, CLAIM_TTL_MIN
+    # >>> CHANGED: uses workink_override + absolute callback URL
+    from dashboard_api import Integration, ClaimSession, CLAIM_TTL_MIN, workink_override
 
     iid = int(payload.get("integration_id") or 0)
     i = db.query(Integration).filter(Integration.id == iid, Integration.enabled == True).first()
@@ -720,10 +726,28 @@ async def claim_start(payload: dict, db=Depends(get_db)):
     db.commit()
 
     redirect = i.provider_link
-    # Lootlabs: append puid for postback correlation
-    if i.provider == "lootlabs":
+
+    if i.provider == "workink":
+        # Build the absolute callback URL Work.ink should send the user back to.
+        # {TOKEN} is the placeholder Work.ink replaces with the user's proof token.
+        if not PUBLIC_BASE_URL:
+            raise HTTPException(500, "Server misconfigured: PUBLIC_BASE_URL not set")
+        callback = f"{PUBLIC_BASE_URL}/api/claim/callback?sid={token}&token={{TOKEN}}"
+        try:
+            sr = await workink_override(callback)
+        except Exception as e:
+            print(f"[claim] workink override error: {e}")
+            raise HTTPException(502, "Could not reach Work.ink")
+        sep = "&" if "?" in redirect else "?"
+        redirect = f"{redirect}{sep}sr={sr}"
+    elif i.provider == "lootlabs":
+        # Lootlabs: append puid for postback correlation
         sep = "&" if "?" in redirect else "?"
         redirect = f"{redirect}{sep}puid={token}"
+    else:
+        # Linkvertise and others: pass sid so the callback can find the session
+        sep = "&" if "?" in redirect else "?"
+        redirect = f"{redirect}{sep}sid={token}"
 
     return {
         "ok": True,

@@ -1,5 +1,6 @@
 # dashboard_api.py — Real backend for the dashboard.
-# Owns: /api/overview, /api/services, /api/keys, /api/blocklists, /api/integrations.
+# Owns: /api/overview, /api/services, /api/keys, /api/blocklists, /api/integrations,
+#       plus the claim flow: /go/{slug} and /api/claim/callback.
 # Key creation is Discord-only (/generatekey, /whitelist) EXCEPT freemium claim keys from integrations.
 # Dashboard is read + manage.
 
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
 from sqlalchemy.orm import Session as OrmSession
 
@@ -31,6 +33,11 @@ from discord_media import fetch_discord_user, fetch_guild_media
 
 
 router = APIRouter(prefix="/api")
+go_router = APIRouter()  # no prefix -> serves /go/{slug}
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+if not PUBLIC_BASE_URL:
+    print("[dashboard_api] WARNING: PUBLIC_BASE_URL is not set — claim callbacks will be relative and Work.ink will reject them.")
 
 
 # ==================== INTEGRATIONS ====================
@@ -160,6 +167,17 @@ async def verify_workink(token: str) -> bool:
         return False
 
 
+async def workink_override(destination: str) -> str:
+    """Ask Work.ink to override the post-completion destination. Returns the sr token."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            "https://work.ink/_api/v2/override",
+            params={"destination": destination},
+        )
+        r.raise_for_status()
+        return r.json()["sr"]
+
+
 def issue_claim_key(db, integration: Integration) -> tuple:
     """Create a License for this integration's server. Returns (key_plain, license_id)."""
     if not integration.server_id:
@@ -179,6 +197,107 @@ def issue_claim_key(db, integration: Integration) -> tuple:
     db.commit()
     db.refresh(lic)
     return key, lic.id
+
+
+def _key_page(key: str, already: bool = False) -> str:
+    note = "You already claimed this key." if already else "Here's your key:"
+    return f"""<!doctype html><meta charset="utf-8">
+<title>Your key</title>
+<style>
+  body{{background:#0c0c0d;color:#eef2f2;font-family:Inter,system-ui,sans-serif;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
+  .card{{background:#17171a;border:1px solid #2a2a2e;border-radius:16px;padding:32px;
+        max-width:420px;width:100%;text-align:center}}
+  p{{color:#a6b1b1;font-size:.9rem;margin:0 0 18px}}
+  code{{display:block;font-family:ui-monospace,Menlo,Consolas,monospace;
+        font-size:1.1rem;color:#AFFBB3;background:#0f0f11;border:1px solid #2a2a2e;
+        border-radius:10px;padding:14px;word-break:break-all;margin-bottom:18px}}
+  button{{font:600 .9rem inherit;background:#AFFBB3;color:#08150a;border:0;
+          border-radius:9px;padding:11px 22px;cursor:pointer}}
+</style>
+<div class="card">
+  <p>{note}</p>
+  <code id="k">{key}</code>
+  <button onclick="navigator.clipboard.writeText(document.getElementById('k').textContent)">
+    Copy key
+  </button>
+</div>"""
+
+
+# ==================== CLAIM FLOW ====================
+@go_router.get("/go/{slug}")
+async def start_claim(slug: str, db: OrmSession = Depends(get_db)):
+    i = db.query(Integration).filter(
+        Integration.slug == slug,
+        Integration.enabled == True,
+    ).first()
+    if not i or not i.provider_link:
+        raise HTTPException(404, "Claim not found")
+
+    sid = secrets.token_urlsafe(24)
+    db.add(ClaimSession(
+        token=sid,
+        integration_id=i.id,
+        expires_at=datetime.utcnow() + timedelta(minutes=CLAIM_TTL_MIN),
+    ))
+    db.commit()
+
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(500, "Server misconfigured: PUBLIC_BASE_URL not set")
+
+    callback = f"{PUBLIC_BASE_URL}/api/claim/callback?sid={sid}&token={{TOKEN}}"
+
+    if i.provider == "workink":
+        try:
+            sr = await workink_override(callback)
+        except Exception as e:
+            print(f"[claim] workink override error: {e}")
+            raise HTTPException(502, "Could not reach Work.ink")
+        sep = "&" if "?" in i.provider_link else "?"
+        dest = f"{i.provider_link}{sep}sr={sr}"
+    else:
+        sep = "&" if "?" in i.provider_link else "?"
+        dest = f"{i.provider_link}{sep}sid={sid}"
+
+    return RedirectResponse(dest, status_code=302)
+
+
+@router.get("/claim/callback")
+async def claim_callback(
+    sid: str,
+    token: str = "",
+    hash: str = "",
+    db: OrmSession = Depends(get_db),
+):
+    cs = db.query(ClaimSession).filter(ClaimSession.token == sid).first()
+    if not cs:
+        raise HTTPException(404, "Unknown session")
+    if cs.completed:
+        return HTMLResponse(_key_page(cs.key_plain or "", already=True))
+    if cs.expires_at < datetime.utcnow():
+        raise HTTPException(410, "Session expired")
+
+    i = db.query(Integration).filter(Integration.id == cs.integration_id).first()
+    if not i or not i.enabled:
+        raise HTTPException(404, "Integration disabled")
+
+    if i.provider == "workink":
+        ok = await verify_workink(token)
+    elif i.provider == "linkvertise":
+        ok = await verify_linkvertise(i.api_token, hash)
+    else:
+        ok = False
+
+    if not ok:
+        raise HTTPException(403, "Verification failed")
+
+    key, lic_id = issue_claim_key(db, i)
+    cs.completed = True
+    cs.license_id = lic_id
+    cs.key_plain = key
+    db.commit()
+
+    return HTMLResponse(_key_page(key))
 
 
 # ==================== OVERVIEW ====================
@@ -665,3 +784,6 @@ def is_blocked(db, server_id, hwid=None, discord_id=None):
     if discord_id and q.filter(Blocklist.type == "discord", Blocklist.value == str(discord_id)).first():
         return True
     return False
+
+
+__all__ = ["router", "go_router", "is_blocked"]

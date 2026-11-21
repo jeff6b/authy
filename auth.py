@@ -19,7 +19,7 @@ from discord_media import fetch_guild_media
 # ==================== CONFIG ====================
 DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://authy-o0pm.onrender.com/api/auth/discord/callback")
+DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://api.keyframe.rip/api/auth/discord/callback")
 
 WEB_SESSION_TTL = 60 * 60 * 24 * 7
 COOKIE_NAME     = "kf_session"

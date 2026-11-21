@@ -5,9 +5,11 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 import os
+import base64
 import secrets
 import hashlib
 import hmac
+import json
 import time
 import asyncio
 import traceback
@@ -32,10 +34,93 @@ FAILURE_WINDOW_MINUTES = 10
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# >>> FREEMIUM: shared secret with the bot
+# Freemium
 SERVER_TRIAL_SECRET = os.getenv("SERVER_TRIAL_SECRET", "").strip()
 TRIAL_TOKEN_TTL = 600
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# Signed envelope (layer 04 / 16)
+MIN_LOADER_VERSION = int(os.getenv("MIN_LOADER_VERSION", "0") or "0")
+LOADER_SIGNING_KEY_B64 = os.getenv("LOADER_SIGNING_KEY", "").strip()
+LOADER_SIGNING_KEY_ID = os.getenv("LOADER_SIGNING_KEY_ID", "").strip() or "k0"
+ENVELOPE_MAX_SKEW = 10  # seconds
+
+# ==================== ED25519 / AES-GCM HELPERS ====================
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization as _ser
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes as _hashes
+    _CRYPTO_OK = True
+except Exception as _e:
+    _CRYPTO_OK = False
+    print(f"[crypto] cryptography not available: {_e}")
+
+_signing_key = None
+
+def _load_signing_key():
+    global _signing_key
+    if _signing_key is not None:
+        return _signing_key
+    if not _CRYPTO_OK:
+        raise RuntimeError("cryptography not installed")
+    if not LOADER_SIGNING_KEY_B64:
+        raise RuntimeError("LOADER_SIGNING_KEY env var is not set")
+    try:
+        raw = base64.b64decode(LOADER_SIGNING_KEY_B64)
+    except Exception as e:
+        raise RuntimeError(f"LOADER_SIGNING_KEY is not valid base64: {e}")
+    if len(raw) != 32:
+        raise RuntimeError(f"LOADER_SIGNING_KEY must be 32 bytes (got {len(raw)})")
+    _signing_key = Ed25519PrivateKey.from_private_bytes(raw)
+    return _signing_key
+
+def _pubkey_hex() -> str:
+    priv = _load_signing_key()
+    pub = priv.public_key().public_bytes(
+        encoding=_ser.Encoding.Raw,
+        format=_ser.PublicFormat.Raw,
+    )
+    return pub.hex()
+
+def _hkdf(secret_str: str, info: bytes = b"kf-payload-v1") -> bytes:
+    hk = HKDF(
+        algorithm=_hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info,
+    )
+    return hk.derive(secret_str.encode())
+
+def _encrypt_payload(session_secret: str, plaintext: bytes):
+    key = _hkdf(session_secret)
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, plaintext, None)
+    return base64.b64encode(ct).decode(), base64.b64encode(nonce).decode()
+
+def _sign_envelope(payload_b64: str, version: int, ts: int) -> str:
+    priv = _load_signing_key()
+    msg = f"{payload_b64}|{version}|{ts}".encode()
+    sig = priv.sign(msg)
+    return base64.b64encode(sig).decode()
+
+def _build_envelope(session_secret: str, plaintext: bytes, version: int = 1) -> dict:
+    if not _CRYPTO_OK:
+        raise HTTPException(500, "Signing not configured")
+    ct_b64, nonce_b64 = _encrypt_payload(session_secret, plaintext)
+    ts = int(time.time())
+    sig_b64 = _sign_envelope(ct_b64, version, ts)
+    return {
+        "v": 1,
+        "ciphertext_b64": ct_b64,
+        "nonce_b64": nonce_b64,
+        "version": version,
+        "timestamp": ts,
+        "signature": sig_b64,
+        "key_id": LOADER_SIGNING_KEY_ID,
+    }
 
 # ==================== MODELS ====================
 class Server(Base):
@@ -57,11 +142,12 @@ class Server(Base):
     linked_at = Column(DateTime, nullable=True)
     user_id = Column(Integer, nullable=True)
     description = Column(Text, nullable=True)
-    freemium = Column(Boolean, default=False)                # >>> FREEMIUM
-    freemium_days = Column(String(64), nullable=True)        # >>> FREEMIUM
-    freemium_daily_minutes = Column(Integer, default=60)     # >>> FREEMIUM
+    freemium = Column(Boolean, default=False)
+    freemium_days = Column(String(64), nullable=True)
+    freemium_daily_minutes = Column(Integer, default=60)
     integration_id = Column(String(64), nullable=True)
     slug = Column(String(64), nullable=True)
+    loader_token = Column(String(64), nullable=True)  # NEW: /raw/<token> for the bootstrap loader
 
 class License(Base):
     __tablename__ = "licenses"
@@ -77,7 +163,7 @@ class License(Base):
     redeemed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
-    is_freemium = Column(Boolean, default=False)             # >>> FREEMIUM
+    is_freemium = Column(Boolean, default=False)
 
 class Device(Base):
     __tablename__ = "devices"
@@ -98,6 +184,8 @@ class Session(Base):
     expires_at = Column(DateTime, nullable=False)
     last_heartbeat = Column(DateTime, default=datetime.utcnow)
     revoked = Column(Boolean, default=False)
+    # NEW: nonce counter for replay protection
+    last_nonce = Column(Integer, default=0)
 
 class Challenge(Base):
     __tablename__ = "challenges"
@@ -134,6 +222,10 @@ class HostedFile(Base):
     filename = Column(String(200), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # NEW
+    is_protected = Column(Boolean, default=False)
+    content_sha256 = Column(String(64), nullable=True)
+    version = Column(Integer, default=1)
 
 class Blocklist(Base):
     __tablename__ = "blocklists"
@@ -144,7 +236,6 @@ class Blocklist(Base):
     reason = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# >>> FREEMIUM: per-user per-day free-minute accounting
 class FreeUsage(Base):
     __tablename__ = "free_usage"
     id = Column(Integer, primary_key=True)
@@ -168,10 +259,15 @@ def run_migrations():
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium BOOLEAN DEFAULT FALSE",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_days VARCHAR(64)",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_daily_minutes INTEGER DEFAULT 60",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS loader_token VARCHAR(64)",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS server_id INTEGER",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS name VARCHAR(200)",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_nonce INTEGER DEFAULT 0",
+        "ALTER TABLE hosted_files ADD COLUMN IF NOT EXISTS is_protected BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE hosted_files ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64)",
+        "ALTER TABLE hosted_files ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS user_id INTEGER",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS description TEXT",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS integration_id VARCHAR(64)",
@@ -205,7 +301,6 @@ def run_migrations():
             print(f"[migrate] skipped: {s} -> {e}")
     print("[migrate] done")
 
-
 def relax_legacy_not_null():
     tables = {
         "challenges": {c.name for c in Challenge.__table__.columns},
@@ -228,13 +323,11 @@ def relax_legacy_not_null():
     except Exception as e:
         print(f"[migrate] relax_legacy_not_null failed: {e}")
 
-
 run_migrations()
 relax_legacy_not_null()
 
 # ==================== FREEMIUM HELPERS ====================
 def _verify_trial_token(token: str):
-    """Return (server_id, discord_id) or None. Validates HMAC + expiry + today's date."""
     if not SERVER_TRIAL_SECRET or not token:
         return None
     parts = token.split(":")
@@ -258,7 +351,6 @@ def _verify_trial_token(token: str):
     if date_str != datetime.utcnow().strftime("%Y-%m-%d"):
         return None
     return server_id, discord_id
-
 
 def _is_freemium_today_server(server) -> bool:
     if not server or not getattr(server, "freemium", False):
@@ -306,13 +398,11 @@ BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not perm
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
 </head><body><span>Not permitted mijo</span></body></html>"""
 
-
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
     traceback.print_exc()
     detail = f"{type(exc).__name__}: {str(exc)[:300]}" if DEBUG_ERRORS else "server_error"
     return JSONResponse({"detail": detail}, status_code=500)
-
 
 async def db_cleanup_task():
     while True:
@@ -323,7 +413,6 @@ async def db_cleanup_task():
                 db.query(AuthLog).filter(AuthLog.created_at < cutoff).delete()
                 db.query(Session).filter(Session.expires_at < datetime.utcnow()).delete()
                 db.query(Challenge).filter(Challenge.expires_at < datetime.utcnow()).delete()
-                # >>> FREEMIUM: purge free_usage older than 30 days
                 fu_cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
                 db.query(FreeUsage).filter(FreeUsage.day < fu_cutoff).delete()
                 db.commit()
@@ -341,6 +430,14 @@ async def startup_event():
         print("[startup] WARNING: PUBLIC_BASE_URL is not set. Work.ink callbacks will not work.")
     if not SERVER_TRIAL_SECRET:
         print("[startup] WARNING: SERVER_TRIAL_SECRET is not set. Freemium tokens will be rejected.")
+    if not LOADER_SIGNING_KEY_B64:
+        print("[startup] WARNING: LOADER_SIGNING_KEY is not set. Signed envelope endpoints will 500.")
+    else:
+        try:
+            _load_signing_key()
+            print(f"[startup] Signing key loaded. key_id={LOADER_SIGNING_KEY_ID} pubkey={_pubkey_hex()[:16]}...")
+        except Exception as e:
+            print(f"[startup] Signing key load FAILED: {e}")
 
 # ==================== HELPERS ====================
 def get_db():
@@ -366,6 +463,51 @@ def recent_failures(db, license_id, minutes):
         AuthLog.created_at >= cutoff,
     ).count()
 
+def _verify_signed_request(db, session_token: str, timestamp: int, signature: str, nonce: int):
+    """
+    Shared gate for /v2/script and /raw/. Returns (sess, lic).
+    Raises HTTPException on any failure.
+    """
+    if abs(time.time() - timestamp) > ENVELOPE_MAX_SKEW:
+        raise HTTPException(401, "Request expired")
+
+    sess = db.query(Session).filter(Session.token_hash == sha256(session_token)).first()
+    if not sess or sess.revoked or sess.expires_at < datetime.utcnow():
+        raise HTTPException(401, "Invalid session")
+
+    # Nonce must be strictly increasing per session.
+    try:
+        nonce_i = int(nonce)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Invalid nonce")
+    last = int(sess.last_nonce or 0)
+    if nonce_i <= last:
+        # Replay attempt — revoke the session.
+        sess.revoked = True
+        db.commit()
+        raise HTTPException(401, "Nonce replay — session revoked")
+
+    # HMAC over session_token|timestamp|nonce
+    expected = hmac.new(
+        sess.secret_plain.encode(),
+        f"{session_token}{timestamp}{nonce_i}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest((signature or "").lower(), expected):
+        raise HTTPException(401, "Invalid signature")
+
+    if (datetime.utcnow() - sess.last_heartbeat).total_seconds() > 60:
+        raise HTTPException(403, "Heartbeat timeout")
+
+    lic = db.query(License).filter(License.id == sess.license_id, License.status == "active").first()
+    if not lic:
+        raise HTTPException(403, "License inactive")
+
+    # Commit nonce advance
+    sess.last_nonce = nonce_i
+    db.commit()
+    return sess, lic
+
 # ==================== FRONTEND ====================
 @app.get("/", response_class=HTMLResponse)
 def serve_frontend():
@@ -385,6 +527,7 @@ def health(db=Depends(get_db)):
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
     raw_hwid = (payload.get("hwid") or "").strip()
+    loader_version = int(payload.get("loader_version") or 0)
     ip = _client_ip(request)
 
     if not license_key:
@@ -392,10 +535,13 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     if not raw_hwid:
         raise HTTPException(400, "Missing hwid")
 
-        # >>> FREEMIUM: signed trial token?
+    # Layer 05 — reject old loaders
+    if MIN_LOADER_VERSION > 0 and loader_version < MIN_LOADER_VERSION:
+        log_auth(db, None, ip, "init", False, f"loader_too_old:{loader_version}<{MIN_LOADER_VERSION}")
+        raise HTTPException(426, f"Loader update required (min v{MIN_LOADER_VERSION})")
+
+    # Freemium trial token path
     trial = _verify_trial_token(license_key)
-    print(f"[DEBUG] Incoming license: {license_key}")
-    print(f"[DEBUG] Trial parsed: {trial}")
     if trial:
         server_id, discord_id = trial
         server = db.query(Server).filter(Server.id == server_id).first()
@@ -463,7 +609,7 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         log_auth(db, lic.id, ip, "init", True)
         return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
-    # Normal paid key path
+    # Paid key path
     key_hash = sha256(license_key)
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
@@ -486,7 +632,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     existing_dev = db.query(Device).filter(
         Device.license_id == lic.id, Device.device_hash == device_hash
     ).first()
-
     if not existing_dev:
         active = db.query(Device).filter(
             Device.license_id == lic.id, Device.banned == False
@@ -503,10 +648,8 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     )
     db.add(ch)
     db.commit()
-    challenge_id = ch.id
     log_auth(db, lic.id, ip, "init", True)
-
-    return {"challenge_id": challenge_id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
+    return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
 @app.post("/v2/auth/verify", dependencies=[Depends(verify_limit)])
 def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
@@ -525,15 +668,12 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         raise HTTPException(401, "Challenge already used")
     if ch.expires_at < datetime.utcnow():
         raise HTTPException(401, "Challenge expired")
-
     if not hmac.compare_digest(sha256(proof), ch.challenge_hash):
         log_auth(db, None, ip, "verify", False, "bad_proof")
         raise HTTPException(401, "Invalid proof")
-
     if not ch.device_hash:
         raise HTTPException(401, "Challenge has no device binding")
 
-    # >>> FREEMIUM: resolve license from trial token or paid key
     trial = _verify_trial_token(license_key)
     if trial:
         server_id, discord_id = trial
@@ -577,6 +717,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         token_hash=sha256(raw_token),
         secret_plain=raw_secret,
         expires_at=datetime.utcnow() + timedelta(seconds=SESSION_TTL),
+        last_nonce=0,
     )
     db.add(sess)
     db.commit()
@@ -607,6 +748,11 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     greeting_enabled = bool(server.greeting_enabled) if server else False
     greeting_message = server.greeting_message if server else None
 
+    # If the server has a loader_token, expose it (only used by /v2/script path)
+    hosted_file_token = None
+    if server and server.loader_token:
+        hosted_file_token = server.loader_token
+
     return {
         "success": True,
         "session_token": raw_token,
@@ -624,7 +770,10 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         "script_name": script_name,
         "project_name": project_name,
         "key_executions": exec_count,
-        "is_freemium": bool(getattr(lic, "is_freemium", False)),   # >>> FREEMIUM
+        "is_freemium": bool(getattr(lic, "is_freemium", False)),
+        "hosted_file_token": hosted_file_token,
+        "loader_version_floor": MIN_LOADER_VERSION,
+        "key_id": LOADER_SIGNING_KEY_ID,
     }
 
 @app.post("/v2/auth/heartbeat")
@@ -654,7 +803,6 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
         db.commit()
         return {"valid": False, "reason": "tampered"}
 
-    # >>> FREEMIUM: minute accounting + day/end enforcement
     if getattr(lic, "is_freemium", False):
         server = db.query(Server).filter(Server.id == lic.server_id).first()
         if server:
@@ -736,45 +884,119 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
 
     return {"success": True, "deleted": True}
 
-@app.get("/v2/script", response_class=PlainTextResponse, dependencies=[Depends(script_limit)])
-def serve_script(session_token: str, timestamp: int, signature: str, db=Depends(get_db)):
-    if abs(time.time() - timestamp) > 10:
-        raise HTTPException(401, "Request expired")
-
-    sess = db.query(Session).filter(Session.token_hash == sha256(session_token)).first()
-    if not sess or sess.revoked or sess.expires_at < datetime.utcnow():
-        raise HTTPException(401, "Invalid session")
-
-    expected_sig = hmac.new(
-        sess.secret_plain.encode(),
-        f"{session_token}{timestamp}".encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    if not hmac.compare_digest(signature.lower(), expected_sig):
-        raise HTTPException(401, "Invalid signature")
-
-    if (datetime.utcnow() - sess.last_heartbeat).total_seconds() > 60:
-        raise HTTPException(403, "Heartbeat timeout - script rejected")
-
-    lic = db.query(License).filter(License.id == sess.license_id, License.status == "active").first()
-    if not lic:
-        raise HTTPException(403, "License inactive")
+# ==================== SCRIPT (signed envelope) ====================
+@app.get("/v2/script", dependencies=[Depends(script_limit)])
+def serve_script(session_token: str, timestamp: int, signature: str, nonce: int, db=Depends(get_db)):
+    sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
 
     if not lic.server_id:
-        return ""
+        raise HTTPException(404, "No script assigned")
     s = db.query(Script).filter(Script.server_id == lic.server_id).first()
-    return s.content if s else ""
+    if not s or not s.content:
+        raise HTTPException(404, "No script assigned")
 
+    try:
+        env = _build_envelope(sess.secret_plain, s.content.encode(), version=1)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[envelope] failed: {e}")
+        raise HTTPException(500, "Envelope build failed")
+
+    return JSONResponse(env)
+
+@app.get("/v2/script/manifest", dependencies=[Depends(script_limit)])
+def script_manifest(session_token: str, timestamp: int, signature: str, nonce: int, db=Depends(get_db)):
+    sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
+    if not lic.server_id:
+        raise HTTPException(404, "No script assigned")
+    s = db.query(Script).filter(Script.server_id == lic.server_id).first()
+    if not s or not s.content:
+        raise HTTPException(404, "No script assigned")
+    h = hashlib.sha256(s.content.encode()).hexdigest()
+    ts = int(time.time())
+    sig = _sign_envelope(h, 1, ts)
+    return {
+        "version": 1,
+        "sha256": h,
+        "timestamp": ts,
+        "signature": sig,
+        "min_loader_version": MIN_LOADER_VERSION,
+        "key_id": LOADER_SIGNING_KEY_ID,
+    }
+
+# ==================== RAW FILES ====================
 @app.get("/raw/{token}")
-def raw_file(token: str, request: Request, db=Depends(get_db)):
+def raw_file(
+    token: str,
+    request: Request,
+    session_token: str = None,
+    timestamp: int = None,
+    signature: str = None,
+    nonce: int = None,
+    db=Depends(get_db),
+):
     f = db.query(HostedFile).filter(HostedFile.token == token).first()
     if not f:
         raise HTTPException(404, "Not found")
+
+    # Block browser scrapes on unprotected .txt too
     ua = (request.headers.get("user-agent") or "").lower()
-    if "mozilla" in ua and "text/html" in (request.headers.get("accept") or "").lower():
+    accept = (request.headers.get("accept") or "").lower()
+    if "mozilla" in ua and "text/html" in accept:
         return HTMLResponse(BLOCK_PAGE, status_code=200)
-    return Response(content=f.content, media_type="text/plain")
+
+    if not f.is_protected:
+        return Response(content=f.content, media_type="text/plain")
+
+    # Protected — require a live signed session.
+    if not session_token or timestamp is None or not signature or nonce is None:
+        raise HTTPException(401, "Session required for protected file")
+
+    sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
+
+    try:
+        env = _build_envelope(sess.secret_plain, f.content.encode(), version=f.version or 1)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[raw-envelope] failed: {e}")
+        raise HTTPException(500, "Envelope build failed")
+
+    return JSONResponse(env)
+
+@app.get("/raw/{token}/manifest")
+def raw_manifest(
+    token: str,
+    session_token: str = None,
+    timestamp: int = None,
+    signature: str = None,
+    nonce: int = None,
+    db=Depends(get_db),
+):
+    f = db.query(HostedFile).filter(HostedFile.token == token).first()
+    if not f:
+        raise HTTPException(404, "Not found")
+
+    if not f.is_protected:
+        return {"version": f.version or 1, "sha256": None, "timestamp": int(time.time()),
+                "signature": None, "min_loader_version": MIN_LOADER_VERSION, "key_id": LOADER_SIGNING_KEY_ID}
+
+    if not session_token or timestamp is None or not signature or nonce is None:
+        raise HTTPException(401, "Session required for protected file")
+
+    sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
+    h = hashlib.sha256(f.content.encode()).hexdigest()
+    ts = int(time.time())
+    sig = _sign_envelope(h, f.version or 1, ts)
+    return {
+        "version": f.version or 1,
+        "sha256": h,
+        "timestamp": ts,
+        "signature": sig,
+        "min_loader_version": MIN_LOADER_VERSION,
+        "key_id": LOADER_SIGNING_KEY_ID,
+    }
 
 # ==================== WEB DASHBOARD ====================
 from auth import router as auth_router
@@ -791,8 +1013,7 @@ def serve_dashboard():
             return f.read()
     return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
 
-
-# ==================== CLAIM / KEY SYSTEM (public) ====================
+# ==================== CLAIM / KEY SYSTEM ====================
 def _render_claim_html(slug: str, options: list) -> str:
     cards = []
     for o in options:
@@ -867,7 +1088,6 @@ document.getElementById('list').addEventListener('click', async function(e) {{
 </body>
 </html>"""
 
-
 def _render_key_html(key: str, hours: int, already: bool = False) -> str:
     from dashboard_api import fmt_hours
     reward = fmt_hours(int(hours or 24))
@@ -912,7 +1132,6 @@ async function copyKey() {{
 </body>
 </html>"""
 
-
 @app.get("/go/{slug}", response_class=HTMLResponse)
 async def claim_page(slug: str, db=Depends(get_db)):
     from dashboard_api import Integration, PROVIDERS, fmt_hours, ensure_server_slug
@@ -938,7 +1157,6 @@ async def claim_page(slug: str, db=Depends(get_db)):
             "ready": bool(i.provider_link and i.server_id),
         })
     return HTMLResponse(_render_claim_html(slug, options))
-
 
 @app.post("/api/claim/start", dependencies=[Depends(claim_limit)])
 async def claim_start(payload: dict, db=Depends(get_db)):
@@ -979,7 +1197,6 @@ async def claim_start(payload: dict, db=Depends(get_db)):
         redirect = f"{redirect}{sep}sid={token}"
 
     return {"ok": True, "session": token, "redirect": redirect}
-
 
 @app.get("/api/claim/callback")
 async def claim_callback(
@@ -1038,7 +1255,6 @@ async def claim_callback(
     db.commit()
     return HTMLResponse(_render_key_html(key, i.key_hours or 24))
 
-
 @app.get("/api/claim/postback/lootlabs")
 def lootlabs_postback(
     click_id: str = "",
@@ -1058,13 +1274,11 @@ def lootlabs_postback(
     db.commit()
     return {"ok": True}
 
-
 @app.get("/go/done", response_class=HTMLResponse)
 def claim_done(key: str = "", hours: int = 24):
     if not key:
         return HTMLResponse("<h1>No key</h1>", status_code=400)
     return HTMLResponse(_render_key_html(key, hours))
-
 
 if __name__ == "__main__":
     import uvicorn

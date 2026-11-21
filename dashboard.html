@@ -315,7 +315,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 <div class="wrap off" data-view="Integrations">
   <div class="panel">
     <div class="ph">
-      <div class="pt"><div class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg></div><div><h1>Integrations</h1><p class="sub">Wire up an ad provider so users can earn a key by completing a link.</p></div></div>
+      <div class="pt"><div class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg></div><div><h1>Integrations</h1><p class="sub">Ad checkpoints with custom claim paths. Users complete a task and get a timed key.</p></div></div>
       <div class="top-actions">
         <button class="btn g" id="newInt"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>Add integration</button>
       </div>
@@ -365,14 +365,41 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 <div class="modal-bg" id="intbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2 id="intTitle">Add integration</h2>
-    <p class="hint">Pick the ad provider you want to use. Keys are not issued through it yet.</p>
+    <p class="hint">Wire an ad provider to a claim path. Users complete the checkpoint and get a key.</p>
     <div class="fld"><label>Provider</label><div class="provs" id="intProv">
       <button type="button" class="prov on" data-p="linkvertise"><img src="https://www.google.com/s2/favicons?sz=128&domain=linkvertise.com" alt=""><span>Linkvertise</span></button>
       <button type="button" class="prov" data-p="lootlabs"><img src="https://www.google.com/s2/favicons?sz=128&domain=lootlabs.com" alt=""><span>Lootlabs</span></button>
       <button type="button" class="prov" data-p="workink"><img src="https://www.google.com/s2/favicons?sz=128&domain=work.ink" alt=""><span>Work.ink</span></button>
     </div></div>
     <div class="fld"><label for="intName">Display name</label><input type="text" id="intName" maxlength="100" placeholder="e.g. Main Ad Gateway" autocomplete="off"></div>
-    <div class="fld"><div class="row"><div><strong>Enabled</strong><small>Off for now — nothing reads this yet.</small></div><button type="button" class="sw" id="intSw" role="switch" aria-checked="false"></button></div></div>
+    <div class="fld">
+      <label for="intSlug">Claim path</label>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="opacity:.55;font-size:.85rem">/go/</span>
+        <input type="text" id="intSlug" maxlength="48" placeholder="my-script" autocomplete="off" style="flex:1;width:100%;font-family:inherit;font-size:.9rem;color:var(--white);background:#0f0f11;border:1px solid #2a2a2e;border-radius:10px;padding:11px 13px;outline:none">
+      </div>
+      <small style="opacity:.55;font-size:.75rem;display:block;margin-top:6px">Users open this path to start the key system.</small>
+    </div>
+    <div class="fld"><label for="intSvc">Service (keys go here)</label><select class="sel full" id="intSvc"></select></div>
+    <div class="fld"><label for="intHours">Key duration (hours)</label><input type="text" id="intHours" maxlength="4" placeholder="24" autocomplete="off"></div>
+    <div class="fld">
+      <label for="intLink">Provider link</label>
+      <input type="text" id="intLink" maxlength="512" placeholder="https://linkvertise.com/... or work.ink/..." autocomplete="off">
+      <small style="opacity:.55;font-size:.75rem;display:block;margin-top:6px">
+        Create the link on the ad network. Destination should hit
+        <code style="color:var(--g)">/api/claim/callback?sid=SESSION</code>.
+        Work.ink: include <code style="color:var(--g)">{TOKEN}</code> in the destination.
+      </small>
+    </div>
+    <div class="fld">
+      <label for="intToken" id="intTokenL">API / Anti-bypass token</label>
+      <input type="text" id="intToken" maxlength="256" placeholder="Paste token (leave blank to keep existing)" autocomplete="off">
+    </div>
+    <div class="fld" id="intPubWrap" style="display:none">
+      <label for="intPub">Linkvertise publisher ID</label>
+      <input type="text" id="intPub" maxlength="32" placeholder="optional" autocomplete="off">
+    </div>
+    <div class="fld"><div class="row"><div><strong>Enabled</strong><small>When on, the claim page is live.</small></div><button type="button" class="sw" id="intSw" role="switch" aria-checked="false"></button></div></div>
     <div class="err" id="intErr"></div>
     <div class="mf"><button class="btn" id="intCancel">Cancel</button><button class="btn g" id="intSave">Add integration</button></div>
   </div>
@@ -865,6 +892,14 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   function setProv(p){
     selProv = p;
     intProv.querySelectorAll('.prov').forEach(function(b){ b.classList.toggle('on', b.dataset.p === p); });
+    var pub = document.getElementById('intPubWrap');
+    if (pub) pub.style.display = p === 'linkvertise' ? '' : 'none';
+    var tl = document.getElementById('intTokenL');
+    if (tl) {
+      if (p === 'linkvertise') tl.textContent = 'Anti-bypass token';
+      else if (p === 'lootlabs') tl.textContent = 'Lootlabs API token';
+      else tl.textContent = 'API token (optional)';
+    }
     intErr.textContent = '';
   }
   intProv.addEventListener('click', function(e){
@@ -885,6 +920,15 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     setProv(i ? i.provider : 'linkvertise');
     intName.value = i ? i.name : (PROVIDERS[i ? i.provider : 'linkvertise'].label);
     setIntOn(i ? !!i.enabled : false);
+    document.getElementById('intSlug').value = i ? (i.slug || '') : '';
+    document.getElementById('intHours').value = i ? (i.key_hours || 24) : 24;
+    document.getElementById('intLink').value = i ? (i.provider_link || '') : '';
+    document.getElementById('intToken').value = '';
+    document.getElementById('intPub').value = i ? (i.publisher_id || '') : '';
+    var sel = document.getElementById('intSvc');
+    sel.innerHTML = '<option value="">Select service…</option>' + servicesCache.map(function(s){
+      return '<option value="' + s.id + '"' + (i && i.server_id === s.id ? ' selected' : '') + '>' + esc(s.name) + '</option>';
+    }).join('');
     openM(intbg);
     setTimeout(function(){ intName.focus(); }, 50);
   }
@@ -894,14 +938,26 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   intSave.addEventListener('click', async function(){
     var name = intName.value.trim();
     if (!name) { intErr.textContent = 'Give it a name.'; intName.focus(); return; }
+    var body = {
+      provider: selProv,
+      name: name,
+      enabled: intOn,
+      slug: document.getElementById('intSlug').value.trim(),
+      key_hours: parseInt(document.getElementById('intHours').value, 10) || 24,
+      server_id: document.getElementById('intSvc').value || null,
+      provider_link: document.getElementById('intLink').value.trim(),
+      publisher_id: document.getElementById('intPub').value.trim() || undefined
+    };
+    var tok = document.getElementById('intToken').value.trim();
+    if (tok) body.api_token = tok;
     intSave.disabled = true;
     try {
       if (editingInt) {
-        await api('/api/integrations/' + editingInt.id, { method: 'PATCH', body: { provider: selProv, name: name, enabled: intOn } });
+        await api('/api/integrations/' + editingInt.id, { method: 'PATCH', body: body });
         toast('Integration updated', name);
       } else {
-        await api('/api/integrations', { method: 'POST', body: { provider: selProv, name: name, enabled: intOn } });
-        toast('Integration added', PROVIDERS[selProv].label);
+        var r = await api('/api/integrations', { method: 'POST', body: body });
+        toast('Integration added', r && r.claim_url ? ('Claim: ' + r.claim_url) : PROVIDERS[selProv].label);
       }
       closeM(intbg);
       await loadIntegrations();
@@ -915,17 +971,23 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   function renderIntegrations(){
     if (!intCache.length) {
       intGrid.innerHTML = '<div class="empty"><div class="tile">' + ICO.grid + '</div>'
-        + '<h3>No integrations yet</h3><p>Add an ad provider to start handing out keys through it.</p>'
+        + '<h3>No integrations yet</h3><p>Add an ad provider, set a claim path, and hand out keys after checkpoints.</p>'
         + '<button class="btn g" data-a="new">' + ICO.plus + 'Add integration</button></div>';
       return;
     }
     intGrid.innerHTML = intCache.map(function(i){
+      var claim = i.claim_url
+        ? '<div class="sid"><button class="reveal" data-a="copyclaim" title="Copy claim URL"><span>' +
+            esc(location.origin + i.claim_url) + '</span></button></div>'
+        : '';
       return '<div class="sc' + (i.enabled ? '' : ' off') + '" data-id="' + i.id + '">'
         + '<div class="sc-top"><div class="ih"><div class="pico">' + pIcon(i.provider, 'plogo') + '</div><div>'
-        + '<h3>' + esc(i.name) + '</h3><small>' + esc(i.provider_label) + '</small></div></div>'
+        + '<h3>' + esc(i.name) + '</h3><small>' + esc(i.provider_label) + (i.slug ? ' · /go/' + esc(i.slug) : '') + '</small></div></div>'
         + '<div class="more"><button class="ib" data-a="more" aria-label="More">' + ICO.dots + '</button>'
         + '<div class="menu"><button class="danger" data-a="del">Delete</button></div></div></div>'
-        + '<div class="meta"><span>' + ICO.link + '<b>' + (i.enabled ? 'Enabled' : 'Disabled') + '</b> status</span></div>'
+        + claim
+        + '<div class="meta"><span>' + ICO.link + '<b>' + (i.enabled ? 'Enabled' : 'Disabled') + '</b></span>'
+        + '<span>' + ICO.key + '<b>' + (i.key_hours || 24) + 'h</b> key</span></div>'
         + '<div class="sc-div"></div>'
         + '<div class="sc-acts"><button class="ab wide" data-a="edit">' + ICO.pen + 'Edit</button></div></div>';
     }).join('');
@@ -951,6 +1013,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
       return;
     }
     closeMenus();
+    if (a === 'copyclaim') { copy(location.origin + i.claim_url, 'Claim URL copied'); return; }
     if (a === 'edit') { openInt(i); return; }
     if (a === 'del') {
       if (!confirm('Delete ' + i.name + '?')) return;

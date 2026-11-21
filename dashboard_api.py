@@ -1,5 +1,5 @@
 # dashboard_api.py — Real backend for the dashboard.
-# Owns: /api/services, /api/keys, /api/blocklists.
+# Owns: /api/overview, /api/services, /api/keys, /api/blocklists.
 # Uses the same tables the Discord bot writes to. No mock data.
 # Key creation is Discord-only (/generatekey, /whitelist). Dashboard is read + manage.
 #
@@ -7,10 +7,12 @@
 #   DISCORD_BOT_TOKEN  — optional; enables real Discord avatar lookup for keys.
 
 import os
+import time
 import secrets
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session as OrmSession
 
 from main import (
@@ -28,6 +30,11 @@ from auth import get_current_user, User
 router = APIRouter(prefix="/api")
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# discord_id -> (fetched_at, username, avatar_url)
+_AV_CACHE: dict[int, tuple[float, str | None, str | None]] = {}
+_AV_TTL_OK = 600
+_AV_TTL_MISS = 60
 
 
 # ==================== DB DEP ====================
@@ -52,21 +59,105 @@ def _cdn_avatar(discord_id, avatar_hash):
 
 
 async def _fetch_discord_user(discord_id):
-    """Best-effort real pfp lookup via bot token. Returns (username, avatar_url) or (None, None)."""
+    """Best-effort pfp lookup via bot token, memoised. Returns (username, avatar_url)."""
     if not BOT_TOKEN or not discord_id:
         return (None, None)
+
+    try:
+        did = int(discord_id)
+    except (TypeError, ValueError):
+        return (None, None)
+
+    hit = _AV_CACHE.get(did)
+    if hit:
+        age = time.time() - hit[0]
+        if (hit[1] or hit[2]) and age < _AV_TTL_OK:
+            return (hit[1], hit[2])
+        if not (hit[1] or hit[2]) and age < _AV_TTL_MISS:
+            return (None, None)
+
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
-                f"https://discord.com/api/v10/users/{discord_id}",
+                f"https://discord.com/api/v10/users/{did}",
                 headers={"Authorization": f"Bot {BOT_TOKEN}"},
             )
             if r.status_code != 200:
+                _AV_CACHE[did] = (time.time(), None, None)
                 return (None, None)
             u = r.json()
-            return (u.get("username"), _cdn_avatar(u.get("id"), u.get("avatar")))
+            name = u.get("username")
+            av = _cdn_avatar(u.get("id"), u.get("avatar"))
+            _AV_CACHE[did] = (time.time(), name, av)
+            return (name, av)
     except Exception:
+        _AV_CACHE[did] = (time.time(), None, None)
         return (None, None)
+
+
+# ==================== OVERVIEW ====================
+@router.get("/overview")
+def overview(range_days: int = 7, user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+    try:
+        range_days = int(range_days)
+    except (TypeError, ValueError):
+        range_days = 7
+    range_days = max(1, min(90, range_days))
+
+    empty = {"users": 0, "active_keys": 0, "auth_requests": 0,
+             "success_rate": 0.0, "series": [], "activity": []}
+
+    server_ids = _user_server_ids(db, user.id)
+    if not server_ids:
+        return empty
+
+    lic_ids = [r[0] for r in db.query(License.id).filter(License.server_id.in_(server_ids)).all()]
+    if not lic_ids:
+        return empty
+
+    base = db.query(License).filter(License.server_id.in_(server_ids))
+    users = base.with_entities(func.count(func.distinct(License.redeemed_by))).scalar() or 0
+    active_keys = base.filter(License.status == "active").count()
+
+    since = (datetime.utcnow() - timedelta(days=range_days - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+
+    logs = db.query(AuthLog).filter(AuthLog.license_id.in_(lic_ids), AuthLog.created_at >= since)
+    total = logs.count()
+    ok = logs.filter(AuthLog.success == True).count()
+
+    buckets = {
+        r[0]: r[1] for r in db.query(func.date(AuthLog.created_at), func.count())
+        .filter(AuthLog.license_id.in_(lic_ids), AuthLog.created_at >= since)
+        .group_by(func.date(AuthLog.created_at)).all()
+    }
+    series = []
+    for i in range(range_days):
+        d = (since + timedelta(days=i)).date()
+        series.append({"date": d.isoformat(), "count": int(buckets.get(d, 0))})
+
+    recent = (db.query(AuthLog).filter(AuthLog.license_id.in_(lic_ids))
+              .order_by(AuthLog.created_at.desc()).limit(8).all())
+    names = {}
+    ids = [a.license_id for a in recent if a.license_id]
+    if ids:
+        names = {r[0]: r[1] for r in db.query(License.id, License.redeemed_name)
+                 .filter(License.id.in_(ids)).all()}
+
+    return {
+        "users": users,
+        "active_keys": active_keys,
+        "auth_requests": total,
+        "success_rate": round(ok / total * 100, 1) if total else 0.0,
+        "series": series,
+        "activity": [{
+            "event": a.event_type or "unknown",
+            "success": bool(a.success),
+            "name": names.get(a.license_id) or "Unknown user",
+            "reason": a.failure_reason,
+            "at": a.created_at.isoformat() if a.created_at else None,
+        } for a in recent],
+    }
 
 
 # ==================== SERVICES ====================
@@ -207,7 +298,7 @@ async def list_keys(user: User = Depends(get_current_user), db: OrmSession = Dep
             AuthLog.success == True,
         ).count()
 
-        # Discord identity — real pfp via bot token, fallback to default avatar.
+        # Discord identity — cached pfp via bot token, fallback to default avatar.
         username = lic.redeemed_name
         avatar_url = None
         if lic.redeemed_by:

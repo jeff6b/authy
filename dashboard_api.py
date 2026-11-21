@@ -1,11 +1,15 @@
 # dashboard_api.py — Real backend for the dashboard.
 # Owns: /api/overview, /api/services, /api/keys, /api/blocklists, /api/integrations.
-# Key creation is Discord-only (/generatekey, /whitelist). Dashboard is read + manage.
+# Key creation is Discord-only (/generatekey, /whitelist) EXCEPT freemium claim keys from integrations.
+# Dashboard is read + manage.
 
 import asyncio
 import os
+import re
 import secrets
 from datetime import datetime, timedelta
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
 from sqlalchemy.orm import Session as OrmSession
@@ -20,6 +24,7 @@ from main import (
     Session,
     AuthLog,
     Blocklist,
+    sha256,
 )
 from auth import get_current_user, User
 from discord_media import fetch_discord_user, fetch_guild_media
@@ -28,7 +33,7 @@ from discord_media import fetch_discord_user, fetch_guild_media
 router = APIRouter(prefix="/api")
 
 
-# ==================== INTEGRATIONS (not wired to anything yet) ====================
+# ==================== INTEGRATIONS ====================
 PROVIDERS = {
     "linkvertise": "Linkvertise",
     "lootlabs":    "Lootlabs",
@@ -38,15 +43,56 @@ PROVIDERS = {
 
 class Integration(Base):
     __tablename__ = "integrations"
-    id          = Column(Integer, primary_key=True)
-    user_id     = Column(Integer, nullable=False, index=True)
-    provider    = Column(String(32), nullable=False)
-    name        = Column(String(100), nullable=False)
-    enabled     = Column(Boolean, default=False)
-    created_at  = Column(DateTime, default=datetime.utcnow)
+    id              = Column(Integer, primary_key=True)
+    user_id         = Column(Integer, nullable=False, index=True)
+    provider        = Column(String(32), nullable=False)
+    name            = Column(String(100), nullable=False)
+    enabled         = Column(Boolean, default=False)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    # Claim / monetization
+    slug            = Column(String(64), nullable=True, index=True)
+    server_id       = Column(Integer, nullable=True)
+    key_hours       = Column(Integer, default=24)
+    provider_link   = Column(String(512), nullable=True)
+    api_token       = Column(String(256), nullable=True)
+    publisher_id    = Column(String(64), nullable=True)
 
 
-Base.metadata.create_all(bind=engine, tables=[Integration.__table__])
+class ClaimSession(Base):
+    __tablename__ = "claim_sessions"
+    id              = Column(Integer, primary_key=True)
+    token           = Column(String(64), unique=True, nullable=False, index=True)
+    integration_id  = Column(Integer, nullable=False)
+    completed       = Column(Boolean, default=False)
+    license_id      = Column(Integer, nullable=True)
+    key_plain       = Column(String(64), nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    expires_at      = Column(DateTime, nullable=False)
+
+
+Base.metadata.create_all(bind=engine, tables=[Integration.__table__, ClaimSession.__table__])
+
+
+# Soft migrations for existing deployments
+def _migrate_integrations():
+    from sqlalchemy import text
+    stmts = [
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS server_id INTEGER",
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS key_hours INTEGER DEFAULT 24",
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS provider_link VARCHAR(512)",
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS api_token VARCHAR(256)",
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS publisher_id VARCHAR(64)",
+    ]
+    for s in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(s))
+        except Exception as e:
+            print(f"[dashboard_api.migrate] skipped: {s} -> {e}")
+
+
+_migrate_integrations()
 
 
 # ==================== DB DEP ====================
@@ -61,6 +107,78 @@ def get_db():
 # ==================== HELPERS ====================
 def _user_server_ids(db, user_id):
     return [r[0] for r in db.query(Server.id).filter(Server.user_id == user_id).all()]
+
+
+def _slugify(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\-]", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s[:48] or secrets.token_hex(4)
+
+
+def fmt_hours(h: int) -> str:
+    h = int(h or 24)
+    if h < 24:
+        return f"{h}h"
+    d, r = divmod(h, 24)
+    return f"{d}d" if not r else f"{d}d {r}h"
+
+
+CLAIM_TTL_MIN = 30
+
+
+async def verify_linkvertise(api_token: str, hash_val: str) -> bool:
+    if not api_token or not hash_val:
+        return False
+    url = "https://publisher.linkvertise.com/api/v1/anti_bypassing"
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.post(url, params={"token": api_token, "hash": hash_val})
+            text = (r.text or "").strip().upper()
+            if text in ("TRUE", "1", "YES"):
+                return True
+            try:
+                j = r.json()
+                return bool(j is True or j.get("valid") or j.get("success"))
+            except Exception:
+                return False
+    except Exception as e:
+        print(f"[claim] linkvertise verify error: {e}")
+        return False
+
+
+async def verify_workink(token: str) -> bool:
+    if not token:
+        return False
+    url = f"https://work.ink/_api/v2/token/isValid/{token}?deleteToken=1"
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(url)
+            return bool(r.json().get("valid"))
+    except Exception as e:
+        print(f"[claim] workink verify error: {e}")
+        return False
+
+
+def issue_claim_key(db, integration: Integration) -> tuple:
+    """Create a License for this integration's server. Returns (key_plain, license_id)."""
+    if not integration.server_id:
+        raise HTTPException(400, "Integration has no service linked")
+    raw = secrets.token_hex(16).upper()
+    key = "-".join(raw[i:i + 4] for i in range(0, 16, 4))
+    expires = datetime.utcnow() + timedelta(hours=integration.key_hours or 24)
+    lic = License(
+        server_id=integration.server_id,
+        key_hash=sha256(key),
+        key_plain=key,
+        status="active",
+        expires_at=expires,
+        max_devices=1,
+    )
+    db.add(lic)
+    db.commit()
+    db.refresh(lic)
+    return key, lic.id
 
 
 # ==================== OVERVIEW ====================
@@ -332,7 +450,7 @@ def delete_key(license_id: int, user: User = Depends(get_current_user), db: OrmS
     return {"ok": True}
 
 
-# ==================== INTEGRATIONS ====================
+# ==================== INTEGRATIONS CRUD ====================
 @router.get("/integrations")
 def list_integrations(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     rows = (
@@ -348,6 +466,13 @@ def list_integrations(user: User = Depends(get_current_user), db: OrmSession = D
             "provider_label": PROVIDERS.get(i.provider, i.provider),
             "name": i.name,
             "enabled": bool(i.enabled),
+            "slug": i.slug or "",
+            "server_id": i.server_id,
+            "key_hours": i.key_hours or 24,
+            "provider_link": i.provider_link or "",
+            "has_token": bool(i.api_token),
+            "publisher_id": i.publisher_id or "",
+            "claim_url": f"/go/{i.slug}" if i.slug else None,
             "created_at": i.created_at.isoformat() if i.created_at else None,
         }
         for i in rows
@@ -360,16 +485,41 @@ def create_integration(payload: dict, user: User = Depends(get_current_user), db
     if provider not in PROVIDERS:
         raise HTTPException(400, "Pick a provider")
     name = (payload.get("name") or "").strip() or PROVIDERS[provider]
+    slug = _slugify(payload.get("slug") or name)
+    exists = db.query(Integration).filter(Integration.user_id == user.id, Integration.slug == slug).first()
+    if exists:
+        slug = f"{slug}-{secrets.token_hex(2)}"
+
+    try:
+        key_hours = int(payload.get("key_hours") or 24)
+    except (TypeError, ValueError):
+        key_hours = 24
+    key_hours = max(1, min(720, key_hours))
+
+    server_id = payload.get("server_id")
+    if server_id is not None and server_id != "":
+        server_id = int(server_id)
+        if server_id not in _user_server_ids(db, user.id):
+            raise HTTPException(403, "Not your service")
+    else:
+        server_id = None
+
     i = Integration(
         user_id=user.id,
         provider=provider,
         name=name[:100],
         enabled=bool(payload.get("enabled")),
+        slug=slug,
+        server_id=server_id,
+        key_hours=key_hours,
+        provider_link=(payload.get("provider_link") or "").strip()[:512] or None,
+        api_token=(payload.get("api_token") or "").strip()[:256] or None,
+        publisher_id=(payload.get("publisher_id") or "").strip()[:64] or None,
     )
     db.add(i)
     db.commit()
     db.refresh(i)
-    return {"ok": True, "id": i.id}
+    return {"ok": True, "id": i.id, "slug": i.slug, "claim_url": f"/go/{i.slug}"}
 
 
 @router.patch("/integrations/{integration_id}")
@@ -379,6 +529,7 @@ def update_integration(integration_id: int, payload: dict, user: User = Depends(
         raise HTTPException(404, "Integration not found")
     if i.user_id != user.id:
         raise HTTPException(403, "Not yours")
+
     if "provider" in payload:
         p = (payload["provider"] or "").strip().lower()
         if p not in PROVIDERS:
@@ -391,8 +542,41 @@ def update_integration(integration_id: int, payload: dict, user: User = Depends(
         i.name = n[:100]
     if "enabled" in payload:
         i.enabled = bool(payload["enabled"])
+    if "slug" in payload:
+        slug = _slugify(payload["slug"])
+        clash = db.query(Integration).filter(
+            Integration.user_id == user.id,
+            Integration.slug == slug,
+            Integration.id != i.id,
+        ).first()
+        if clash:
+            raise HTTPException(409, "Slug already in use")
+        i.slug = slug
+    if "key_hours" in payload:
+        try:
+            i.key_hours = max(1, min(720, int(payload["key_hours"] or 24)))
+        except (TypeError, ValueError):
+            pass
+    if "server_id" in payload:
+        sid = payload["server_id"]
+        if sid is None or sid == "":
+            i.server_id = None
+        else:
+            sid = int(sid)
+            if sid not in _user_server_ids(db, user.id):
+                raise HTTPException(403, "Not your service")
+            i.server_id = sid
+    if "provider_link" in payload:
+        i.provider_link = (payload["provider_link"] or "").strip()[:512] or None
+    if "api_token" in payload:
+        tok = (payload["api_token"] or "").strip()
+        if tok:
+            i.api_token = tok[:256]
+    if "publisher_id" in payload:
+        i.publisher_id = (payload["publisher_id"] or "").strip()[:64] or None
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "slug": i.slug, "claim_url": f"/go/{i.slug}" if i.slug else None}
 
 
 @router.delete("/integrations/{integration_id}")

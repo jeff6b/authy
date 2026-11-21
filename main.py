@@ -836,6 +836,28 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
     db.commit()
     return {"valid": True, "alive": True}
 
+
+
+@app.get("/v2/debug/signcheck")
+def debug_signcheck():
+    import os
+    try:
+        _load_signing_key()
+        return {
+            "ok": True,
+            "pubkey": _pubkey_hex(),
+            "key_id": LOADER_SIGNING_KEY_ID,
+            "env_set": bool(os.getenv("LOADER_SIGNING_KEY")),
+            "crypto_ok": _CRYPTO_OK,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "env_set": bool(os.getenv("LOADER_SIGNING_KEY")),
+            "crypto_ok": _CRYPTO_OK,
+        }
+
 @app.post("/v2/auth/tamper")
 def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
     ip = _client_ip(request)

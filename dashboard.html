@@ -76,7 +76,8 @@ h1{margin:0;font-size:1.75rem;letter-spacing:-.03em;color:var(--white);font-weig
 .sc-top h3{margin:0;font-size:1.02rem;color:var(--white);font-weight:700;word-break:break-word}
 .ih{display:flex;align-items:center;gap:12px;min-width:0}
 .ih small{font-size:.78rem;display:block;margin-top:2px}
-.ptile{width:42px;height:42px;border-radius:11px;background:#0f0f11;border:1px solid var(--card-line);display:flex;align-items:center;justify-content:center;flex:none}
+.ptile{width:42px;height:42px;border-radius:11px;background:#0f0f11;border:1px solid var(--card-line);display:flex;align-items:center;justify-content:center;flex:none;overflow:hidden}
+.ptile img{width:100%;height:100%;object-fit:cover}
 .sid{display:flex;align-items:center;gap:8px;min-width:0}
 .sid code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.78rem}
 .sc p{margin:0;font-size:.86rem;line-height:1.5}
@@ -109,8 +110,11 @@ h1{margin:0;font-size:1.75rem;letter-spacing:-.03em;color:var(--white);font-weig
 .provs.two{grid-template-columns:1fr 1fr}
 .prov{display:flex;flex-direction:column;align-items:center;gap:9px;padding:14px 6px;border-radius:11px;border:1px solid #2a2a2e;background:#0f0f11;color:#7d8686;font-family:inherit;font-size:.8rem;font-weight:600;cursor:pointer;transition:.15s}
 .prov svg{width:22px;height:22px}
+.prov img{width:24px;height:24px;object-fit:contain}
 .prov:hover{border-color:#3a3a40}
 .prov.on{border-color:#e6eded;color:#fff}
+.pico{width:42px;height:42px;border-radius:11px;background:#0f0f11;border:1px solid var(--card-line);display:flex;align-items:center;justify-content:center;flex:none}
+.pico img{width:22px;height:22px;object-fit:contain}
 .sel{appearance:none;-webkit-appearance:none;font-family:inherit;font-size:.85rem;font-weight:600;color:var(--white);height:40px;padding:0 38px 0 14px;border-radius:10px;border:1px solid var(--card-line);background:#0f0f11 url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23A6B1B1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>") no-repeat right 12px center;cursor:pointer;outline:none}
 .sel:focus{border-color:var(--g)}
 .sel.full{width:100%}
@@ -236,7 +240,7 @@ h1{margin:0;font-size:1.75rem;letter-spacing:-.03em;color:var(--white);font-weig
     <a><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg></span>Services</a>
     <a><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 21 9.6-9.6"/><path d="m7.5 15.5 2.3 2.3a1 1 0 0 1 0 1.4l-2.1 2.1a1 1 0 0 1-1.4 0L4 19"/><circle cx="15.5" cy="7.5" r="5.5"/></svg></span>Keys</a>
     <div class="group">Tools</div>
-    <a><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg></span>Discord Bot</a>
+    <a><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg></span>Integrations</a>
     <a><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22a14.48 14.48 0 01-4.008-10C7.993 9.136 9 5.258 11 2.05A10 10 0 0012 22"/><path d="m15.172 3.172 5.656 5.656"/><path d="M15.86 14a14.5 14.5 0 01-3.859 8 10 10 0 009.949-9"/><path d="M2 12h10.5"/><circle cx="18" cy="6" r="4"/></svg></span>Blocklists</a>
   </nav>
   <div class="pinned bottom">
@@ -285,7 +289,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 <div class="wrap off" data-view="Services">
   <div class="panel">
     <div class="ph">
-      <div class="pt"><div class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg></div><div><h1>Services</h1><p class="sub">Each service is a Server with its own API key. Create one here, then link it in Discord with /link.</p></div></div>
+      <div class="pt"><div class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg></div><div><h1>Services</h1><p class="sub">Each service is a Server with its own API key. Create one here, then link it to your Discord server.</p></div></div>
       <div class="top-actions">
         <button class="btn g" id="newSvc"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>Create service</button>
       </div>
@@ -308,14 +312,15 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   </div>
 </div>
 
-<div class="wrap off" data-view="Discord Bot">
+<div class="wrap off" data-view="Integrations">
   <div class="panel">
     <div class="ph">
-      <div class="pt"><div class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg></div><div><h1>Discord Bot</h1><p class="sub">Add the bot to your servers and choose where it stays active.</p></div></div>
-      <div class="top-actions"><button class="btn g" id="newBot"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>Add server</button></div>
+      <div class="pt"><div class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg></div><div><h1>Integrations</h1><p class="sub">Wire up an ad provider so users can earn a key by completing a link. Not wired to the backend yet.</p></div></div>
+      <div class="top-actions">
+        <button class="btn g" id="newInt"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>Add integration</button>
+      </div>
     </div>
-    <div class="kstats" id="bStats"></div>
-    <div class="list" id="botGrid"></div>
+    <div class="list" id="intGrid"></div>
   </div>
 </div>
 
@@ -337,7 +342,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 <div class="modal-bg" id="svcbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2 id="svcTitle">Create service</h2>
-    <p class="hint">Each service gets its own API key. Link it in Discord afterwards with /link.</p>
+    <p class="hint">Each service gets its own API key. Link it to a Discord server afterwards.</p>
     <div class="fld"><label for="svcName">Service name</label><input type="text" id="svcName" maxlength="100" placeholder="e.g. Main Loader" autocomplete="off"></div>
     <div class="fld"><label for="svcDesc">Description</label><textarea id="svcDesc" maxlength="500" placeholder="What is this service for?"></textarea></div>
     <div class="fld"><div class="row"><div><strong>Freemium</strong><small id="svcFmHint">Off. Only key holders can use this service.</small></div><button type="button" class="sw" id="svcSw" role="switch" aria-checked="false"></button></div></div>
@@ -347,14 +352,29 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   </div>
 </div>
 
-<div class="modal-bg" id="botbg">
+<div class="modal-bg" id="linkbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2>Link a Discord server</h2>
-    <p class="hint">Run /create in Discord to mint an API key, then paste it here with the server ID.</p>
-    <div class="fld"><label for="bKey">API key</label><input type="text" id="bKey" placeholder="Paste the key from /create" autocomplete="off"></div>
-    <div class="fld"><label for="bGuild">Server ID</label><input type="text" id="bGuild" maxlength="20" placeholder="e.g. 123456789012345678" autocomplete="off"></div>
-    <div class="err" id="bErr"></div>
-    <div class="mf"><button class="btn" id="bCancel">Cancel</button><button class="btn g" id="bSave">Link server</button></div>
+    <p class="hint" id="linkHint">Paste the server ID you want this service bound to.</p>
+    <div class="fld"><label for="linkGuild">Server ID</label><input type="text" id="linkGuild" maxlength="20" placeholder="e.g. 123456789012345678" autocomplete="off"></div>
+    <div class="err" id="linkErr"></div>
+    <div class="mf"><button class="btn" id="linkCancel">Cancel</button><button class="btn g" id="linkSave">Link server</button></div>
+  </div>
+</div>
+
+<div class="modal-bg" id="intbg">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="intTitle">Add integration</h2>
+    <p class="hint">Pick the ad provider you want to use. Keys are not issued through it yet.</p>
+    <div class="fld"><label>Provider</label><div class="provs" id="intProv">
+      <button type="button" class="prov on" data-p="linkvertise"><img src="https://www.google.com/s2/favicons?sz=128&domain=linkvertise.com" alt=""><span>Linkvertise</span></button>
+      <button type="button" class="prov" data-p="lootlabs"><img src="https://www.google.com/s2/favicons?sz=128&domain=lootlabs.com" alt=""><span>Lootlabs</span></button>
+      <button type="button" class="prov" data-p="workink"><img src="https://www.google.com/s2/favicons?sz=128&domain=work.ink" alt=""><span>Work.ink</span></button>
+    </div></div>
+    <div class="fld"><label for="intName">Display name</label><input type="text" id="intName" maxlength="100" placeholder="e.g. Main Ad Gateway" autocomplete="off"></div>
+    <div class="fld"><div class="row"><div><strong>Enabled</strong><small>Off for now — nothing reads this yet.</small></div><button type="button" class="sw" id="intSw" role="switch" aria-checked="false"></button></div></div>
+    <div class="err" id="intErr"></div>
+    <div class="mf"><button class="btn" id="intCancel">Cancel</button><button class="btn g" id="intSave">Add integration</button></div>
   </div>
 </div>
 
@@ -399,8 +419,21 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     pen:   I('<path d="M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z"/><path d="m15 5 4 4"/>'),
     bot:   I('<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>'),
     users: I('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'),
+    grid:  I('<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>'),
     plus:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>'
   };
+
+  var PROVIDERS = {
+    linkvertise: { label: 'Linkvertise', domain: 'linkvertise.com' },
+    lootlabs:    { label: 'Lootlabs',    domain: 'lootlabs.com' },
+    workink:     { label: 'Work.ink',    domain: 'work.ink' }
+  };
+  function pIcon(p, cls){
+    var d = PROVIDERS[p];
+    if (!d) return '<span class="' + cls + ' lf">?</span>';
+    return '<img class="' + cls + '" src="https://www.google.com/s2/favicons?sz=128&domain=' +
+      encodeURIComponent(d.domain) + '" alt="">';
+  }
 
   async function api(path, opts){
     opts = opts || {};
@@ -614,7 +647,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
         toast('Service updated', name);
       } else {
         var r = await api('/api/services', { method: 'POST', body: body });
-        toast('Service created', 'API key ready — link it in Discord');
+        toast('Service created', 'API key ready — link it to a server');
         if (r && r.api_key) copy(r.api_key, 'API key copied');
       }
       closeM(svcbg);
@@ -635,9 +668,15 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     }
     svcGrid.innerHTML = servicesCache.map(function(s){
       var days = (s.freemium_days || []).join(', ');
+      var logo = s.icon_url
+        ? '<img src="' + esc(s.icon_url) + '" alt="">'
+        : ICO.bot;
+      var label = s.linked
+        ? 'Linked · ' + esc(s.guild_name || s.guild_id)
+        : 'Not linked';
       return '<div class="sc" data-id="' + s.id + '">'
-        + '<div class="sc-top"><div class="ih"><div class="ptile">' + ICO.bot + '</div><div>'
-        + '<h3>' + esc(s.name) + '</h3><small>' + (s.linked ? 'Linked to ' + esc(s.guild_id) : 'Not linked') + '</small></div></div>'
+        + '<div class="sc-top"><div class="ih"><div class="ptile">' + logo + '</div><div>'
+        + '<h3>' + esc(s.name) + '</h3><small>' + label + '</small></div></div>'
         + '<div class="more"><button class="ib" data-a="more" aria-label="More">' + ICO.dots + '</button>'
         + '<div class="menu"><button data-a="rotate">Rotate API key</button><button class="danger" data-a="del">Delete</button></div></div></div>'
         + '<div class="sid"><button class="reveal" data-a="copykey" title="Click to copy"><span>' + esc(s.api_key) + '</span></button></div>'
@@ -645,7 +684,10 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
         + '<div class="meta"><span>' + ICO.key + '<b>' + s.keys + '</b> keys</span>'
         + (s.freemium ? '<span>' + ICO.cal + esc(days || 'No days set') + '</span>' : '<span>' + ICO.cal + 'Paid only</span>') + '</div>'
         + '<div class="sc-div"></div>'
-        + '<div class="sc-acts"><button class="ab wide" data-a="link">' + ICO.link + 'Link in Discord</button>'
+        + '<div class="sc-acts">'
+        + (s.linked
+            ? '<button class="ab wide" data-a="unlink">' + ICO.power + 'Unlink</button>'
+            : '<button class="ab wide" data-a="link">' + ICO.link + 'Link server</button>')
         + '<button class="ab" data-a="edit">' + ICO.pen + 'Edit</button></div></div>';
     }).join('');
   }
@@ -654,6 +696,30 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     try { servicesCache = (await api('/api/services')) || []; } catch (e) { servicesCache = []; }
     renderServices();
   }
+
+  var linkbg = document.getElementById('linkbg');
+  var linkGuild = document.getElementById('linkGuild');
+  var linkErr = document.getElementById('linkErr');
+  var linkingSvc = null;
+
+  document.getElementById('linkCancel').addEventListener('click', function(){ closeM(linkbg); });
+  document.getElementById('linkSave').addEventListener('click', async function(){
+    if (!linkingSvc) return;
+    var gid = linkGuild.value.trim();
+    if (!gid) { linkErr.textContent = 'Enter the server ID.'; return; }
+    if (!/^\d+$/.test(gid)) { linkErr.textContent = 'Server ID must be numeric.'; return; }
+    this.disabled = true;
+    try {
+      await api('/api/servers/link', { method: 'POST', body: { api_key: linkingSvc.api_key, guild_id: gid } });
+      closeM(linkbg);
+      toast('Server linked');
+      await loadServices();
+    } catch (e) {
+      linkErr.textContent = String(e.message || e).slice(0, 200);
+    } finally {
+      this.disabled = false;
+    }
+  });
 
   svcGrid.addEventListener('click', async function(e){
     var b = e.target.closest('button');
@@ -675,7 +741,21 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 
     if (a === 'copykey') { copy(s.api_key, 'API key copied'); return; }
     if (a === 'edit') { openSvc(s); return; }
-    if (a === 'link') { copy(s.api_key, 'Run /link in Discord and paste this key'); return; }
+    if (a === 'link') {
+      linkingSvc = s;
+      linkGuild.value = '';
+      linkErr.textContent = '';
+      document.getElementById('linkHint').textContent = 'Paste the server ID for ' + s.name + '.';
+      openM(linkbg);
+      setTimeout(function(){ linkGuild.focus(); }, 50);
+      return;
+    }
+    if (a === 'unlink') {
+      if (!confirm('Unlink ' + s.name + '? The bot stops working there.')) return;
+      try { await api('/api/servers/' + s.id, { method: 'DELETE' }); toast('Unlinked'); await loadServices(); }
+      catch (err) { alert('Unlink failed: ' + (err.message || err)); }
+      return;
+    }
     if (a === 'rotate') {
       if (!confirm('Rotate the API key for ' + s.name + '? The old key stops working immediately.')) return;
       try {
@@ -772,76 +852,98 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     }
   });
 
-  /* ---------- discord bot ---------- */
-  var botGrid = document.getElementById('botGrid');
-  var bStats = document.getElementById('bStats');
-  var botbg = document.getElementById('botbg');
-  var bErr = document.getElementById('bErr');
-  var serverCache = [];
+  /* ---------- integrations ---------- */
+  var intGrid = document.getElementById('intGrid');
+  var intbg = document.getElementById('intbg');
+  var intProv = document.getElementById('intProv');
+  var intName = document.getElementById('intName');
+  var intSw = document.getElementById('intSw');
+  var intErr = document.getElementById('intErr');
+  var intSave = document.getElementById('intSave');
+  var intCache = [], editingInt = null, selProv = 'linkvertise', intOn = false;
 
-  function renderBot(){
-    var linked = serverCache.filter(function(s){ return s.linked; }).length;
-    bStats.innerHTML = '<div class="ks"><span>Servers</span><b>' + serverCache.length + '</b></div>'
-      + '<div class="ks"><span>Linked</span><b>' + linked + '</b></div>'
-      + '<div class="ks"><span>Unlinked</span><b>' + (serverCache.length - linked) + '</b></div>';
-    if (!serverCache.length) {
-      botGrid.innerHTML = '<div class="empty"><div class="tile">' + ICO.bot + '</div><h3>No servers yet</h3>'
-        + '<p>Run /create in Discord to mint an API key, then paste it here.</p>'
-        + '<button class="btn g" data-a="new">' + ICO.plus + 'Add server</button></div>';
+  function setProv(p){
+    selProv = p;
+    intProv.querySelectorAll('.prov').forEach(function(b){ b.classList.toggle('on', b.dataset.p === p); });
+    intErr.textContent = '';
+  }
+  intProv.addEventListener('click', function(e){
+    var b = e.target.closest('.prov');
+    if (b) setProv(b.dataset.p);
+  });
+  function setIntOn(v){
+    intOn = v;
+    intSw.classList.toggle('on', v);
+    intSw.setAttribute('aria-checked', String(v));
+  }
+  intSw.addEventListener('click', function(){ setIntOn(!intOn); });
+
+  function openInt(i){
+    editingInt = i || null;
+    document.getElementById('intTitle').textContent = i ? 'Edit integration' : 'Add integration';
+    intSave.textContent = i ? 'Save changes' : 'Add integration';
+    setProv(i ? i.provider : 'linkvertise');
+    intName.value = i ? i.name : (PROVIDERS[i ? i.provider : 'linkvertise'].label);
+    setIntOn(i ? !!i.enabled : false);
+    openM(intbg);
+    setTimeout(function(){ intName.focus(); }, 50);
+  }
+  document.getElementById('intCancel').addEventListener('click', function(){ closeM(intbg); });
+  document.getElementById('newInt').addEventListener('click', function(){ openInt(null); });
+
+  intSave.addEventListener('click', async function(){
+    var name = intName.value.trim();
+    if (!name) { intErr.textContent = 'Give it a name.'; intName.focus(); return; }
+    intSave.disabled = true;
+    try {
+      if (editingInt) {
+        await api('/api/integrations/' + editingInt.id, { method: 'PATCH', body: { provider: selProv, name: name, enabled: intOn } });
+        toast('Integration updated', name);
+      } else {
+        await api('/api/integrations', { method: 'POST', body: { provider: selProv, name: name, enabled: intOn } });
+        toast('Integration added', PROVIDERS[selProv].label);
+      }
+      closeM(intbg);
+      await loadIntegrations();
+    } catch (e) {
+      intErr.textContent = String(e.message || e).slice(0, 200);
+    } finally {
+      intSave.disabled = false;
+    }
+  });
+
+  function renderIntegrations(){
+    if (!intCache.length) {
+      intGrid.innerHTML = '<div class="empty"><div class="tile">' + ICO.grid + '</div>'
+        + '<h3>No integrations yet</h3><p>Add an ad provider to start handing out keys through it.</p>'
+        + '<button class="btn g" data-a="new">' + ICO.plus + 'Add integration</button></div>';
       return;
     }
-    botGrid.innerHTML = serverCache.map(function(s){
-      var initial = (s.guild_name || ('Server ' + s.id)).charAt(0).toUpperCase();
-      return '<div class="sc' + (s.linked ? '' : ' off') + '" data-id="' + s.id + '">'
-        + '<div class="sc-top"><div class="ih"><div class="ptile"><span class="plogo lf" style="width:26px;height:26px;font-size:.9rem">' + esc(initial) + '</span></div>'
-        + '<div><h3>' + esc(s.guild_name || ('Server #' + s.id)) + '</h3><small>' + (s.linked ? 'Linked' : 'Not linked') + '</small></div></div>'
+    intGrid.innerHTML = intCache.map(function(i){
+      return '<div class="sc' + (i.enabled ? '' : ' off') + '" data-id="' + i.id + '">'
+        + '<div class="sc-top"><div class="ih"><div class="pico">' + pIcon(i.provider, 'plogo') + '</div><div>'
+        + '<h3>' + esc(i.name) + '</h3><small>' + esc(i.provider_label) + '</small></div></div>'
         + '<div class="more"><button class="ib" data-a="more" aria-label="More">' + ICO.dots + '</button>'
-        + '<div class="menu"><button class="danger" data-a="del">Unlink</button></div></div></div>'
-        + '<div class="sid"><code>Server #' + s.id + '</code></div>'
-        + '<div class="meta"><span>' + ICO.users + '<b>' + esc(s.guild_id || '—') + '</b> Guild ID</span></div>'
+        + '<div class="menu"><button class="danger" data-a="del">Delete</button></div></div></div>'
+        + '<div class="meta"><span>' + ICO.link + '<b>' + (i.enabled ? 'Enabled' : 'Disabled') + '</b> status</span></div>'
         + '<div class="sc-div"></div>'
-        + '<div class="sc-acts"><button class="ab wide" data-a="del">' + ICO.power + 'Unlink</button></div></div>';
+        + '<div class="sc-acts"><button class="ab wide" data-a="edit">' + ICO.pen + 'Edit</button></div></div>';
     }).join('');
   }
 
-  async function loadBot(){
-    try { serverCache = (await api('/api/servers')) || []; } catch (e) { serverCache = []; }
-    renderBot();
+  async function loadIntegrations(){
+    try { intCache = (await api('/api/integrations')) || []; } catch (e) { intCache = []; }
+    renderIntegrations();
   }
 
-  document.getElementById('newBot').addEventListener('click', function(){
-    document.getElementById('bKey').value = '';
-    document.getElementById('bGuild').value = '';
-    bErr.textContent = '';
-    openM(botbg);
-    setTimeout(function(){ document.getElementById('bKey').focus(); }, 50);
-  });
-  document.getElementById('bCancel').addEventListener('click', function(){ closeM(botbg); });
-  document.getElementById('bSave').addEventListener('click', async function(){
-    var key = document.getElementById('bKey').value.trim();
-    var gid = document.getElementById('bGuild').value.trim();
-    if (!key) { bErr.textContent = 'Paste the API key from /create.'; return; }
-    if (!gid) { bErr.textContent = 'Enter the server ID.'; return; }
-    this.disabled = true; this.textContent = 'Linking…';
-    try {
-      await api('/api/servers/link', { method: 'POST', body: { api_key: key, guild_id: gid } });
-      closeM(botbg);
-      await loadBot();
-    } catch (e) {
-      bErr.textContent = String(e.message || e).slice(0, 200);
-    } finally {
-      this.disabled = false; this.textContent = 'Link server';
-    }
-  });
-
-  botGrid.addEventListener('click', async function(e){
+  intGrid.addEventListener('click', async function(e){
     var b = e.target.closest('button');
     if (!b) return;
     var a = b.dataset.a;
     var card = b.closest('.sc');
-    var s = card ? serverCache.filter(function(i){ return String(i.id) === card.dataset.id; })[0] : null;
-    if (a === 'new') { document.getElementById('newBot').click(); return; }
-    if (!s) return;
+    var i = card ? intCache.filter(function(x){ return String(x.id) === card.dataset.id; })[0] : null;
+    if (a === 'new') { openInt(null); return; }
+    if (!i) return;
     if (a === 'more') {
       var m = b.closest('.more'), was = m.classList.contains('open');
       closeMenus();
@@ -849,10 +951,11 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
       return;
     }
     closeMenus();
+    if (a === 'edit') { openInt(i); return; }
     if (a === 'del') {
-      if (!confirm('Unlink server #' + s.id + '? The bot stops working there.')) return;
-      try { await api('/api/servers/' + s.id, { method: 'DELETE' }); await loadBot(); }
-      catch (err) { alert('Unlink failed: ' + (err.message || err)); }
+      if (!confirm('Delete ' + i.name + '?')) return;
+      try { await api('/api/integrations/' + i.id, { method: 'DELETE' }); toast('Integration deleted'); await loadIntegrations(); }
+      catch (err) { alert('Delete failed: ' + (err.message || err)); }
     }
   });
 
@@ -956,7 +1059,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     if (e.detail === 'Overview') loadOverview();
     else if (e.detail === 'Services') loadServices();
     else if (e.detail === 'Keys') loadKeys();
-    else if (e.detail === 'Discord Bot') loadBot();
+    else if (e.detail === 'Integrations') loadIntegrations();
     else if (e.detail === 'Blocklists') { loadServices().then(loadBlocks); }
   });
 

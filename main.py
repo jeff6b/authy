@@ -32,6 +32,11 @@ FAILURE_WINDOW_MINUTES = 10
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
+# >>> FREEMIUM: shared secret with the bot
+SERVER_TRIAL_SECRET = os.getenv("SERVER_TRIAL_SECRET", "").strip()
+TRIAL_TOKEN_TTL = 600
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
 # ==================== MODELS ====================
 class Server(Base):
     __tablename__ = "servers"
@@ -41,6 +46,7 @@ class Server(Base):
     guild_name = Column(String(200), nullable=True)
     admin_role = Column(String(100), nullable=True)
     panel_name = Column(String(100), nullable=True, default="Key Panel")
+    panel_title = Column(String(100), nullable=True)
     panel_message_id = Column(BigInteger, nullable=True)
     panel_channel_id = Column(BigInteger, nullable=True)
     buyer_role = Column(String(100), nullable=True)
@@ -51,10 +57,11 @@ class Server(Base):
     linked_at = Column(DateTime, nullable=True)
     user_id = Column(Integer, nullable=True)
     description = Column(Text, nullable=True)
-    freemium = Column(Boolean, default=False)
-    freemium_days = Column(String(64), nullable=True)
+    freemium = Column(Boolean, default=False)                # >>> FREEMIUM
+    freemium_days = Column(String(64), nullable=True)        # >>> FREEMIUM
+    freemium_daily_minutes = Column(Integer, default=60)     # >>> FREEMIUM
     integration_id = Column(String(64), nullable=True)
-    slug = Column(String(64), nullable=True)  # NEW: global per-service slug
+    slug = Column(String(64), nullable=True)
 
 class License(Base):
     __tablename__ = "licenses"
@@ -70,6 +77,7 @@ class License(Base):
     redeemed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
+    is_freemium = Column(Boolean, default=False)             # >>> FREEMIUM
 
 class Device(Base):
     __tablename__ = "devices"
@@ -136,24 +144,39 @@ class Blocklist(Base):
     reason = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# >>> FREEMIUM: per-user per-day free-minute accounting
+class FreeUsage(Base):
+    __tablename__ = "free_usage"
+    id = Column(Integer, primary_key=True)
+    server_id = Column(Integer, nullable=False, index=True)
+    discord_id = Column(BigInteger, nullable=False, index=True)
+    day = Column(String(10), nullable=False)
+    seconds_used = Column(Integer, default=0)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 # ==================== MIGRATIONS ====================
 def run_migrations():
     stmts = [
         "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS redeemed_name VARCHAR(100)",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_freemium BOOLEAN DEFAULT FALSE",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS anti_tamper_enabled BOOLEAN DEFAULT FALSE",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS greeting_enabled BOOLEAN DEFAULT FALSE",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS greeting_message VARCHAR(200)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS panel_title VARCHAR(100)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_days VARCHAR(64)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_daily_minutes INTEGER DEFAULT 60",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS server_id INTEGER",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS name VARCHAR(200)",
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS user_id INTEGER",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS description TEXT",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium BOOLEAN DEFAULT FALSE",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_days VARCHAR(64)",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS integration_id VARCHAR(64)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_servers_slug ON servers (slug)",
         "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS device_hash VARCHAR(128)",
         "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS device_id INTEGER",
         "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMP",
@@ -172,8 +195,7 @@ def run_migrations():
         "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS event_type VARCHAR(40)",
         "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS success BOOLEAN DEFAULT FALSE",
         "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(200)",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_servers_slug ON servers (slug)",
+        "CREATE INDEX IF NOT EXISTS ix_free_usage_server_day ON free_usage (server_id, day)",
     ]
     for s in stmts:
         try:
@@ -209,6 +231,42 @@ def relax_legacy_not_null():
 
 run_migrations()
 relax_legacy_not_null()
+
+# ==================== FREEMIUM HELPERS ====================
+def _verify_trial_token(token: str):
+    """Return (server_id, discord_id) or None. Validates HMAC + expiry + today's date."""
+    if not SERVER_TRIAL_SECRET or not token:
+        return None
+    parts = token.split(":")
+    if len(parts) != 5:
+        return None
+    try:
+        server_id = int(parts[0]); discord_id = int(parts[1])
+    except ValueError:
+        return None
+    date_str, exp_str, sig = parts[2], parts[3], parts[4]
+    payload = f"{server_id}:{discord_id}:{date_str}:{exp_str}"
+    expected = hmac.new(SERVER_TRIAL_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return None
+    if exp < int(time.time()):
+        return None
+    if date_str != datetime.utcnow().strftime("%Y-%m-%d"):
+        return None
+    return server_id, discord_id
+
+
+def _is_freemium_today_server(server) -> bool:
+    if not server or not getattr(server, "freemium", False):
+        return False
+    days = [d.strip() for d in (getattr(server, "freemium_days", "") or "").split(",") if d.strip()]
+    if not days:
+        return False
+    return WEEKDAYS[datetime.utcnow().weekday()] in days
 
 # ==================== APP ====================
 app = FastAPI()
@@ -265,6 +323,9 @@ async def db_cleanup_task():
                 db.query(AuthLog).filter(AuthLog.created_at < cutoff).delete()
                 db.query(Session).filter(Session.expires_at < datetime.utcnow()).delete()
                 db.query(Challenge).filter(Challenge.expires_at < datetime.utcnow()).delete()
+                # >>> FREEMIUM: purge free_usage older than 30 days
+                fu_cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+                db.query(FreeUsage).filter(FreeUsage.day < fu_cutoff).delete()
                 db.commit()
             finally:
                 db.close()
@@ -278,6 +339,8 @@ async def startup_event():
     asyncio.create_task(db_cleanup_task())
     if not PUBLIC_BASE_URL:
         print("[startup] WARNING: PUBLIC_BASE_URL is not set. Work.ink callbacks will not work.")
+    if not SERVER_TRIAL_SECRET:
+        print("[startup] WARNING: SERVER_TRIAL_SECRET is not set. Freemium tokens will be rejected.")
 
 # ==================== HELPERS ====================
 def get_db():
@@ -322,13 +385,83 @@ def health(db=Depends(get_db)):
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
     raw_hwid = (payload.get("hwid") or "").strip()
-    ip = request.client.host if request.client else None
+    ip = _client_ip(request)
 
     if not license_key:
         raise HTTPException(400, "Missing license")
     if not raw_hwid:
         raise HTTPException(400, "Missing hwid")
 
+    # >>> FREEMIUM: signed trial token?
+    trial = _verify_trial_token(license_key)
+    if trial:
+        server_id, discord_id = trial
+        server = db.query(Server).filter(Server.id == server_id).first()
+        if not server or not _is_freemium_today_server(server):
+            log_auth(db, None, ip, "init", False, "freemium_not_today")
+            raise HTTPException(403, "Free access is not active today")
+
+        cap_minutes = getattr(server, "freemium_daily_minutes", 0) or 0
+        day = datetime.utcnow().strftime("%Y-%m-%d")
+        usage = db.query(FreeUsage).filter(
+            FreeUsage.server_id == server.id,
+            FreeUsage.discord_id == discord_id,
+            FreeUsage.day == day,
+        ).first()
+        used = usage.seconds_used if usage else 0
+        if cap_minutes and used >= cap_minutes * 60:
+            log_auth(db, None, ip, "init", False, "freemium_cap")
+            raise HTTPException(403, "Free time used up for today")
+
+        lic = db.query(License).filter(
+            License.server_id == server.id,
+            License.redeemed_by == discord_id,
+            License.is_freemium == True,
+        ).first()
+        if not lic:
+            raw_key = secrets.token_hex(16)
+            lic = License(
+                server_id=server.id,
+                key_hash=sha256("freemium:" + raw_key),
+                key_plain=raw_key,
+                status="active",
+                expires_at=datetime.utcnow() + timedelta(minutes=cap_minutes or 1440),
+                max_devices=1,
+                redeemed_by=discord_id,
+                is_freemium=True,
+            )
+            db.add(lic)
+            db.commit()
+            db.refresh(lic)
+        else:
+            lic.status = "active"
+            if cap_minutes:
+                lic.expires_at = datetime.utcnow() + timedelta(minutes=cap_minutes)
+
+        device_hash = sha256(license_key + "|" + raw_hwid)[:128]
+        existing_dev = db.query(Device).filter(
+            Device.license_id == lic.id, Device.device_hash == device_hash
+        ).first()
+        if not existing_dev:
+            active = db.query(Device).filter(
+                Device.license_id == lic.id, Device.banned == False
+            ).count()
+            if active >= (lic.max_devices or 1):
+                log_auth(db, lic.id, ip, "init", False, "device_limit")
+                raise HTTPException(403, "Device limit reached")
+
+        raw_challenge = secrets.token_hex(32)
+        ch = Challenge(
+            challenge_hash=sha256(raw_challenge),
+            device_hash=device_hash,
+            expires_at=datetime.utcnow() + timedelta(seconds=CHALLENGE_TTL),
+        )
+        db.add(ch)
+        db.commit()
+        log_auth(db, lic.id, ip, "init", True)
+        return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
+
+    # Normal paid key path
     key_hash = sha256(license_key)
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
@@ -378,7 +511,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     challenge_id = payload.get("challenge_id")
     proof = (payload.get("proof") or "").strip()
     license_key = (payload.get("license") or "").strip()
-    ip = request.client.host if request.client else None
+    ip = _client_ip(request)
 
     if not challenge_id or not proof or not license_key:
         raise HTTPException(400, "Missing fields")
@@ -398,7 +531,18 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     if not ch.device_hash:
         raise HTTPException(401, "Challenge has no device binding")
 
-    lic = db.query(License).filter(License.key_hash == sha256(license_key)).with_for_update().first()
+    # >>> FREEMIUM: resolve license from trial token or paid key
+    trial = _verify_trial_token(license_key)
+    if trial:
+        server_id, discord_id = trial
+        lic = db.query(License).filter(
+            License.server_id == server_id,
+            License.redeemed_by == discord_id,
+            License.is_freemium == True,
+        ).first()
+    else:
+        lic = db.query(License).filter(License.key_hash == sha256(license_key)).with_for_update().first()
+
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
 
@@ -478,6 +622,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         "script_name": script_name,
         "project_name": project_name,
         "key_executions": exec_count,
+        "is_freemium": bool(getattr(lic, "is_freemium", False)),   # >>> FREEMIUM
     }
 
 @app.post("/v2/auth/heartbeat")
@@ -507,6 +652,33 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
         db.commit()
         return {"valid": False, "reason": "tampered"}
 
+    # >>> FREEMIUM: minute accounting + day/end enforcement
+    if getattr(lic, "is_freemium", False):
+        server = db.query(Server).filter(Server.id == lic.server_id).first()
+        if server:
+            if not _is_freemium_today_server(server):
+                sess.revoked = True
+                db.commit()
+                return {"valid": False, "reason": "freemium_ended"}
+            cap_minutes = getattr(server, "freemium_daily_minutes", 0) or 0
+            day = datetime.utcnow().strftime("%Y-%m-%d")
+            row = db.query(FreeUsage).filter(
+                FreeUsage.server_id == server.id,
+                FreeUsage.discord_id == lic.redeemed_by,
+                FreeUsage.day == day,
+            ).first()
+            if not row:
+                row = FreeUsage(server_id=server.id, discord_id=lic.redeemed_by, day=day, seconds_used=0)
+                db.add(row)
+                db.flush()
+            row.seconds_used = (row.seconds_used or 0) + 30
+            row.last_seen = datetime.utcnow()
+            db.commit()
+            if cap_minutes and row.seconds_used >= cap_minutes * 60:
+                sess.revoked = True
+                db.commit()
+                return {"valid": False, "reason": "freemium_cap_reached"}
+
     sess.last_heartbeat = datetime.utcnow()
     lic.last_used = datetime.utcnow()
     if dev:
@@ -516,7 +688,7 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
 
 @app.post("/v2/auth/tamper")
 def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
-    ip = request.client.host if request.client else None
+    ip = _client_ip(request)
     license_key = (payload.get("license") or "").strip()
     session_token = (payload.get("session_token") or "").strip()
     reason = (payload.get("reason") or "unspecified")[:200]
@@ -527,7 +699,16 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
         if sess:
             lic = db.query(License).filter(License.id == sess.license_id).first()
     if not lic and license_key:
-        lic = db.query(License).filter(License.key_hash == sha256(license_key)).first()
+        trial = _verify_trial_token(license_key)
+        if trial:
+            server_id, discord_id = trial
+            lic = db.query(License).filter(
+                License.server_id == server_id,
+                License.redeemed_by == discord_id,
+                License.is_freemium == True,
+            ).first()
+        else:
+            lic = db.query(License).filter(License.key_hash == sha256(license_key)).first()
 
     if not lic:
         log_auth(db, None, ip, "tamper", True, f"already_gone:{reason}")
@@ -611,25 +792,20 @@ def serve_dashboard():
 
 # ==================== CLAIM / KEY SYSTEM (public) ====================
 def _render_claim_html(slug: str, options: list) -> str:
-    """One card per integration under this service. Matches the snug 'Get your key' design."""
     cards = []
     for o in options:
         ready = o["ready"]
         btn_label = "Start checkpoint" if ready else "Not configured"
         disabled = "" if ready else "disabled"
-        provider_label = o["provider_label"]
-        # Show provider name + site like the mock
         cards.append(
             f'<div class="provider">'
             f'  <div class="provider-name">{o["name"]}</div>'
-            f'  <div class="provider-site">{provider_label}</div>'
+            f'  <div class="provider-site">{o["provider_label"]}</div>'
             f'</div>'
             f'<div class="reward"><span>Reward</span><strong>{o["reward"]} key</strong></div>'
             f'<button data-id="{o["id"]}" {disabled}>{btn_label}</button>'
         )
-
     body = "\n".join(cards) if cards else '<p class="description">No options available.</p>'
-
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -639,42 +815,19 @@ def _render_claim_html(slug: str, options: list) -> str:
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-    background: #0c0c0c; color: #fff; min-height: 100vh;
-    display: flex; align-items: center; justify-content: center;
-    padding: 20px; font-family: Arial, sans-serif;
-}}
-.container {{
-    width: 350px; background: #141414; border: 1px solid #303030;
-    border-radius: 7px; padding: 22px;
-}}
-h2 {{
-    font-family: 'Space Grotesk', sans-serif; font-size: 21px;
-    font-weight: 500; text-align: center; margin-bottom: 9px;
-}}
-.description {{
-    text-align: center; color: #777; font-size: 12px;
-    margin-bottom: 24px; line-height: 1.5;
-}}
-.provider {{
-    background: #181818; border: 1px solid #292929;
-    border-radius: 4px; padding: 14px; margin-bottom: 12px;
-}}
-.provider-name {{ font-size: 14px; font-weight: 500; margin-bottom: 5px; }}
-.provider-site {{ font-size: 11px; color: #777; }}
-.reward {{
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 14px 2px; font-size: 12px; color: #888;
-}}
-.reward strong {{ color: #ccc; font-weight: 500; }}
-button {{
-    width: 100%; border: 1px solid #333; background: #222; color: #fff;
-    padding: 12px; border-radius: 4px; cursor: pointer;
-    font-size: 12px; transition: background .15s; margin-top: 6px;
-}}
-button:hover {{ background: #303030; }}
-button:disabled {{ opacity: .45; cursor: not-allowed; }}
-.err {{ color: #ff8a8a; font-size: 11px; margin-top: 10px; min-height: 1.2em; text-align: center; }}
+body {{ background:#0c0c0c;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:Arial,sans-serif; }}
+.container {{ width:350px;background:#141414;border:1px solid #303030;border-radius:7px;padding:22px; }}
+h2 {{ font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:500;text-align:center;margin-bottom:9px; }}
+.description {{ text-align:center;color:#777;font-size:12px;margin-bottom:24px;line-height:1.5; }}
+.provider {{ background:#181818;border:1px solid #292929;border-radius:4px;padding:14px;margin-bottom:12px; }}
+.provider-name {{ font-size:14px;font-weight:500;margin-bottom:5px; }}
+.provider-site {{ font-size:11px;color:#777; }}
+.reward {{ display:flex;justify-content:space-between;align-items:center;padding:14px 2px;font-size:12px;color:#888; }}
+.reward strong {{ color:#ccc;font-weight:500; }}
+button {{ width:100%;border:1px solid #333;background:#222;color:#fff;padding:12px;border-radius:4px;cursor:pointer;font-size:12px;transition:background .15s;margin-top:6px; }}
+button:hover {{ background:#303030; }}
+button:disabled {{ opacity:.45;cursor:not-allowed; }}
+.err {{ color:#ff8a8a;font-size:11px;margin-top:10px;min-height:1.2em;text-align:center; }}
 </style>
 </head>
 <body>
@@ -714,7 +867,6 @@ document.getElementById('list').addEventListener('click', async function(e) {{
 
 
 def _render_key_html(key: str, hours: int, already: bool = False) -> str:
-    """Keyframe modal, filled with the real key + real reward duration."""
     from dashboard_api import fmt_hours
     reward = fmt_hours(int(hours or 24))
     note = "You already claimed this key." if already else f"You have access for {reward}."
@@ -727,35 +879,14 @@ def _render_key_html(key: str, hours: int, already: bool = False) -> str:
 <title>Keyframe</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-    background: #0c0c0c; color: #fff; min-height: 100vh;
-    display: flex; align-items: center; justify-content: center;
-    padding: 20px; font-family: Arial, sans-serif;
-}}
-.modal {{
-    width: 330px; background: #141414; border: 1px solid #303030;
-    border-radius: 7px; padding: 22px;
-}}
-h2 {{
-    font-family: 'Space Grotesk', sans-serif; font-size: 21px;
-    font-weight: 500; text-align: center; margin-bottom: 9px;
-    letter-spacing: -0.6px;
-}}
-p {{
-    text-align: center; color: #777; font-size: 12px; margin-bottom: 20px;
-}}
-.key-value {{
-    background: #181818; border: 1px solid #292929; border-radius: 4px;
-    padding: 13px; color: #bbb; font-size: 12px; margin-bottom: 12px;
-    word-break: break-all;
-}}
-button {{
-    width: 100%; border: 1px solid #333; background: #222; color: #fff;
-    padding: 11px; border-radius: 4px; cursor: pointer;
-    font-size: 12px; transition: background .15s;
-}}
-button:hover {{ background: #303030; }}
+* {{ margin:0;padding:0;box-sizing:border-box; }}
+body {{ background:#0c0c0c;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:Arial,sans-serif; }}
+.modal {{ width:330px;background:#141414;border:1px solid #303030;border-radius:7px;padding:22px; }}
+h2 {{ font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:500;text-align:center;margin-bottom:9px;letter-spacing:-0.6px; }}
+p {{ text-align:center;color:#777;font-size:12px;margin-bottom:20px; }}
+.key-value {{ background:#181818;border:1px solid #292929;border-radius:4px;padding:13px;color:#bbb;font-size:12px;margin-bottom:12px;word-break:break-all; }}
+button {{ width:100%;border:1px solid #333;background:#222;color:#fff;padding:11px;border-radius:4px;cursor:pointer;font-size:12px;transition:background .15s; }}
+button:hover {{ background:#303030; }}
 </style>
 </head>
 <body>
@@ -772,12 +903,8 @@ async function copyKey() {{
     try {{
         await navigator.clipboard.writeText(key);
         document.getElementById("copyBtn").textContent = "Copied!";
-        setTimeout(() => {{
-            document.getElementById("copyBtn").textContent = "Copy key";
-        }}, 1800);
-    }} catch {{
-        document.getElementById("copyBtn").textContent = "Copy failed";
-    }}
+        setTimeout(() => {{ document.getElementById("copyBtn").textContent = "Copy key"; }}, 1800);
+    }} catch {{ document.getElementById("copyBtn").textContent = "Copy failed"; }}
 }}
 </script>
 </body>
@@ -786,16 +913,10 @@ async function copyKey() {{
 
 @app.get("/go/{slug}", response_class=HTMLResponse)
 async def claim_page(slug: str, db=Depends(get_db)):
-    """Global per-service claim page. One slug -> every enabled integration under that Server."""
     from dashboard_api import Integration, PROVIDERS, fmt_hours, ensure_server_slug
-
     server = db.query(Server).filter(Server.slug == slug).first()
     if not server:
-        return HTMLResponse(
-            "<h1>Not found</h1><p>This claim page does not exist.</p>",
-            status_code=404,
-        )
-
+        return HTMLResponse("<h1>Not found</h1><p>This claim page does not exist.</p>", status_code=404)
     rows = (
         db.query(Integration)
         .filter(Integration.server_id == server.id, Integration.enabled == True)
@@ -803,11 +924,7 @@ async def claim_page(slug: str, db=Depends(get_db)):
         .all()
     )
     if not rows:
-        return HTMLResponse(
-            "<h1>No checkpoints</h1><p>This service has no enabled integrations yet.</p>",
-            status_code=404,
-        )
-
+        return HTMLResponse("<h1>No checkpoints</h1><p>This service has no enabled integrations yet.</p>", status_code=404)
     options = []
     for i in rows:
         options.append({
@@ -824,7 +941,6 @@ async def claim_page(slug: str, db=Depends(get_db)):
 @app.post("/api/claim/start", dependencies=[Depends(claim_limit)])
 async def claim_start(payload: dict, db=Depends(get_db)):
     from dashboard_api import Integration, ClaimSession, CLAIM_TTL_MIN, workink_override
-
     iid = int(payload.get("integration_id") or 0)
     i = db.query(Integration).filter(Integration.id == iid, Integration.enabled == True).first()
     if not i or not i.provider_link:
@@ -842,7 +958,6 @@ async def claim_start(payload: dict, db=Depends(get_db)):
     db.commit()
 
     redirect = i.provider_link
-
     if i.provider == "workink":
         if not PUBLIC_BASE_URL:
             raise HTTPException(500, "Server misconfigured: PUBLIC_BASE_URL not set")
@@ -878,7 +993,6 @@ async def claim_callback(
         Integration, ClaimSession,
         verify_linkvertise, verify_workink, issue_claim_key, fmt_hours,
     )
-
     if not sid:
         raise HTTPException(400, "Missing session")
     cs = db.query(ClaimSession).filter(ClaimSession.token == sid).first()
@@ -902,10 +1016,7 @@ async def claim_callback(
         proof = token or request.query_params.get("token") or request.query_params.get("hash")
         ok = await verify_workink(proof or "")
     elif i.provider == "lootlabs":
-        if unique_id or click_id:
-            ok = True
-        else:
-            ok = bool(cs.completed)
+        ok = True if (unique_id or click_id) else bool(cs.completed)
     else:
         ok = False
 
@@ -913,8 +1024,7 @@ async def claim_callback(
         back = f"/go/{db.query(Server.slug).filter(Server.id == i.server_id).scalar()}" if i.server_id else "/"
         return HTMLResponse(
             "<h1>Verification failed</h1>"
-            "<p>Complete the ad tasks, then try again. "
-            "If you already did, the proof may have expired — start a new claim.</p>"
+            "<p>Complete the ad tasks, then try again.</p>"
             f'<p><a href="{back}" style="color:#AFFBB3">Back</a></p>',
             status_code=403,
         )
@@ -934,11 +1044,7 @@ def lootlabs_postback(
     ip: str = "",
     db=Depends(get_db),
 ):
-    """Set this URL in Lootlabs Advanced → Postback.
-    Claim session token is sent as puid when the user starts a claim.
-    """
     from dashboard_api import ClaimSession
-
     if not click_id:
         return {"ok": False}
     cs = db.query(ClaimSession).filter(ClaimSession.token == click_id).first()
@@ -953,7 +1059,6 @@ def lootlabs_postback(
 
 @app.get("/go/done", response_class=HTMLResponse)
 def claim_done(key: str = "", hours: int = 24):
-    """Legacy /go/done route — kept for compatibility, renders the same Keyframe modal."""
     if not key:
         return HTMLResponse("<h1>No key</h1>", status_code=400)
     return HTMLResponse(_render_key_html(key, hours))

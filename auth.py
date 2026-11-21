@@ -1,5 +1,6 @@
 # auth.py — Discord OAuth + web sessions + server linking
 
+import asyncio
 import os
 import secrets
 import hashlib
@@ -12,6 +13,7 @@ from sqlalchemy import Column, Integer, String, DateTime, BigInteger
 from sqlalchemy.orm import Session as OrmSession
 
 from main import Base, engine, SessionLocal, Server, sha256
+from discord_media import fetch_guild_media
 
 
 # ==================== CONFIG ====================
@@ -229,22 +231,24 @@ def me(user: User = Depends(get_current_user)):
 
 # ==================== SERVERS (linking) ====================
 @router.get("/servers")
-def list_servers(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+async def list_servers(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     rows = db.query(Server).filter(Server.user_id == user.id).all()
+    media = await asyncio.gather(*[fetch_guild_media(s.guild_id) for s in rows])
     return [
         {
             "id": s.id,
             "guild_id": str(s.guild_id) if s.guild_id else None,
-            "guild_name": s.guild_name,
+            "guild_name": s.guild_name or gname,
             "panel_name": s.panel_name,
             "linked": bool(s.guild_id),
+            "icon_url": gicon,
         }
-        for s in rows
+        for s, (gname, gicon) in zip(rows, media)
     ]
 
 
 @router.post("/servers/link")
-def link_server(payload: dict, user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+async def link_server(payload: dict, user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     api_key  = (payload.get("api_key") or "").strip()
     guild_id = (payload.get("guild_id") or "").strip()
     if not api_key:
@@ -265,12 +269,15 @@ def link_server(payload: dict, user: User = Depends(get_current_user), db: OrmSe
     if existing and existing.id != s.id:
         raise HTTPException(409, "That guild is already linked to another server")
 
-    s.user_id  = user.id
-    s.guild_id = gid
-    s.guild_name = s.guild_name or f"Guild {gid}"
-    s.linked_at = datetime.utcnow()
+    gname, gicon = await fetch_guild_media(gid)
+
+    s.user_id    = user.id
+    s.guild_id   = gid
+    s.guild_name = gname or s.guild_name or f"Guild {gid}"
+    s.linked_at  = datetime.utcnow()
     db.commit()
-    return {"ok": True, "id": s.id, "guild_id": str(s.guild_id)}
+    return {"ok": True, "id": s.id, "guild_id": str(s.guild_id),
+            "guild_name": s.guild_name, "icon_url": gicon}
 
 
 @router.delete("/servers/{server_id}")
@@ -284,8 +291,8 @@ def unlink_server(server_id: int, user: User = Depends(get_current_user), db: Or
     s.guild_name = None
     s.admin_role = None
     s.linked_at = None
-    s.panel_name = None
     s.panel_message_id = None
     s.panel_channel_id = None
+    # panel_name is kept — it is the service name now, not a guild name.
     db.commit()
     return {"ok": True}

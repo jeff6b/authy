@@ -468,8 +468,11 @@ def reset_key_hwid(license_id: int, user: User = Depends(get_current_user), db: 
         raise HTTPException(404, "Key not found")
     if lic.server_id not in server_ids:
         raise HTTPException(403, "Not yours")
-    db.query(Device).filter(Device.license_id == lic.id).delete()
-    db.query(Session).filter(Session.license_id == lic.id).update({"revoked": True})
+    
+    # FIX: Delete sessions FIRST so we don't violate the ForeignKey constraint on devices
+    db.query(Session).filter(Session.license_id == lic.id).delete(synchronize_session=False)
+    db.query(Device).filter(Device.license_id == lic.id).delete(synchronize_session=False)
+    
     db.commit()
     return {"ok": True}
 

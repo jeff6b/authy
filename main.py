@@ -30,7 +30,6 @@ SESSION_TTL = 3600
 MAX_FAILURES = 10
 FAILURE_WINDOW_MINUTES = 10
 
-# >>> CHANGED: public base URL used to build absolute claim callbacks
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # ==================== MODELS ====================
@@ -55,6 +54,7 @@ class Server(Base):
     freemium = Column(Boolean, default=False)
     freemium_days = Column(String(64), nullable=True)
     integration_id = Column(String(64), nullable=True)
+    slug = Column(String(64), nullable=True)  # NEW: global per-service slug
 
 class License(Base):
     __tablename__ = "licenses"
@@ -172,6 +172,8 @@ def run_migrations():
         "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS event_type VARCHAR(40)",
         "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS success BOOLEAN DEFAULT FALSE",
         "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(200)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_servers_slug ON servers (slug)",
     ]
     for s in stmts:
         try:
@@ -275,7 +277,7 @@ async def db_cleanup_task():
 async def startup_event():
     asyncio.create_task(db_cleanup_task())
     if not PUBLIC_BASE_URL:
-        print("[startup] WARNING: PUBLIC_BASE_URL is not set. Work.ink/Linkvertise callbacks will not work.")
+        print("[startup] WARNING: PUBLIC_BASE_URL is not set. Work.ink callbacks will not work.")
 
 # ==================== HELPERS ====================
 def get_db():
@@ -609,59 +611,92 @@ def serve_dashboard():
 
 # ==================== CLAIM / KEY SYSTEM (public) ====================
 def _render_claim_html(slug: str, options: list) -> str:
+    """One card per integration under this service. Matches the snug 'Get your key' design."""
     cards = []
     for o in options:
-        disabled = "" if o["ready"] else "disabled"
+        ready = o["ready"]
+        btn_label = "Start checkpoint" if ready else "Not configured"
+        disabled = "" if ready else "disabled"
+        provider_label = o["provider_label"]
+        # Show provider name + site like the mock
         cards.append(
-            f'<button class="card" data-id="{o["id"]}" {disabled}>'
-            f'<div class="top"><b>{o["name"]}</b><span class="tag">{o["provider_label"]}</span></div>'
-            f'<div class="reward">Reward · <strong>{o["reward"]} key</strong></div>'
-            f'<div class="cta">{"Start checkpoint" if o["ready"] else "Not configured"}</div>'
-            f"</button>"
+            f'<div class="provider">'
+            f'  <div class="provider-name">{o["name"]}</div>'
+            f'  <div class="provider-site">{provider_label}</div>'
+            f'</div>'
+            f'<div class="reward"><span>Reward</span><strong>{o["reward"]} key</strong></div>'
+            f'<button data-id="{o["id"]}" {disabled}>{btn_label}</button>'
         )
-    cards_html = "\n".join(cards) or '<p class="empty">No options available.</p>'
+
+    body = "\n".join(cards) if cards else '<p class="description">No options available.</p>'
+
     return f"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Get key · {slug}</title>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Keyframe</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{{color-scheme:dark}}
-*{{box-sizing:border-box}}
-body{{margin:0;min-height:100vh;background:#141415;color:#A6B1B1;
-  font-family:Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}}
-.wrap{{width:min(480px,100%)}}
-h1{{margin:0 0 6px;color:#eef2f2;font-size:1.5rem;letter-spacing:-.02em}}
-.sub{{margin:0 0 22px;font-size:.9rem}}
-.card{{width:100%;text-align:left;background:#19191b;border:1px solid #242427;border-radius:14px;
-  padding:18px;margin-bottom:12px;color:inherit;font:inherit;cursor:pointer;transition:.15s}}
-.card:hover:not(:disabled){{border-color:#3a3a40}}
-.card:disabled{{opacity:.45;cursor:not-allowed}}
-.top{{display:flex;justify-content:space-between;align-items:center;gap:10px}}
-.top b{{color:#eef2f2;font-size:1rem}}
-.tag{{font-size:.72rem;text-transform:uppercase;letter-spacing:.6px;opacity:.7}}
-.reward{{margin:10px 0 14px;font-size:.88rem}}
-.reward strong{{color:#AFFBB3}}
-.cta{{font-size:.84rem;font-weight:600;color:#AFFBB3}}
-.empty{{text-align:center;padding:28px;border:1px dashed #2c2c30;border-radius:14px}}
-.err{{color:#ff8a8a;font-size:.82rem;margin-top:10px;min-height:1.2em}}
-</style></head><body>
-<div class="wrap">
-  <h1>Get your key</h1>
-  <p class="sub">Pick a checkpoint, complete the tasks, then unlock your key.</p>
-  <div id="list">{cards_html}</div>
-  <div class="err" id="err"></div>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    background: #0c0c0c; color: #fff; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px; font-family: Arial, sans-serif;
+}}
+.container {{
+    width: 350px; background: #141414; border: 1px solid #303030;
+    border-radius: 7px; padding: 22px;
+}}
+h2 {{
+    font-family: 'Space Grotesk', sans-serif; font-size: 21px;
+    font-weight: 500; text-align: center; margin-bottom: 9px;
+}}
+.description {{
+    text-align: center; color: #777; font-size: 12px;
+    margin-bottom: 24px; line-height: 1.5;
+}}
+.provider {{
+    background: #181818; border: 1px solid #292929;
+    border-radius: 4px; padding: 14px; margin-bottom: 12px;
+}}
+.provider-name {{ font-size: 14px; font-weight: 500; margin-bottom: 5px; }}
+.provider-site {{ font-size: 11px; color: #777; }}
+.reward {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 2px; font-size: 12px; color: #888;
+}}
+.reward strong {{ color: #ccc; font-weight: 500; }}
+button {{
+    width: 100%; border: 1px solid #333; background: #222; color: #fff;
+    padding: 12px; border-radius: 4px; cursor: pointer;
+    font-size: 12px; transition: background .15s; margin-top: 6px;
+}}
+button:hover {{ background: #303030; }}
+button:disabled {{ opacity: .45; cursor: not-allowed; }}
+.err {{ color: #ff8a8a; font-size: 11px; margin-top: 10px; min-height: 1.2em; text-align: center; }}
+</style>
+</head>
+<body>
+<div class="container">
+    <h2>Get your key</h2>
+    <p class="description">Pick a checkpoint, complete the tasks, then unlock your key.</p>
+    <div id="list">{body}</div>
+    <div class="err" id="err"></div>
 </div>
 <script>
-document.getElementById('list').addEventListener('click', async function(e){{
-  var b = e.target.closest('.card');
+document.getElementById('list').addEventListener('click', async function(e) {{
+  var b = e.target.closest('button[data-id]');
   if (!b || b.disabled) return;
   var err = document.getElementById('err');
   err.textContent = '';
   b.disabled = true;
+  var original = b.textContent;
+  b.textContent = 'Opening…';
   try {{
     var r = await fetch('/api/claim/start', {{
       method: 'POST',
-      headers: {{'Content-Type':'application/json'}},
+      headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{ integration_id: +b.dataset.id }})
     }});
     var d = await r.json();
@@ -670,24 +705,106 @@ document.getElementById('list').addEventListener('click', async function(e){{
   }} catch (ex) {{
     err.textContent = String(ex.message || ex);
     b.disabled = false;
+    b.textContent = original;
   }}
 }});
 </script>
-</body></html>"""
+</body>
+</html>"""
+
+
+def _render_key_html(key: str, hours: int, already: bool = False) -> str:
+    """Keyframe modal, filled with the real key + real reward duration."""
+    from dashboard_api import fmt_hours
+    reward = fmt_hours(int(hours or 24))
+    note = "You already claimed this key." if already else f"You have access for {reward}."
+    safe_key = (key or "").replace("<", "").replace(">", "")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Keyframe</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    background: #0c0c0c; color: #fff; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px; font-family: Arial, sans-serif;
+}}
+.modal {{
+    width: 330px; background: #141414; border: 1px solid #303030;
+    border-radius: 7px; padding: 22px;
+}}
+h2 {{
+    font-family: 'Space Grotesk', sans-serif; font-size: 21px;
+    font-weight: 500; text-align: center; margin-bottom: 9px;
+    letter-spacing: -0.6px;
+}}
+p {{
+    text-align: center; color: #777; font-size: 12px; margin-bottom: 20px;
+}}
+.key-value {{
+    background: #181818; border: 1px solid #292929; border-radius: 4px;
+    padding: 13px; color: #bbb; font-size: 12px; margin-bottom: 12px;
+    word-break: break-all;
+}}
+button {{
+    width: 100%; border: 1px solid #333; background: #222; color: #fff;
+    padding: 11px; border-radius: 4px; cursor: pointer;
+    font-size: 12px; transition: background .15s;
+}}
+button:hover {{ background: #303030; }}
+</style>
+</head>
+<body>
+<div class="modal">
+    <h2>Keyframe</h2>
+    <p>{note}</p>
+    <div class="key-value" id="key">{safe_key}</div>
+    <button onclick="copyKey()" id="copyBtn">Copy key</button>
+</div>
+<script>
+const key = {safe_key!r};
+document.getElementById("key").textContent = key;
+async function copyKey() {{
+    try {{
+        await navigator.clipboard.writeText(key);
+        document.getElementById("copyBtn").textContent = "Copied!";
+        setTimeout(() => {{
+            document.getElementById("copyBtn").textContent = "Copy key";
+        }}, 1800);
+    }} catch {{
+        document.getElementById("copyBtn").textContent = "Copy failed";
+    }}
+}}
+</script>
+</body>
+</html>"""
 
 
 @app.get("/go/{slug}", response_class=HTMLResponse)
 async def claim_page(slug: str, db=Depends(get_db)):
-    from dashboard_api import Integration, PROVIDERS, fmt_hours
+    """Global per-service claim page. One slug -> every enabled integration under that Server."""
+    from dashboard_api import Integration, PROVIDERS, fmt_hours, ensure_server_slug
+
+    server = db.query(Server).filter(Server.slug == slug).first()
+    if not server:
+        return HTMLResponse(
+            "<h1>Not found</h1><p>This claim page does not exist.</p>",
+            status_code=404,
+        )
 
     rows = (
         db.query(Integration)
-        .filter(Integration.slug == slug, Integration.enabled == True)
+        .filter(Integration.server_id == server.id, Integration.enabled == True)
+        .order_by(Integration.id.asc())
         .all()
     )
     if not rows:
         return HTMLResponse(
-            "<h1>Not found</h1><p>This claim page does not exist or is disabled.</p>",
+            "<h1>No checkpoints</h1><p>This service has no enabled integrations yet.</p>",
             status_code=404,
         )
 
@@ -706,7 +823,6 @@ async def claim_page(slug: str, db=Depends(get_db)):
 
 @app.post("/api/claim/start", dependencies=[Depends(claim_limit)])
 async def claim_start(payload: dict, db=Depends(get_db)):
-    # >>> CHANGED: uses workink_override + absolute callback URL
     from dashboard_api import Integration, ClaimSession, CLAIM_TTL_MIN, workink_override
 
     iid = int(payload.get("integration_id") or 0)
@@ -728,8 +844,6 @@ async def claim_start(payload: dict, db=Depends(get_db)):
     redirect = i.provider_link
 
     if i.provider == "workink":
-        # Build the absolute callback URL Work.ink should send the user back to.
-        # {TOKEN} is the placeholder Work.ink replaces with the user's proof token.
         if not PUBLIC_BASE_URL:
             raise HTTPException(500, "Server misconfigured: PUBLIC_BASE_URL not set")
         callback = f"{PUBLIC_BASE_URL}/api/claim/callback?sid={token}&token={{TOKEN}}"
@@ -741,19 +855,13 @@ async def claim_start(payload: dict, db=Depends(get_db)):
         sep = "&" if "?" in redirect else "?"
         redirect = f"{redirect}{sep}sr={sr}"
     elif i.provider == "lootlabs":
-        # Lootlabs: append puid for postback correlation
         sep = "&" if "?" in redirect else "?"
         redirect = f"{redirect}{sep}puid={token}"
     else:
-        # Linkvertise and others: pass sid so the callback can find the session
         sep = "&" if "?" in redirect else "?"
         redirect = f"{redirect}{sep}sid={token}"
 
-    return {
-        "ok": True,
-        "session": token,
-        "redirect": redirect,
-    }
+    return {"ok": True, "session": token, "redirect": redirect}
 
 
 @app.get("/api/claim/callback")
@@ -768,7 +876,7 @@ async def claim_callback(
 ):
     from dashboard_api import (
         Integration, ClaimSession,
-        verify_linkvertise, verify_workink, issue_claim_key,
+        verify_linkvertise, verify_workink, issue_claim_key, fmt_hours,
     )
 
     if not sid:
@@ -778,15 +886,13 @@ async def claim_callback(
         raise HTTPException(404, "Unknown session")
     if cs.expires_at < datetime.utcnow():
         raise HTTPException(410, "Session expired — start again")
-    if cs.completed and cs.key_plain:
-        return RedirectResponse(
-            f"/go/done?key={cs.key_plain}&hours=24",
-            status_code=302,
-        )
 
     i = db.query(Integration).filter(Integration.id == cs.integration_id).first()
     if not i or not i.enabled:
         raise HTTPException(400, "Integration disabled")
+
+    if cs.completed and cs.key_plain:
+        return HTMLResponse(_render_key_html(cs.key_plain, i.key_hours or 24, already=True))
 
     ok = False
     if i.provider == "linkvertise":
@@ -797,8 +903,6 @@ async def claim_callback(
         ok = await verify_workink(proof or "")
     elif i.provider == "lootlabs":
         if unique_id or click_id:
-            cs.completed = True
-            db.commit()
             ok = True
         else:
             ok = bool(cs.completed)
@@ -806,12 +910,12 @@ async def claim_callback(
         ok = False
 
     if not ok:
-        back = f"/go/{i.slug}" if i.slug else "/"
+        back = f"/go/{db.query(Server.slug).filter(Server.id == i.server_id).scalar()}" if i.server_id else "/"
         return HTMLResponse(
             "<h1>Verification failed</h1>"
             "<p>Complete the ad tasks, then try again. "
             "If you already did, the proof may have expired — start a new claim.</p>"
-            f'<p><a href="{back}">Back</a></p>',
+            f'<p><a href="{back}" style="color:#AFFBB3">Back</a></p>',
             status_code=403,
         )
 
@@ -820,10 +924,7 @@ async def claim_callback(
     cs.license_id = lid
     cs.key_plain = key
     db.commit()
-    return RedirectResponse(
-        f"/go/done?key={key}&hours={i.key_hours or 24}",
-        status_code=302,
-    )
+    return HTMLResponse(_render_key_html(key, i.key_hours or 24))
 
 
 @app.get("/api/claim/postback/lootlabs")
@@ -852,32 +953,10 @@ def lootlabs_postback(
 
 @app.get("/go/done", response_class=HTMLResponse)
 def claim_done(key: str = "", hours: int = 24):
-    from dashboard_api import fmt_hours
-
+    """Legacy /go/done route — kept for compatibility, renders the same Keyframe modal."""
     if not key:
         return HTMLResponse("<h1>No key</h1>", status_code=400)
-    reward = fmt_hours(int(hours or 24))
-    safe_key = key.replace("<", "").replace(">", "")
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Your key</title>
-<style>
-  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-    background:#0c0c0d;color:#eef2f2;font-family:Inter,system-ui,sans-serif}}
-  .box{{background:#17171a;border:1px solid #2a2a2e;border-radius:16px;padding:28px;max-width:420px;width:90%;text-align:center}}
-  h1{{margin:0 0 8px;font-size:1.3rem}}
-  p{{margin:0 0 18px;color:#A6B1B1;font-size:.9rem}}
-  code{{display:block;background:#0f0f11;border:1px solid #2a2a2e;border-radius:10px;
-    padding:14px;font-size:1.05rem;letter-spacing:.04em;word-break:break-all;margin-bottom:16px}}
-  button{{font:600 .9rem inherit;height:40px;padding:0 18px;border-radius:9px;border:0;
-    background:#AFFBB3;color:#08150a;cursor:pointer}}
-</style></head><body>
-<div class="box">
-  <h1>Key unlocked</h1>
-  <p>Valid for {reward}</p>
-  <code id="k">{safe_key}</code>
-  <button onclick="navigator.clipboard.writeText(document.getElementById('k').textContent)">Copy key</button>
-</div></body></html>""")
+    return HTMLResponse(_render_key_html(key, hours))
 
 
 if __name__ == "__main__":

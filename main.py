@@ -3,8 +3,7 @@ from fastapi.responses import PlainTextResponse, HTMLResponse, Response, JSONRes
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
-from fastapi_limiter.depends import RateLimiter
-from pyrate_limiter import Duration, Limiter, Rate
+from collections import defaultdict, deque
 import os
 import secrets
 import hashlib
@@ -219,9 +218,37 @@ relax_legacy_not_null()
 # ==================== APP INITIALIZATION ====================
 app = FastAPI()
 
-init_limiter = Limiter(Rate(5, Duration.MINUTE))
-verify_limiter = Limiter(Rate(5, Duration.MINUTE))
-script_limiter = Limiter(Rate(10, Duration.MINUTE))
+# ---- Simple in-memory sliding-window rate limiter (no external package) ----
+_rate_hits = defaultdict(deque)
+
+def _client_ip(request: Request) -> str:
+    # Behind Cloudflare/Render the real IP is in a header, not request.client.
+    ip = request.headers.get("cf-connecting-ip")
+    if not ip:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            ip = xff.split(",")[0].strip()
+    if not ip and request.client:
+        ip = request.client.host
+    return ip or "unknown"
+
+def rate_limit(name: str, max_calls: int, seconds: int):
+    def dep(request: Request):
+        key = (name, _client_ip(request))
+        now = time.time()
+        q = _rate_hits[key]
+        while q and now - q[0] > seconds:
+            q.popleft()
+        if len(q) >= max_calls:
+            raise HTTPException(429, "Too many requests")
+        q.append(now)
+        if not q:
+            _rate_hits.pop(key, None)
+    return dep
+
+init_limit = rate_limit("init", 5, 60)
+verify_limit = rate_limit("verify", 5, 60)
+script_limit = rate_limit("script", 10, 60)
 
 BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not permitted</title>
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
@@ -297,7 +324,7 @@ def health(db=Depends(get_db)):
     return {"ok": True}
 
 # ==================== AUTH ENDPOINTS (executor-facing) ====================
-@app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])
+@app.post("/v2/auth/init", dependencies=[Depends(init_limit)])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
     raw_hwid = (payload.get("hwid") or "").strip()
@@ -352,7 +379,7 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
 
     return {"challenge_id": challenge_id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
-@app.post("/v2/auth/verify", dependencies=[Depends(RateLimiter(limiter=verify_limiter))])
+@app.post("/v2/auth/verify", dependencies=[Depends(verify_limit)])
 def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     challenge_id = payload.get("challenge_id")
     proof = (payload.get("proof") or "").strip()
@@ -529,7 +556,7 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
 
     return {"success": True, "deleted": True}
 
-@app.get("/v2/script", response_class=PlainTextResponse, dependencies=[Depends(RateLimiter(limiter=script_limiter))])
+@app.get("/v2/script", response_class=PlainTextResponse, dependencies=[Depends(script_limit)])
 def serve_script(session_token: str, timestamp: int, signature: str, db=Depends(get_db)):
     if abs(time.time() - timestamp) > 10:
         raise HTTPException(401, "Request expired")

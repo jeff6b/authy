@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.responses import PlainTextResponse, HTMLResponse, Response, JSONResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, Response, JSONResponse, RedirectResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
@@ -13,14 +13,12 @@ import asyncio
 import traceback
 
 # ==================== CONFIG ====================
-# Set DATABASE_URL as an environment variable on Render. Never hardcode it.
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-# Set DEBUG_ERRORS=0 on Render once everything works, so 500s stop leaking details.
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
@@ -50,10 +48,9 @@ class Server(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     linked_at = Column(DateTime, nullable=True)
     user_id = Column(Integer, nullable=True)
-    # Dashboard-only fields (not used by bot)
     description = Column(Text, nullable=True)
     freemium = Column(Boolean, default=False)
-    freemium_days = Column(String(64), nullable=True)  # "Mon,Tue,Wed"
+    freemium_days = Column(String(64), nullable=True)
     integration_id = Column(String(64), nullable=True)
 
 class License(Base):
@@ -131,7 +128,7 @@ class Blocklist(Base):
     __tablename__ = "blocklists"
     id = Column(Integer, primary_key=True)
     server_id = Column(Integer, nullable=True)
-    type = Column(String(16), nullable=False)  # "hwid" | "discord"
+    type = Column(String(16), nullable=False)
     value = Column(String(128), nullable=False)
     reason = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -150,12 +147,10 @@ def run_migrations():
         "ALTER TABLE script ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secret_plain VARCHAR(64)",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS user_id INTEGER",
-        # Dashboard-only fields
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS description TEXT",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium BOOLEAN DEFAULT FALSE",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_days VARCHAR(64)",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS integration_id VARCHAR(64)",
-        # Auth tables (older deployments may be missing these)
         "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS device_hash VARCHAR(128)",
         "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS device_id INTEGER",
         "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMP",
@@ -185,11 +180,6 @@ def run_migrations():
 
 
 def relax_legacy_not_null():
-    """
-    Old versions of these tables may have NOT NULL columns that the current models
-    never fill in, which makes every INSERT fail with a 500. For each auth table, any
-    NOT NULL column with no default that the model doesn't define gets relaxed.
-    """
     tables = {
         "challenges": {c.name for c in Challenge.__table__.columns},
         "sessions": {c.name for c in Session.__table__.columns},
@@ -215,14 +205,12 @@ def relax_legacy_not_null():
 run_migrations()
 relax_legacy_not_null()
 
-# ==================== APP INITIALIZATION ====================
+# ==================== APP ====================
 app = FastAPI()
 
-# ---- Simple in-memory sliding-window rate limiter (no external package) ----
 _rate_hits = defaultdict(deque)
 
 def _client_ip(request: Request) -> str:
-    # Behind Cloudflare/Render the real IP is in a header, not request.client.
     ip = request.headers.get("cf-connecting-ip")
     if not ip:
         xff = request.headers.get("x-forwarded-for")
@@ -249,13 +237,13 @@ def rate_limit(name: str, max_calls: int, seconds: int):
 init_limit = rate_limit("init", 5, 60)
 verify_limit = rate_limit("verify", 5, 60)
 script_limit = rate_limit("script", 10, 60)
+claim_limit = rate_limit("claim", 20, 60)
 
 BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not permitted</title>
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
 </head><body><span>Not permitted mijo</span></body></html>"""
 
 
-# Any unexpected crash now returns JSON (so the Lua loader can read it) and logs a traceback.
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
     traceback.print_exc()
@@ -263,7 +251,6 @@ async def unhandled_exception(request: Request, exc: Exception):
     return JSONResponse({"detail": detail}, status_code=500)
 
 
-# ==================== BACKGROUND TASKS ====================
 async def db_cleanup_task():
     while True:
         try:
@@ -323,7 +310,7 @@ def health(db=Depends(get_db)):
     db.execute(text("SELECT 1"))
     return {"ok": True}
 
-# ==================== AUTH ENDPOINTS (executor-facing) ====================
+# ==================== AUTH ENDPOINTS ====================
 @app.post("/v2/auth/init", dependencies=[Depends(init_limit)])
 def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     license_key = (payload.get("license") or "").strip()
@@ -599,7 +586,7 @@ def raw_file(token: str, request: Request, db=Depends(get_db)):
         return HTMLResponse(BLOCK_PAGE, status_code=200)
     return Response(content=f.content, media_type="text/plain")
 
-# ==================== WEB DASHBOARD (OAuth, /api/*) ====================
+# ==================== WEB DASHBOARD ====================
 from auth import router as auth_router
 app.include_router(auth_router)
 
@@ -613,6 +600,261 @@ def serve_dashboard():
         with open(fp, "r", encoding="utf-8") as f:
             return f.read()
     return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
+
+
+# ==================== CLAIM / KEY SYSTEM (public) ====================
+def _render_claim_html(slug: str, options: list) -> str:
+    cards = []
+    for o in options:
+        disabled = "" if o["ready"] else "disabled"
+        cards.append(
+            f'<button class="card" data-id="{o["id"]}" {disabled}>'
+            f'<div class="top"><b>{o["name"]}</b><span class="tag">{o["provider_label"]}</span></div>'
+            f'<div class="reward">Reward · <strong>{o["reward"]} key</strong></div>'
+            f'<div class="cta">{"Start checkpoint" if o["ready"] else "Not configured"}</div>'
+            f"</button>"
+        )
+    cards_html = "\n".join(cards) or '<p class="empty">No options available.</p>'
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Get key · {slug}</title>
+<style>
+:root{{color-scheme:dark}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;background:#141415;color:#A6B1B1;
+  font-family:Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}}
+.wrap{{width:min(480px,100%)}}
+h1{{margin:0 0 6px;color:#eef2f2;font-size:1.5rem;letter-spacing:-.02em}}
+.sub{{margin:0 0 22px;font-size:.9rem}}
+.card{{width:100%;text-align:left;background:#19191b;border:1px solid #242427;border-radius:14px;
+  padding:18px;margin-bottom:12px;color:inherit;font:inherit;cursor:pointer;transition:.15s}}
+.card:hover:not(:disabled){{border-color:#3a3a40}}
+.card:disabled{{opacity:.45;cursor:not-allowed}}
+.top{{display:flex;justify-content:space-between;align-items:center;gap:10px}}
+.top b{{color:#eef2f2;font-size:1rem}}
+.tag{{font-size:.72rem;text-transform:uppercase;letter-spacing:.6px;opacity:.7}}
+.reward{{margin:10px 0 14px;font-size:.88rem}}
+.reward strong{{color:#AFFBB3}}
+.cta{{font-size:.84rem;font-weight:600;color:#AFFBB3}}
+.empty{{text-align:center;padding:28px;border:1px dashed #2c2c30;border-radius:14px}}
+.err{{color:#ff8a8a;font-size:.82rem;margin-top:10px;min-height:1.2em}}
+</style></head><body>
+<div class="wrap">
+  <h1>Get your key</h1>
+  <p class="sub">Pick a checkpoint, complete the tasks, then unlock your key.</p>
+  <div id="list">{cards_html}</div>
+  <div class="err" id="err"></div>
+</div>
+<script>
+document.getElementById('list').addEventListener('click', async function(e){{
+  var b = e.target.closest('.card');
+  if (!b || b.disabled) return;
+  var err = document.getElementById('err');
+  err.textContent = '';
+  b.disabled = true;
+  try {{
+    var r = await fetch('/api/claim/start', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{ integration_id: +b.dataset.id, base_url: location.origin }})
+    }});
+    var d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Failed');
+    location.href = d.redirect;
+  }} catch (ex) {{
+    err.textContent = String(ex.message || ex);
+    b.disabled = false;
+  }}
+}});
+</script>
+</body></html>"""
+
+
+@app.get("/go/{slug}", response_class=HTMLResponse)
+async def claim_page(slug: str, db=Depends(get_db)):
+    from dashboard_api import Integration, PROVIDERS, fmt_hours
+
+    rows = (
+        db.query(Integration)
+        .filter(Integration.slug == slug, Integration.enabled == True)
+        .all()
+    )
+    if not rows:
+        return HTMLResponse(
+            "<h1>Not found</h1><p>This claim page does not exist or is disabled.</p>",
+            status_code=404,
+        )
+
+    options = []
+    for i in rows:
+        options.append({
+            "id": i.id,
+            "name": i.name,
+            "provider": i.provider,
+            "provider_label": PROVIDERS.get(i.provider, i.provider),
+            "reward": fmt_hours(i.key_hours or 24),
+            "ready": bool(i.provider_link and i.server_id),
+        })
+    return HTMLResponse(_render_claim_html(slug, options))
+
+
+@app.post("/api/claim/start", dependencies=[Depends(claim_limit)])
+async def claim_start(payload: dict, db=Depends(get_db)):
+    from dashboard_api import Integration, ClaimSession, CLAIM_TTL_MIN
+
+    iid = int(payload.get("integration_id") or 0)
+    i = db.query(Integration).filter(Integration.id == iid, Integration.enabled == True).first()
+    if not i or not i.provider_link:
+        raise HTTPException(400, "Integration not ready")
+    if not i.server_id:
+        raise HTTPException(400, "No service linked")
+
+    token = secrets.token_urlsafe(24)
+    cs = ClaimSession(
+        token=token,
+        integration_id=i.id,
+        expires_at=datetime.utcnow() + timedelta(minutes=CLAIM_TTL_MIN),
+    )
+    db.add(cs)
+    db.commit()
+
+    redirect = i.provider_link
+    # Lootlabs: append puid for postback correlation
+    if i.provider == "lootlabs":
+        sep = "&" if "?" in redirect else "?"
+        redirect = f"{redirect}{sep}puid={token}"
+
+    return {
+        "ok": True,
+        "session": token,
+        "redirect": redirect,
+    }
+
+
+@app.get("/api/claim/callback")
+async def claim_callback(
+    request: Request,
+    sid: str = "",
+    hash: str = None,
+    token: str = None,
+    unique_id: str = None,
+    click_id: str = None,
+    db=Depends(get_db),
+):
+    from dashboard_api import (
+        Integration, ClaimSession,
+        verify_linkvertise, verify_workink, issue_claim_key,
+    )
+
+    if not sid:
+        raise HTTPException(400, "Missing session")
+    cs = db.query(ClaimSession).filter(ClaimSession.token == sid).first()
+    if not cs:
+        raise HTTPException(404, "Unknown session")
+    if cs.expires_at < datetime.utcnow():
+        raise HTTPException(410, "Session expired — start again")
+    if cs.completed and cs.key_plain:
+        return RedirectResponse(
+            f"/go/done?key={cs.key_plain}&hours=24",
+            status_code=302,
+        )
+
+    i = db.query(Integration).filter(Integration.id == cs.integration_id).first()
+    if not i or not i.enabled:
+        raise HTTPException(400, "Integration disabled")
+
+    ok = False
+    if i.provider == "linkvertise":
+        proof = hash or request.query_params.get("hash")
+        ok = await verify_linkvertise(i.api_token or "", proof or "")
+    elif i.provider == "workink":
+        proof = token or request.query_params.get("token") or request.query_params.get("hash")
+        ok = await verify_workink(proof or "")
+    elif i.provider == "lootlabs":
+        if unique_id or click_id:
+            cs.completed = True
+            db.commit()
+            ok = True
+        else:
+            ok = bool(cs.completed)
+    else:
+        ok = False
+
+    if not ok:
+        back = f"/go/{i.slug}" if i.slug else "/"
+        return HTMLResponse(
+            "<h1>Verification failed</h1>"
+            "<p>Complete the ad tasks, then try again. "
+            "If you already did, the proof may have expired — start a new claim.</p>"
+            f'<p><a href="{back}">Back</a></p>',
+            status_code=403,
+        )
+
+    key, lid = issue_claim_key(db, i)
+    cs.completed = True
+    cs.license_id = lid
+    cs.key_plain = key
+    db.commit()
+    return RedirectResponse(
+        f"/go/done?key={key}&hours={i.key_hours or 24}",
+        status_code=302,
+    )
+
+
+@app.get("/api/claim/postback/lootlabs")
+def lootlabs_postback(
+    click_id: str = "",
+    unique_id: str = "",
+    ip: str = "",
+    db=Depends(get_db),
+):
+    """Set this URL in Lootlabs Advanced → Postback.
+    Claim session token is sent as puid when the user starts a claim.
+    """
+    from dashboard_api import ClaimSession
+
+    if not click_id:
+        return {"ok": False}
+    cs = db.query(ClaimSession).filter(ClaimSession.token == click_id).first()
+    if not cs:
+        return {"ok": False, "reason": "unknown"}
+    if cs.expires_at < datetime.utcnow():
+        return {"ok": False, "reason": "expired"}
+    cs.completed = True
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/go/done", response_class=HTMLResponse)
+def claim_done(key: str = "", hours: int = 24):
+    from dashboard_api import fmt_hours
+
+    if not key:
+        return HTMLResponse("<h1>No key</h1>", status_code=400)
+    reward = fmt_hours(int(hours or 24))
+    safe_key = key.replace("<", "").replace(">", "")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Your key</title>
+<style>
+  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#0c0c0d;color:#eef2f2;font-family:Inter,system-ui,sans-serif}}
+  .box{{background:#17171a;border:1px solid #2a2a2e;border-radius:16px;padding:28px;max-width:420px;width:90%;text-align:center}}
+  h1{{margin:0 0 8px;font-size:1.3rem}}
+  p{{margin:0 0 18px;color:#A6B1B1;font-size:.9rem}}
+  code{{display:block;background:#0f0f11;border:1px solid #2a2a2e;border-radius:10px;
+    padding:14px;font-size:1.05rem;letter-spacing:.04em;word-break:break-all;margin-bottom:16px}}
+  button{{font:600 .9rem inherit;height:40px;padding:0 18px;border-radius:9px;border:0;
+    background:#AFFBB3;color:#08150a;cursor:pointer}}
+</style></head><body>
+<div class="box">
+  <h1>Key unlocked</h1>
+  <p>Valid for {reward}</p>
+  <code id="k">{safe_key}</code>
+  <button onclick="navigator.clipboard.writeText(document.getElementById('k').textContent)">Copy key</button>
+</div></body></html>""")
+
 
 if __name__ == "__main__":
     import uvicorn

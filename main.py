@@ -392,8 +392,10 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     if not raw_hwid:
         raise HTTPException(400, "Missing hwid")
 
-    # >>> FREEMIUM: signed trial token?
+        # >>> FREEMIUM: signed trial token?
     trial = _verify_trial_token(license_key)
+    print(f"[DEBUG] Incoming license: {license_key}")
+    print(f"[DEBUG] Trial parsed: {trial}")
     if trial:
         server_id, discord_id = trial
         server = db.query(Server).filter(Server.id == server_id).first()

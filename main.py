@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.responses import PlainTextResponse, HTMLResponse, Response
+from fastapi.responses import PlainTextResponse, HTMLResponse, Response, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
@@ -11,13 +11,18 @@ import hashlib
 import hmac
 import time
 import asyncio
+import traceback
 
 # ==================== CONFIG ====================
+# Set DATABASE_URL as an environment variable on Render. Never hardcode it.
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://neondb_owner:npg_S7hoDMeaw2cQ@ep-wandering-dream-ah21egpt-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require"
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+# Set DEBUG_ERRORS=0 on Render once everything works, so 500s stop leaking details.
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(bind=engine)
@@ -151,16 +156,65 @@ def run_migrations():
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium BOOLEAN DEFAULT FALSE",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_days VARCHAR(64)",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS integration_id VARCHAR(64)",
+        # Auth tables (older deployments may be missing these)
+        "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS device_hash VARCHAR(128)",
+        "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS device_id INTEGER",
+        "ALTER TABLE challenges ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMP",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_id INTEGER",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_heartbeat TIMESTAMP DEFAULT NOW()",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS first_seen TIMESTAMP DEFAULT NOW()",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW()",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS max_devices INTEGER DEFAULT 1",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_plain VARCHAR(64)",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS redeemed_by BIGINT",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMP",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_used TIMESTAMP",
+        "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS ip_address VARCHAR(64)",
+        "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS event_type VARCHAR(40)",
+        "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS success BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE auth_logs ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(200)",
     ]
-    with engine.begin() as conn:
-        for s in stmts:
-            try:
+    for s in stmts:
+        try:
+            with engine.begin() as conn:
                 conn.execute(text(s))
-            except Exception as e:
-                print(f"[migrate] skipped: {s} -> {e}")
+        except Exception as e:
+            print(f"[migrate] skipped: {s} -> {e}")
     print("[migrate] done")
 
+
+def relax_legacy_not_null():
+    """
+    Old versions of these tables may have NOT NULL columns that the current models
+    never fill in, which makes every INSERT fail with a 500. For each auth table, any
+    NOT NULL column with no default that the model doesn't define gets relaxed.
+    """
+    tables = {
+        "challenges": {c.name for c in Challenge.__table__.columns},
+        "sessions": {c.name for c in Session.__table__.columns},
+        "devices": {c.name for c in Device.__table__.columns},
+        "licenses": {c.name for c in License.__table__.columns},
+        "auth_logs": {c.name for c in AuthLog.__table__.columns},
+    }
+    try:
+        with engine.begin() as conn:
+            for table, known in tables.items():
+                rows = conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :t AND is_nullable = 'NO' AND column_default IS NULL"
+                ), {"t": table}).fetchall()
+                for (col,) in rows:
+                    if col not in known:
+                        print(f"[migrate] relaxing legacy NOT NULL: {table}.{col}")
+                        conn.execute(text(f'ALTER TABLE {table} ALTER COLUMN "{col}" DROP NOT NULL'))
+    except Exception as e:
+        print(f"[migrate] relax_legacy_not_null failed: {e}")
+
+
 run_migrations()
+relax_legacy_not_null()
 
 # ==================== APP INITIALIZATION ====================
 app = FastAPI()
@@ -173,17 +227,28 @@ BLOCK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not perm
 <style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}span{color:#4a4a4a;font-size:2rem;font-weight:600}</style>
 </head><body><span>Not permitted mijo</span></body></html>"""
 
+
+# Any unexpected crash now returns JSON (so the Lua loader can read it) and logs a traceback.
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception):
+    traceback.print_exc()
+    detail = f"{type(exc).__name__}: {str(exc)[:300]}" if DEBUG_ERRORS else "server_error"
+    return JSONResponse({"detail": detail}, status_code=500)
+
+
 # ==================== BACKGROUND TASKS ====================
 async def db_cleanup_task():
     while True:
         try:
             db = SessionLocal()
-            cutoff = datetime.utcnow() - timedelta(days=7)
-            db.query(AuthLog).filter(AuthLog.created_at < cutoff).delete()
-            db.query(Session).filter(Session.expires_at < datetime.utcnow()).delete()
-            db.query(Challenge).filter(Challenge.expires_at < datetime.utcnow()).delete()
-            db.commit()
-            db.close()
+            try:
+                cutoff = datetime.utcnow() - timedelta(days=7)
+                db.query(AuthLog).filter(AuthLog.created_at < cutoff).delete()
+                db.query(Session).filter(Session.expires_at < datetime.utcnow()).delete()
+                db.query(Challenge).filter(Challenge.expires_at < datetime.utcnow()).delete()
+                db.commit()
+            finally:
+                db.close()
             print("[cleanup] Old logs and sessions purged.")
         except Exception as e:
             print(f"[cleanup] Error: {e}")
@@ -225,6 +290,11 @@ def serve_frontend():
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
     return "<h1>Frontend not found</h1><p>Please create frontend.html in the root directory.</p>"
+
+@app.get("/health")
+def health(db=Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return {"ok": True}
 
 # ==================== AUTH ENDPOINTS (executor-facing) ====================
 @app.post("/v2/auth/init", dependencies=[Depends(RateLimiter(limiter=init_limiter))])
@@ -277,9 +347,10 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     )
     db.add(ch)
     db.commit()
+    challenge_id = ch.id
     log_auth(db, lic.id, ip, "init", True)
 
-    return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
+    return {"challenge_id": challenge_id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
 @app.post("/v2/auth/verify", dependencies=[Depends(RateLimiter(limiter=verify_limiter))])
 def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
@@ -342,6 +413,8 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     )
     db.add(sess)
     db.commit()
+    session_id = sess.id
+    device_hash_out = ch.device_hash
     log_auth(db, lic.id, ip, "verify", True)
 
     server = db.query(Server).filter(Server.id == lic.server_id).first() if lic.server_id else None
@@ -350,7 +423,7 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         s = db.query(Script).filter(Script.server_id == lic.server_id).first()
         if s and s.name:
             script_name = s.name
-    project_name = server.panel_name or server.guild_name if server else "unknown"
+    project_name = (server.panel_name or server.guild_name or "unknown") if server else "unknown"
     session_count = db.query(Session).filter(
         Session.license_id == lic.id, Session.revoked == False, Session.expires_at > datetime.utcnow()
     ).count()
@@ -360,7 +433,9 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         delta = (lic.expires_at - datetime.utcnow()).total_seconds()
         time_left = max(0, int(delta))
 
-    exec_count = db.query(AuthLog).filter(AuthLog.license_id == lic.id, AuthLog.event_type == "verify", AuthLog.success == True).count()
+    exec_count = db.query(AuthLog).filter(
+        AuthLog.license_id == lic.id, AuthLog.event_type == "verify", AuthLog.success == True
+    ).count()
     anti_tamper = bool(server.anti_tamper_enabled) if server else False
     greeting_enabled = bool(server.greeting_enabled) if server else False
     greeting_message = server.greeting_message if server else None
@@ -369,14 +444,14 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
         "success": True,
         "session_token": raw_token,
         "session_secret": raw_secret,
-        "session_id": sess.id,
+        "session_id": session_id,
         "expires_in": SESSION_TTL,
         "anti_tamper": anti_tamper,
         "greeting_enabled": greeting_enabled,
         "greeting_message": greeting_message,
         "discord_id": lic.redeemed_by,
         "discord_name": lic.redeemed_name,
-        "hwid": ch.device_hash,
+        "hwid": device_hash_out,
         "time_left": time_left,
         "session_count": session_count,
         "script_name": script_name,
@@ -447,8 +522,10 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
     except Exception as e:
         db.rollback()
         print(f"[tamper] error deleting lic {lic_id}: {e}")
-        try: log_auth(db, lic_id, ip, "tamper", True, f"partial:{reason}")
-        except Exception: pass
+        try:
+            log_auth(db, lic_id, ip, "tamper", True, f"partial:{reason}")
+        except Exception:
+            pass
 
     return {"success": True, "deleted": True}
 
@@ -467,7 +544,7 @@ def serve_script(session_token: str, timestamp: int, signature: str, db=Depends(
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(signature, expected_sig):
+    if not hmac.compare_digest(signature.lower(), expected_sig):
         raise HTTPException(401, "Invalid signature")
 
     if (datetime.utcnow() - sess.last_heartbeat).total_seconds() > 60:

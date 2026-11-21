@@ -1,21 +1,18 @@
 # dashboard_api.py — Real backend for the dashboard.
-# Owns: /api/overview, /api/services, /api/keys, /api/blocklists.
-# Uses the same tables the Discord bot writes to. No mock data.
+# Owns: /api/overview, /api/services, /api/keys, /api/blocklists, /api/integrations.
 # Key creation is Discord-only (/generatekey, /whitelist). Dashboard is read + manage.
-#
-# Required env on the web service:
-#   DISCORD_BOT_TOKEN  — optional; enables real Discord avatar lookup for keys.
 
+import asyncio
 import os
-import time
 import secrets
-import httpx
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
 from sqlalchemy.orm import Session as OrmSession
 
 from main import (
+    Base,
+    engine,
     SessionLocal,
     Server,
     License,
@@ -25,16 +22,31 @@ from main import (
     Blocklist,
 )
 from auth import get_current_user, User
+from discord_media import fetch_discord_user, fetch_guild_media
 
 
 router = APIRouter(prefix="/api")
 
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-# discord_id -> (fetched_at, username, avatar_url)
-_AV_CACHE: dict[int, tuple[float, str | None, str | None]] = {}
-_AV_TTL_OK = 600
-_AV_TTL_MISS = 60
+# ==================== INTEGRATIONS (not wired to anything yet) ====================
+PROVIDERS = {
+    "linkvertise": "Linkvertise",
+    "lootlabs":    "Lootlabs",
+    "workink":     "Work.ink",
+}
+
+
+class Integration(Base):
+    __tablename__ = "integrations"
+    id          = Column(Integer, primary_key=True)
+    user_id     = Column(Integer, nullable=False, index=True)
+    provider    = Column(String(32), nullable=False)
+    name        = Column(String(100), nullable=False)
+    enabled     = Column(Boolean, default=False)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+
+Base.metadata.create_all(bind=engine, tables=[Integration.__table__])
 
 
 # ==================== DB DEP ====================
@@ -49,50 +61,6 @@ def get_db():
 # ==================== HELPERS ====================
 def _user_server_ids(db, user_id):
     return [r[0] for r in db.query(Server.id).filter(Server.user_id == user_id).all()]
-
-
-def _cdn_avatar(discord_id, avatar_hash):
-    if not discord_id or not avatar_hash:
-        return None
-    ext = "gif" if avatar_hash.startswith("a_") else "png"
-    return f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar_hash}.{ext}?size=128"
-
-
-async def _fetch_discord_user(discord_id):
-    """Best-effort pfp lookup via bot token, memoised. Returns (username, avatar_url)."""
-    if not BOT_TOKEN or not discord_id:
-        return (None, None)
-
-    try:
-        did = int(discord_id)
-    except (TypeError, ValueError):
-        return (None, None)
-
-    hit = _AV_CACHE.get(did)
-    if hit:
-        age = time.time() - hit[0]
-        if (hit[1] or hit[2]) and age < _AV_TTL_OK:
-            return (hit[1], hit[2])
-        if not (hit[1] or hit[2]) and age < _AV_TTL_MISS:
-            return (None, None)
-
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(
-                f"https://discord.com/api/v10/users/{did}",
-                headers={"Authorization": f"Bot {BOT_TOKEN}"},
-            )
-            if r.status_code != 200:
-                _AV_CACHE[did] = (time.time(), None, None)
-                return (None, None)
-            u = r.json()
-            name = u.get("username")
-            av = _cdn_avatar(u.get("id"), u.get("avatar"))
-            _AV_CACHE[did] = (time.time(), name, av)
-            return (name, av)
-    except Exception:
-        _AV_CACHE[did] = (time.time(), None, None)
-        return (None, None)
 
 
 # ==================== OVERVIEW ====================
@@ -161,14 +129,12 @@ def overview(range_days: int = 7, user: User = Depends(get_current_user), db: Or
 
 
 # ==================== SERVICES ====================
-# Dashboard creates Server rows with a fresh api_key (mirrors /create in the bot).
-# Guild binding still happens via /api/servers/link or /link in Discord.
-
 @router.get("/services")
-def list_services(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+async def list_services(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     rows = db.query(Server).filter(Server.user_id == user.id).order_by(Server.id.desc()).all()
+    media = await asyncio.gather(*[fetch_guild_media(s.guild_id) for s in rows])
     out = []
-    for s in rows:
+    for s, (gname, gicon) in zip(rows, media):
         key_count = db.query(License).filter(License.server_id == s.id).count()
         out.append({
             "id": s.id,
@@ -177,7 +143,8 @@ def list_services(user: User = Depends(get_current_user), db: OrmSession = Depen
             "name": s.panel_name or s.guild_name or f"Server {s.id}",
             "desc": s.description or "",
             "guild_id": str(s.guild_id) if s.guild_id else None,
-            "guild_name": s.guild_name,
+            "guild_name": s.guild_name or gname,
+            "icon_url": gicon,
             "linked": bool(s.guild_id),
             "freemium": bool(s.freemium),
             "freemium_days": (s.freemium_days or "").split(",") if s.freemium_days else [],
@@ -242,7 +209,6 @@ def delete_service(service_id: int, user: User = Depends(get_current_user), db: 
         raise HTTPException(404, "Service not found")
     if s.user_id != user.id:
         raise HTTPException(403, "Not yours")
-    # Detach licenses so they don't dangle; don't delete them.
     db.query(License).filter(License.server_id == s.id).update({"server_id": None})
     db.delete(s)
     db.commit()
@@ -261,10 +227,7 @@ def rotate_service_key(service_id: int, user: User = Depends(get_current_user), 
     return {"api_key": s.api_key}
 
 
-# ==================== KEYS (read-only; creation is Discord-only) ====================
-# Keys come from /generatekey, /whitelist, or panel redeem in the bot.
-# The dashboard never mints keys.
-
+# ==================== KEYS ====================
 @router.get("/keys")
 async def list_keys(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     server_ids = _user_server_ids(db, user.id)
@@ -283,7 +246,6 @@ async def list_keys(user: User = Depends(get_current_user), db: OrmSession = Dep
     for lic in lics:
         sv = server_map.get(lic.server_id)
 
-        # HWID: prefer a non-banned device, most recently seen.
         dev = (
             db.query(Device)
             .filter(Device.license_id == lic.id)
@@ -291,18 +253,16 @@ async def list_keys(user: User = Depends(get_current_user), db: OrmSession = Dep
             .first()
         )
 
-        # Executions: successful verify events
         ex = db.query(AuthLog).filter(
             AuthLog.license_id == lic.id,
             AuthLog.event_type == "verify",
             AuthLog.success == True,
         ).count()
 
-        # Discord identity — cached pfp via bot token, fallback to default avatar.
         username = lic.redeemed_name
         avatar_url = None
         if lic.redeemed_by:
-            uname, aurl = await _fetch_discord_user(lic.redeemed_by)
+            uname, aurl = await fetch_discord_user(lic.redeemed_by)
             if uname:
                 username = username or uname
             avatar_url = aurl
@@ -372,6 +332,81 @@ def delete_key(license_id: int, user: User = Depends(get_current_user), db: OrmS
     return {"ok": True}
 
 
+# ==================== INTEGRATIONS ====================
+@router.get("/integrations")
+def list_integrations(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+    rows = (
+        db.query(Integration)
+        .filter(Integration.user_id == user.id)
+        .order_by(Integration.id.desc())
+        .all()
+    )
+    return [
+        {
+            "id": i.id,
+            "provider": i.provider,
+            "provider_label": PROVIDERS.get(i.provider, i.provider),
+            "name": i.name,
+            "enabled": bool(i.enabled),
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        }
+        for i in rows
+    ]
+
+
+@router.post("/integrations")
+def create_integration(payload: dict, user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+    provider = (payload.get("provider") or "").strip().lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(400, "Pick a provider")
+    name = (payload.get("name") or "").strip() or PROVIDERS[provider]
+    i = Integration(
+        user_id=user.id,
+        provider=provider,
+        name=name[:100],
+        enabled=bool(payload.get("enabled")),
+    )
+    db.add(i)
+    db.commit()
+    db.refresh(i)
+    return {"ok": True, "id": i.id}
+
+
+@router.patch("/integrations/{integration_id}")
+def update_integration(integration_id: int, payload: dict, user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+    i = db.query(Integration).filter(Integration.id == integration_id).first()
+    if not i:
+        raise HTTPException(404, "Integration not found")
+    if i.user_id != user.id:
+        raise HTTPException(403, "Not yours")
+    if "provider" in payload:
+        p = (payload["provider"] or "").strip().lower()
+        if p not in PROVIDERS:
+            raise HTTPException(400, "Unknown provider")
+        i.provider = p
+    if "name" in payload:
+        n = (payload["name"] or "").strip()
+        if not n:
+            raise HTTPException(400, "Name cannot be empty")
+        i.name = n[:100]
+    if "enabled" in payload:
+        i.enabled = bool(payload["enabled"])
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/integrations/{integration_id}")
+def delete_integration(integration_id: int, user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+    i = db.query(Integration).filter(Integration.id == integration_id).first()
+    if not i:
+        raise HTTPException(404, "Integration not found")
+    if i.user_id != user.id:
+        raise HTTPException(403, "Not yours")
+    db.delete(i)
+    db.commit()
+    return {"ok": True}
+
+
 # ==================== BLOCKLISTS ====================
 @router.get("/blocklists")
 def list_blocks(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
@@ -437,8 +472,6 @@ def delete_block(block_id: int, user: User = Depends(get_current_user), db: OrmS
 
 
 # ==================== ENFORCEMENT HELPER ====================
-# Import into main.py's /v2/auth/init to actually reject blocked HWIDs/Discord IDs.
-
 def is_blocked(db, server_id, hwid=None, discord_id=None):
     if not server_id:
         return False

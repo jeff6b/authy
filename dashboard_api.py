@@ -1,8 +1,6 @@
 # dashboard_api.py — Real backend for the dashboard.
-# Owns: /api/overview, /api/services, /api/keys, /api/blocklists, /api/integrations,
-#       plus the claim flow: /go/{slug} and /api/claim/callback.
-# Key creation is Discord-only (/generatekey, /whitelist) EXCEPT freemium claim keys from integrations.
-# Dashboard is read + manage.
+# Owns: /api/overview, /api/services, /api/keys, /api/blocklists, /api/integrations.
+# Claim flow lives in main.py (/go/{slug}, /api/claim/start, /api/claim/callback).
 
 import asyncio
 import os
@@ -12,8 +10,7 @@ from datetime import datetime, timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, func, text
 from sqlalchemy.orm import Session as OrmSession
 
 from main import (
@@ -33,11 +30,10 @@ from discord_media import fetch_discord_user, fetch_guild_media
 
 
 router = APIRouter(prefix="/api")
-go_router = APIRouter()  # no prefix -> serves /go/{slug}
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 if not PUBLIC_BASE_URL:
-    print("[dashboard_api] WARNING: PUBLIC_BASE_URL is not set — claim callbacks will be relative and Work.ink will reject them.")
+    print("[dashboard_api] WARNING: PUBLIC_BASE_URL is not set — Work.ink callbacks will not work.")
 
 
 # ==================== INTEGRATIONS ====================
@@ -56,8 +52,8 @@ class Integration(Base):
     name            = Column(String(100), nullable=False)
     enabled         = Column(Boolean, default=False)
     created_at      = Column(DateTime, default=datetime.utcnow)
-    # Claim / monetization
-    slug            = Column(String(64), nullable=True, index=True)
+    # Kept for backwards compat, but routing uses Server.slug, not this.
+    slug            = Column(String(64), nullable=True)
     server_id       = Column(Integer, nullable=True)
     key_hours       = Column(Integer, default=24)
     provider_link   = Column(String(512), nullable=True)
@@ -82,7 +78,6 @@ Base.metadata.create_all(bind=engine, tables=[Integration.__table__, ClaimSessio
 
 # Soft migrations for existing deployments
 def _migrate_integrations():
-    from sqlalchemy import text
     stmts = [
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS server_id INTEGER",
@@ -90,6 +85,9 @@ def _migrate_integrations():
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS provider_link VARCHAR(512)",
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS api_token VARCHAR(256)",
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS publisher_id VARCHAR(64)",
+        # NEW: global per-service slug on servers
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_servers_slug ON servers (slug)",
     ]
     for s in stmts:
         try:
@@ -120,7 +118,23 @@ def _slugify(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9\-]", "-", s)
     s = re.sub(r"-+", "-", s).strip("-")
-    return s[:48] or secrets.token_hex(4)
+    return s[:48]
+
+
+def ensure_server_slug(db, server: Server) -> str:
+    """Every Server gets a stable global slug. Idempotent."""
+    if getattr(server, "slug", None):
+        return server.slug
+    base = _slugify(server.panel_name or server.guild_name or f"service-{server.id}")
+    base = base or f"service-{server.id}"
+    candidate = base
+    i = 0
+    while db.query(Server).filter(Server.slug == candidate, Server.id != server.id).first():
+        i += 1
+        candidate = f"{base}-{i}" if i < 100 else f"{base}-{secrets.token_hex(2)}"
+    server.slug = candidate
+    db.commit()
+    return candidate
 
 
 def fmt_hours(h: int) -> str:
@@ -141,8 +155,8 @@ async def verify_linkvertise(api_token: str, hash_val: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             r = await client.post(url, params={"token": api_token, "hash": hash_val})
-            text = (r.text or "").strip().upper()
-            if text in ("TRUE", "1", "YES"):
+            text_body = (r.text or "").strip().upper()
+            if text_body in ("TRUE", "1", "YES"):
                 return True
             try:
                 j = r.json()
@@ -197,107 +211,6 @@ def issue_claim_key(db, integration: Integration) -> tuple:
     db.commit()
     db.refresh(lic)
     return key, lic.id
-
-
-def _key_page(key: str, already: bool = False) -> str:
-    note = "You already claimed this key." if already else "Here's your key:"
-    return f"""<!doctype html><meta charset="utf-8">
-<title>Your key</title>
-<style>
-  body{{background:#0c0c0d;color:#eef2f2;font-family:Inter,system-ui,sans-serif;
-       display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
-  .card{{background:#17171a;border:1px solid #2a2a2e;border-radius:16px;padding:32px;
-        max-width:420px;width:100%;text-align:center}}
-  p{{color:#a6b1b1;font-size:.9rem;margin:0 0 18px}}
-  code{{display:block;font-family:ui-monospace,Menlo,Consolas,monospace;
-        font-size:1.1rem;color:#AFFBB3;background:#0f0f11;border:1px solid #2a2a2e;
-        border-radius:10px;padding:14px;word-break:break-all;margin-bottom:18px}}
-  button{{font:600 .9rem inherit;background:#AFFBB3;color:#08150a;border:0;
-          border-radius:9px;padding:11px 22px;cursor:pointer}}
-</style>
-<div class="card">
-  <p>{note}</p>
-  <code id="k">{key}</code>
-  <button onclick="navigator.clipboard.writeText(document.getElementById('k').textContent)">
-    Copy key
-  </button>
-</div>"""
-
-
-# ==================== CLAIM FLOW ====================
-@go_router.get("/go/{slug}")
-async def start_claim(slug: str, db: OrmSession = Depends(get_db)):
-    i = db.query(Integration).filter(
-        Integration.slug == slug,
-        Integration.enabled == True,
-    ).first()
-    if not i or not i.provider_link:
-        raise HTTPException(404, "Claim not found")
-
-    sid = secrets.token_urlsafe(24)
-    db.add(ClaimSession(
-        token=sid,
-        integration_id=i.id,
-        expires_at=datetime.utcnow() + timedelta(minutes=CLAIM_TTL_MIN),
-    ))
-    db.commit()
-
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(500, "Server misconfigured: PUBLIC_BASE_URL not set")
-
-    callback = f"{PUBLIC_BASE_URL}/api/claim/callback?sid={sid}&token={{TOKEN}}"
-
-    if i.provider == "workink":
-        try:
-            sr = await workink_override(callback)
-        except Exception as e:
-            print(f"[claim] workink override error: {e}")
-            raise HTTPException(502, "Could not reach Work.ink")
-        sep = "&" if "?" in i.provider_link else "?"
-        dest = f"{i.provider_link}{sep}sr={sr}"
-    else:
-        sep = "&" if "?" in i.provider_link else "?"
-        dest = f"{i.provider_link}{sep}sid={sid}"
-
-    return RedirectResponse(dest, status_code=302)
-
-
-@router.get("/claim/callback")
-async def claim_callback(
-    sid: str,
-    token: str = "",
-    hash: str = "",
-    db: OrmSession = Depends(get_db),
-):
-    cs = db.query(ClaimSession).filter(ClaimSession.token == sid).first()
-    if not cs:
-        raise HTTPException(404, "Unknown session")
-    if cs.completed:
-        return HTMLResponse(_key_page(cs.key_plain or "", already=True))
-    if cs.expires_at < datetime.utcnow():
-        raise HTTPException(410, "Session expired")
-
-    i = db.query(Integration).filter(Integration.id == cs.integration_id).first()
-    if not i or not i.enabled:
-        raise HTTPException(404, "Integration disabled")
-
-    if i.provider == "workink":
-        ok = await verify_workink(token)
-    elif i.provider == "linkvertise":
-        ok = await verify_linkvertise(i.api_token, hash)
-    else:
-        ok = False
-
-    if not ok:
-        raise HTTPException(403, "Verification failed")
-
-    key, lic_id = issue_claim_key(db, i)
-    cs.completed = True
-    cs.license_id = lic_id
-    cs.key_plain = key
-    db.commit()
-
-    return HTMLResponse(_key_page(key))
 
 
 # ==================== OVERVIEW ====================
@@ -369,6 +282,8 @@ def overview(range_days: int = 7, user: User = Depends(get_current_user), db: Or
 @router.get("/services")
 async def list_services(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
     rows = db.query(Server).filter(Server.user_id == user.id).order_by(Server.id.desc()).all()
+    for s in rows:
+        ensure_server_slug(db, s)
     media = await asyncio.gather(*[fetch_guild_media(s.guild_id) for s in rows])
     out = []
     for s, (gname, gicon) in zip(rows, media):
@@ -378,6 +293,7 @@ async def list_services(user: User = Depends(get_current_user), db: OrmSession =
             "sid": str(s.id),
             "api_key": s.api_key,
             "name": s.panel_name or s.guild_name or f"Server {s.id}",
+            "slug": s.slug,
             "desc": s.description or "",
             "guild_id": str(s.guild_id) if s.guild_id else None,
             "guild_name": s.guild_name or gname,
@@ -414,7 +330,8 @@ def create_service(payload: dict, user: User = Depends(get_current_user), db: Or
     db.add(s)
     db.commit()
     db.refresh(s)
-    return {"id": s.id, "api_key": s.api_key, "name": s.panel_name}
+    ensure_server_slug(db, s)
+    return {"id": s.id, "api_key": s.api_key, "name": s.panel_name, "slug": s.slug}
 
 
 @router.patch("/services/{service_id}")
@@ -435,8 +352,17 @@ def update_service(service_id: int, payload: dict, user: User = Depends(get_curr
         s.freemium = bool(payload["freemium"])
     if "days" in payload:
         s.freemium_days = ",".join(payload["days"] or []) or None
+    if "slug" in payload:
+        slug = _slugify(payload["slug"])
+        if not slug:
+            raise HTTPException(400, "Slug cannot be empty")
+        clash = db.query(Server).filter(Server.slug == slug, Server.id != s.id).first()
+        if clash:
+            raise HTTPException(409, "Slug already in use")
+        s.slug = slug
     db.commit()
-    return {"ok": True}
+    ensure_server_slug(db, s)
+    return {"ok": True, "slug": s.slug}
 
 
 @router.delete("/services/{service_id}")
@@ -578,6 +504,14 @@ def list_integrations(user: User = Depends(get_current_user), db: OrmSession = D
         .order_by(Integration.id.desc())
         .all()
     )
+    # Pre-fetch the server slugs so the dashboard can display /go/<service-slug>
+    server_ids = {i.server_id for i in rows if i.server_id}
+    server_slugs = {}
+    if server_ids:
+        for s in db.query(Server).filter(Server.id.in_(server_ids)).all():
+            ensure_server_slug(db, s)
+            server_slugs[s.id] = s.slug
+
     return [
         {
             "id": i.id,
@@ -585,13 +519,14 @@ def list_integrations(user: User = Depends(get_current_user), db: OrmSession = D
             "provider_label": PROVIDERS.get(i.provider, i.provider),
             "name": i.name,
             "enabled": bool(i.enabled),
-            "slug": i.slug or "",
             "server_id": i.server_id,
+            "server_slug": server_slugs.get(i.server_id),
             "key_hours": i.key_hours or 24,
+            "key_hours_label": fmt_hours(i.key_hours or 24),
             "provider_link": i.provider_link or "",
             "has_token": bool(i.api_token),
             "publisher_id": i.publisher_id or "",
-            "claim_url": f"/go/{i.slug}" if i.slug else None,
+            "claim_url": f"/go/{server_slugs[i.server_id]}" if i.server_id in server_slugs else None,
             "created_at": i.created_at.isoformat() if i.created_at else None,
         }
         for i in rows
@@ -604,10 +539,6 @@ def create_integration(payload: dict, user: User = Depends(get_current_user), db
     if provider not in PROVIDERS:
         raise HTTPException(400, "Pick a provider")
     name = (payload.get("name") or "").strip() or PROVIDERS[provider]
-    slug = _slugify(payload.get("slug") or name)
-    exists = db.query(Integration).filter(Integration.user_id == user.id, Integration.slug == slug).first()
-    if exists:
-        slug = f"{slug}-{secrets.token_hex(2)}"
 
     try:
         key_hours = int(payload.get("key_hours") or 24)
@@ -620,6 +551,7 @@ def create_integration(payload: dict, user: User = Depends(get_current_user), db
         server_id = int(server_id)
         if server_id not in _user_server_ids(db, user.id):
             raise HTTPException(403, "Not your service")
+        ensure_server_slug(db, db.query(Server).filter(Server.id == server_id).first())
     else:
         server_id = None
 
@@ -628,7 +560,6 @@ def create_integration(payload: dict, user: User = Depends(get_current_user), db
         provider=provider,
         name=name[:100],
         enabled=bool(payload.get("enabled")),
-        slug=slug,
         server_id=server_id,
         key_hours=key_hours,
         provider_link=(payload.get("provider_link") or "").strip()[:512] or None,
@@ -638,7 +569,8 @@ def create_integration(payload: dict, user: User = Depends(get_current_user), db
     db.add(i)
     db.commit()
     db.refresh(i)
-    return {"ok": True, "id": i.id, "slug": i.slug, "claim_url": f"/go/{i.slug}"}
+    slug = db.query(Server.slug).filter(Server.id == server_id).scalar() if server_id else None
+    return {"ok": True, "id": i.id, "server_slug": slug, "claim_url": f"/go/{slug}" if slug else None}
 
 
 @router.patch("/integrations/{integration_id}")
@@ -661,16 +593,6 @@ def update_integration(integration_id: int, payload: dict, user: User = Depends(
         i.name = n[:100]
     if "enabled" in payload:
         i.enabled = bool(payload["enabled"])
-    if "slug" in payload:
-        slug = _slugify(payload["slug"])
-        clash = db.query(Integration).filter(
-            Integration.user_id == user.id,
-            Integration.slug == slug,
-            Integration.id != i.id,
-        ).first()
-        if clash:
-            raise HTTPException(409, "Slug already in use")
-        i.slug = slug
     if "key_hours" in payload:
         try:
             i.key_hours = max(1, min(720, int(payload["key_hours"] or 24)))
@@ -695,7 +617,8 @@ def update_integration(integration_id: int, payload: dict, user: User = Depends(
         i.publisher_id = (payload["publisher_id"] or "").strip()[:64] or None
 
     db.commit()
-    return {"ok": True, "slug": i.slug, "claim_url": f"/go/{i.slug}" if i.slug else None}
+    slug = db.query(Server.slug).filter(Server.id == i.server_id).scalar() if i.server_id else None
+    return {"ok": True, "server_slug": slug, "claim_url": f"/go/{slug}" if slug else None}
 
 
 @router.delete("/integrations/{integration_id}")
@@ -786,4 +709,17 @@ def is_blocked(db, server_id, hwid=None, discord_id=None):
     return False
 
 
-__all__ = ["router", "go_router", "is_blocked"]
+__all__ = [
+    "router",
+    "Integration",
+    "ClaimSession",
+    "PROVIDERS",
+    "PUBLIC_BASE_URL",
+    "CLAIM_TTL_MIN",
+    "fmt_hours",
+    "verify_linkvertise",
+    "verify_workink",
+    "workink_override",
+    "issue_claim_key",
+    "ensure_server_slug",
+]

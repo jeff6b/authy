@@ -52,7 +52,6 @@ class Integration(Base):
     name            = Column(String(100), nullable=False)
     enabled         = Column(Boolean, default=False)
     created_at      = Column(DateTime, default=datetime.utcnow)
-    # Kept for backwards compat, but routing uses Server.slug, not this.
     slug            = Column(String(64), nullable=True)
     server_id       = Column(Integer, nullable=True)
     key_hours       = Column(Integer, default=24)
@@ -76,7 +75,6 @@ class ClaimSession(Base):
 Base.metadata.create_all(bind=engine, tables=[Integration.__table__, ClaimSession.__table__])
 
 
-# Soft migrations for existing deployments
 def _migrate_integrations():
     stmts = [
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
@@ -85,9 +83,11 @@ def _migrate_integrations():
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS provider_link VARCHAR(512)",
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS api_token VARCHAR(256)",
         "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS publisher_id VARCHAR(64)",
-        # NEW: global per-service slug on servers
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS slug VARCHAR(64)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_servers_slug ON servers (slug)",
+        # >>> FREEMIUM
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS freemium_daily_minutes INTEGER DEFAULT 60",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_freemium BOOLEAN DEFAULT FALSE",
     ]
     for s in stmts:
         try:
@@ -122,7 +122,6 @@ def _slugify(s: str) -> str:
 
 
 def ensure_server_slug(db, server: Server) -> str:
-    """Every Server gets a stable global slug. Idempotent."""
     if getattr(server, "slug", None):
         return server.slug
     base = _slugify(server.panel_name or server.guild_name or f"service-{server.id}")
@@ -182,7 +181,6 @@ async def verify_workink(token: str) -> bool:
 
 
 async def workink_override(destination: str) -> str:
-    """Ask Work.ink to override the post-completion destination. Returns the sr token."""
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
             "https://work.ink/_api/v2/override",
@@ -193,7 +191,6 @@ async def workink_override(destination: str) -> str:
 
 
 def issue_claim_key(db, integration: Integration) -> tuple:
-    """Create a License for this integration's server. Returns (key_plain, license_id)."""
     if not integration.server_id:
         raise HTTPException(400, "Integration has no service linked")
     raw = secrets.token_hex(16).upper()
@@ -301,6 +298,7 @@ async def list_services(user: User = Depends(get_current_user), db: OrmSession =
             "linked": bool(s.guild_id),
             "freemium": bool(s.freemium),
             "freemium_days": (s.freemium_days or "").split(",") if s.freemium_days else [],
+            "freemium_daily_minutes": s.freemium_daily_minutes if s.freemium_daily_minutes is not None else 60,  # >>> FREEMIUM
             "keys": key_count,
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "linked_at": s.linked_at.isoformat() if s.linked_at else None,
@@ -326,6 +324,7 @@ def create_service(payload: dict, user: User = Depends(get_current_user), db: Or
         description=(payload.get("desc") or "").strip()[:2000] or None,
         freemium=bool(payload.get("freemium")),
         freemium_days=",".join(payload.get("days") or []) or None,
+        freemium_daily_minutes=max(0, min(1440, int(payload.get("freemium_daily_minutes") or 60))),  # >>> FREEMIUM
     )
     db.add(s)
     db.commit()
@@ -352,6 +351,14 @@ def update_service(service_id: int, payload: dict, user: User = Depends(get_curr
         s.freemium = bool(payload["freemium"])
     if "days" in payload:
         s.freemium_days = ",".join(payload["days"] or []) or None
+    if "freemium_daily_minutes" in payload:  # >>> FREEMIUM
+        try:
+            v = int(payload["freemium_daily_minutes"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "freemium_daily_minutes must be an integer")
+        if v < 0 or v > 1440:
+            raise HTTPException(400, "freemium_daily_minutes must be 0-1440")
+        s.freemium_daily_minutes = v
     if "slug" in payload:
         slug = _slugify(payload["slug"])
         if not slug:
@@ -446,6 +453,7 @@ async def list_keys(user: User = Depends(get_current_user), db: OrmSession = Dep
             "hwid": dev.device_hash if dev and not dev.banned else None,
             "executions": ex,
             "blacklisted": (lic.status == "banned") or bool(dev and dev.banned),
+            "is_freemium": bool(getattr(lic, "is_freemium", False)),  # >>> FREEMIUM
             "created_at": lic.created_at.isoformat() if lic.created_at else None,
             "last_used": lic.last_used.isoformat() if lic.last_used else None,
         })
@@ -504,7 +512,6 @@ def list_integrations(user: User = Depends(get_current_user), db: OrmSession = D
         .order_by(Integration.id.desc())
         .all()
     )
-    # Pre-fetch the server slugs so the dashboard can display /go/<service-slug>
     server_ids = {i.server_id for i in rows if i.server_id}
     server_slugs = {}
     if server_ids:

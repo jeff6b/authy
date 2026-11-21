@@ -7,3 +7,4 @@ python-dotenv>=1.0.1
 fastapi-limiter
 pyrate-limiter
 httpx
+cryptography>=42.0.0

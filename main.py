@@ -541,8 +541,11 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
 
     lic_id = lic.id
     try:
-        db.query(Session).filter(Session.license_id == lic_id).delete()
-        db.query(Device).filter(Device.license_id == lic_id).delete()
+        dev_ids = [d[0] for d in db.query(Device.id).filter(Device.license_id == lic_id).all()]
+        if dev_ids:
+            db.query(Challenge).filter(Challenge.device_id.in_(dev_ids)).delete(synchronize_session=False)
+        db.query(Session).filter(Session.license_id == lic_id).delete(synchronize_session=False)
+        db.query(Device).filter(Device.license_id == lic_id).delete(synchronize_session=False)
         db.delete(lic)
         db.commit()
         log_auth(db, lic_id, ip, "tamper", True, reason)

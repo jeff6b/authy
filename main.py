@@ -21,7 +21,7 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(bind=engine)
@@ -39,11 +39,11 @@ SERVER_TRIAL_SECRET = os.getenv("SERVER_TRIAL_SECRET", "").strip()
 TRIAL_TOKEN_TTL = 600
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-# Signed envelope (layer 04 / 16)
+# Signed envelope
 MIN_LOADER_VERSION = int(os.getenv("MIN_LOADER_VERSION", "0") or "0")
 LOADER_SIGNING_KEY_B64 = os.getenv("LOADER_SIGNING_KEY", "").strip()
 LOADER_SIGNING_KEY_ID = os.getenv("LOADER_SIGNING_KEY_ID", "").strip() or "k0"
-ENVELOPE_MAX_SKEW = 10  # seconds
+ENVELOPE_MAX_SKEW = 10
 
 # ==================== ED25519 / CHACHA20 HELPERS ====================
 try:
@@ -94,7 +94,6 @@ def _hkdf_info(secret_str: str, info: bytes) -> bytes:
     return hk.derive(secret_str.encode())
 
 def _chacha20_block(key: bytes, counter: int, nonce: bytes) -> bytes:
-    """One 64-byte ChaCha20 keystream block (IETF variant, 12-byte nonce)."""
     counter_nonce = counter.to_bytes(4, "little") + nonce
     cipher = Cipher(algorithms.ChaCha20(key, counter_nonce), mode=None)
     enc = cipher.encryptor()
@@ -111,34 +110,31 @@ def _chacha20_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
             out[start + i] = b ^ ks[i]
     return bytes(out)
 
-def _encrypt_payload(session_secret: str, plaintext: bytes):
-    """
-    ChaCha20 + HMAC-SHA256 authenticate-then-encrypt.
-    Returns (ciphertext_b64, nonce_b64, tag_b64).
-    """
+def _encrypt_payload(session_secret: str, session_token: str, plaintext: bytes):
+    """ChaCha20 + HMAC-SHA256 authenticate-then-encrypt, session-bound."""
     ct_key = _hkdf_info(session_secret, b"kf-payload-ctr-v1")
     mac_key = _hkdf_info(session_secret, b"kf-payload-mac-v1")
     nonce = os.urandom(12)
     ct = _chacha20_xor(ct_key, nonce, plaintext)
-    tag = hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    tag = hmac.new(mac_key, session_token.encode() + nonce + ct, hashlib.sha256).digest()
     return (
         base64.b64encode(ct).decode(),
         base64.b64encode(nonce).decode(),
         base64.b64encode(tag).decode(),
     )
 
-def _sign_envelope(payload_b64: str, version: int, ts: int) -> str:
+def _sign_envelope(payload_b64: str, version: int, ts: int, session_token: str) -> str:
     priv = _load_signing_key()
-    msg = f"{payload_b64}|{version}|{ts}".encode()
+    msg = f"{payload_b64}|{version}|{ts}|{session_token}".encode()
     sig = priv.sign(msg)
     return base64.b64encode(sig).decode()
 
-def _build_envelope(session_secret: str, plaintext: bytes, version: int = 1) -> dict:
+def _build_envelope(session_secret: str, session_token: str, plaintext: bytes, version: int = 1) -> dict:
     if not _CRYPTO_OK:
         raise HTTPException(500, "Signing not configured")
-    ct_b64, nonce_b64, tag_b64 = _encrypt_payload(session_secret, plaintext)
+    ct_b64, nonce_b64, tag_b64 = _encrypt_payload(session_secret, session_token, plaintext)
     ts = int(time.time())
-    sig_b64 = _sign_envelope(ct_b64, version, ts)
+    sig_b64 = _sign_envelope(ct_b64, version, ts, session_token)
     return {
         "v": 2,
         "alg": "chacha20-hmac-sha256",
@@ -918,7 +914,7 @@ def auth_tamper(payload: dict, request: Request, db=Depends(get_db)):
 
     return {"success": True, "deleted": True}
 
-# ==================== SCRIPT (signed envelope) ====================
+# ==================== SCRIPT ====================
 @app.get("/v2/script", dependencies=[Depends(script_limit)])
 def serve_script(session_token: str, timestamp: int, signature: str, nonce: int, db=Depends(get_db)):
     sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
@@ -930,7 +926,7 @@ def serve_script(session_token: str, timestamp: int, signature: str, nonce: int,
         raise HTTPException(404, "No script assigned")
 
     try:
-        env = _build_envelope(sess.secret_plain, s.content.encode(), version=1)
+        env = _build_envelope(sess.secret_plain, session_token, s.content.encode(), version=1)
     except HTTPException:
         raise
     except Exception as e:
@@ -949,7 +945,7 @@ def script_manifest(session_token: str, timestamp: int, signature: str, nonce: i
         raise HTTPException(404, "No script assigned")
     h = hashlib.sha256(s.content.encode()).hexdigest()
     ts = int(time.time())
-    sig = _sign_envelope(h, 1, ts)
+    sig = _sign_envelope(h, 1, ts, session_token)
     return {
         "version": 1,
         "sha256": h,
@@ -988,7 +984,7 @@ def raw_file(
     sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
 
     try:
-        env = _build_envelope(sess.secret_plain, f.content.encode(), version=f.version or 1)
+        env = _build_envelope(sess.secret_plain, session_token, f.content.encode(), version=f.version or 1)
     except HTTPException:
         raise
     except Exception as e:
@@ -1020,7 +1016,7 @@ def raw_manifest(
     sess, lic = _verify_signed_request(db, session_token, timestamp, signature, nonce)
     h = hashlib.sha256(f.content.encode()).hexdigest()
     ts = int(time.time())
-    sig = _sign_envelope(h, f.version or 1, ts)
+    sig = _sign_envelope(h, f.version or 1, ts, session_token)
     return {
         "version": f.version or 1,
         "sha256": h,

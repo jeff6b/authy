@@ -45,11 +45,11 @@ LOADER_SIGNING_KEY_B64 = os.getenv("LOADER_SIGNING_KEY", "").strip()
 LOADER_SIGNING_KEY_ID = os.getenv("LOADER_SIGNING_KEY_ID", "").strip() or "k0"
 ENVELOPE_MAX_SKEW = 10  # seconds
 
-# ==================== ED25519 / AES-GCM HELPERS ====================
+# ==================== ED25519 / CHACHA20 HELPERS ====================
 try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization as _ser
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes as _hashes
     _CRYPTO_OK = True
@@ -84,7 +84,7 @@ def _pubkey_hex() -> str:
     )
     return pub.hex()
 
-def _hkdf(secret_str: str, info: bytes = b"kf-payload-v1") -> bytes:
+def _hkdf_info(secret_str: str, info: bytes) -> bytes:
     hk = HKDF(
         algorithm=_hashes.SHA256(),
         length=32,
@@ -93,12 +93,39 @@ def _hkdf(secret_str: str, info: bytes = b"kf-payload-v1") -> bytes:
     )
     return hk.derive(secret_str.encode())
 
+def _chacha20_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    """One 64-byte ChaCha20 keystream block (IETF variant, 12-byte nonce)."""
+    counter_nonce = counter.to_bytes(4, "little") + nonce
+    cipher = Cipher(algorithms.ChaCha20(key, counter_nonce), mode=None)
+    enc = cipher.encryptor()
+    return enc.update(b"\x00" * 64) + enc.finalize()
+
+def _chacha20_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    out = bytearray(len(data))
+    n_blocks = (len(data) + 63) // 64
+    for block in range(n_blocks):
+        ks = _chacha20_block(key, block, nonce)
+        start = block * 64
+        chunk = data[start:start + 64]
+        for i, b in enumerate(chunk):
+            out[start + i] = b ^ ks[i]
+    return bytes(out)
+
 def _encrypt_payload(session_secret: str, plaintext: bytes):
-    key = _hkdf(session_secret)
-    aesgcm = AESGCM(key)
+    """
+    ChaCha20 + HMAC-SHA256 authenticate-then-encrypt.
+    Returns (ciphertext_b64, nonce_b64, tag_b64).
+    """
+    ct_key = _hkdf_info(session_secret, b"kf-payload-ctr-v1")
+    mac_key = _hkdf_info(session_secret, b"kf-payload-mac-v1")
     nonce = os.urandom(12)
-    ct = aesgcm.encrypt(nonce, plaintext, None)
-    return base64.b64encode(ct).decode(), base64.b64encode(nonce).decode()
+    ct = _chacha20_xor(ct_key, nonce, plaintext)
+    tag = hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    return (
+        base64.b64encode(ct).decode(),
+        base64.b64encode(nonce).decode(),
+        base64.b64encode(tag).decode(),
+    )
 
 def _sign_envelope(payload_b64: str, version: int, ts: int) -> str:
     priv = _load_signing_key()
@@ -109,13 +136,15 @@ def _sign_envelope(payload_b64: str, version: int, ts: int) -> str:
 def _build_envelope(session_secret: str, plaintext: bytes, version: int = 1) -> dict:
     if not _CRYPTO_OK:
         raise HTTPException(500, "Signing not configured")
-    ct_b64, nonce_b64 = _encrypt_payload(session_secret, plaintext)
+    ct_b64, nonce_b64, tag_b64 = _encrypt_payload(session_secret, plaintext)
     ts = int(time.time())
     sig_b64 = _sign_envelope(ct_b64, version, ts)
     return {
-        "v": 1,
+        "v": 2,
+        "alg": "chacha20-hmac-sha256",
         "ciphertext_b64": ct_b64,
         "nonce_b64": nonce_b64,
+        "tag_b64": tag_b64,
         "version": version,
         "timestamp": ts,
         "signature": sig_b64,
@@ -147,7 +176,7 @@ class Server(Base):
     freemium_daily_minutes = Column(Integer, default=60)
     integration_id = Column(String(64), nullable=True)
     slug = Column(String(64), nullable=True)
-    loader_token = Column(String(64), nullable=True)  # NEW: /raw/<token> for the bootstrap loader
+    loader_token = Column(String(64), nullable=True)
 
 class License(Base):
     __tablename__ = "licenses"
@@ -184,7 +213,6 @@ class Session(Base):
     expires_at = Column(DateTime, nullable=False)
     last_heartbeat = Column(DateTime, default=datetime.utcnow)
     revoked = Column(Boolean, default=False)
-    # NEW: nonce counter for replay protection
     last_nonce = Column(Integer, default=0)
 
 class Challenge(Base):
@@ -222,7 +250,6 @@ class HostedFile(Base):
     filename = Column(String(200), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    # NEW
     is_protected = Column(Boolean, default=False)
     content_sha256 = Column(String(64), nullable=True)
     version = Column(Integer, default=1)
@@ -464,10 +491,6 @@ def recent_failures(db, license_id, minutes):
     ).count()
 
 def _verify_signed_request(db, session_token: str, timestamp: int, signature: str, nonce: int):
-    """
-    Shared gate for /v2/script and /raw/. Returns (sess, lic).
-    Raises HTTPException on any failure.
-    """
     if abs(time.time() - timestamp) > ENVELOPE_MAX_SKEW:
         raise HTTPException(401, "Request expired")
 
@@ -475,19 +498,16 @@ def _verify_signed_request(db, session_token: str, timestamp: int, signature: st
     if not sess or sess.revoked or sess.expires_at < datetime.utcnow():
         raise HTTPException(401, "Invalid session")
 
-    # Nonce must be strictly increasing per session.
     try:
         nonce_i = int(nonce)
     except (TypeError, ValueError):
         raise HTTPException(400, "Invalid nonce")
     last = int(sess.last_nonce or 0)
     if nonce_i <= last:
-        # Replay attempt — revoke the session.
         sess.revoked = True
         db.commit()
         raise HTTPException(401, "Nonce replay — session revoked")
 
-    # HMAC over session_token|timestamp|nonce
     expected = hmac.new(
         sess.secret_plain.encode(),
         f"{session_token}{timestamp}{nonce_i}".encode(),
@@ -503,7 +523,6 @@ def _verify_signed_request(db, session_token: str, timestamp: int, signature: st
     if not lic:
         raise HTTPException(403, "License inactive")
 
-    # Commit nonce advance
     sess.last_nonce = nonce_i
     db.commit()
     return sess, lic
@@ -535,12 +554,10 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
     if not raw_hwid:
         raise HTTPException(400, "Missing hwid")
 
-    # Layer 05 — reject old loaders
     if MIN_LOADER_VERSION > 0 and loader_version < MIN_LOADER_VERSION:
         log_auth(db, None, ip, "init", False, f"loader_too_old:{loader_version}<{MIN_LOADER_VERSION}")
         raise HTTPException(426, f"Loader update required (min v{MIN_LOADER_VERSION})")
 
-    # Freemium trial token path
     trial = _verify_trial_token(license_key)
     if trial:
         server_id, discord_id = trial
@@ -609,7 +626,6 @@ def auth_init(payload: dict, request: Request, db=Depends(get_db)):
         log_auth(db, lic.id, ip, "init", True)
         return {"challenge_id": ch.id, "challenge": raw_challenge, "expires_in": CHALLENGE_TTL}
 
-    # Paid key path
     key_hash = sha256(license_key)
     lic = db.query(License).filter(License.key_hash == key_hash).with_for_update().first()
     if not lic:
@@ -748,7 +764,6 @@ def auth_verify(payload: dict, request: Request, db=Depends(get_db)):
     greeting_enabled = bool(server.greeting_enabled) if server else False
     greeting_message = server.greeting_message if server else None
 
-    # If the server has a loader_token, expose it (only used by /v2/script path)
     hosted_file_token = None
     if server and server.loader_token:
         hosted_file_token = server.loader_token
@@ -836,11 +851,8 @@ def auth_heartbeat(payload: dict, db=Depends(get_db)):
     db.commit()
     return {"valid": True, "alive": True}
 
-
-
 @app.get("/v2/debug/signcheck")
 def debug_signcheck():
-    import os
     try:
         _load_signing_key()
         return {
@@ -962,7 +974,6 @@ def raw_file(
     if not f:
         raise HTTPException(404, "Not found")
 
-    # Block browser scrapes on unprotected .txt too
     ua = (request.headers.get("user-agent") or "").lower()
     accept = (request.headers.get("accept") or "").lower()
     if "mozilla" in ua and "text/html" in accept:
@@ -971,7 +982,6 @@ def raw_file(
     if not f.is_protected:
         return Response(content=f.content, media_type="text/plain")
 
-    # Protected — require a live signed session.
     if not session_token or timestamp is None or not signature or nonce is None:
         raise HTTPException(401, "Session required for protected file")
 

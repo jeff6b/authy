@@ -194,12 +194,10 @@ h1{margin:0;font-size:1.75rem;letter-spacing:-.03em;color:var(--white);font-weig
 .toast .bar{position:absolute;left:0;bottom:0;height:2px;width:100%;background:rgba(255,255,255,.45);transform-origin:left}
 .toast.show .bar{animation:tbar 2.2s linear forwards}
 @keyframes tbar{to{transform:scaleX(0)}}
-/* read-only slug preview in integration modal */
 .slug-preview{display:flex;align-items:center;gap:8px;padding:11px 13px;background:#0f0f11;border:1px solid #2a2a2e;border-radius:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem;color:var(--text)}
 .slug-preview .prefix{opacity:.55}
 .slug-preview .value{color:var(--white)}
 .slug-preview .value.none{opacity:.4;color:var(--text);font-family:Inter,system-ui,sans-serif;font-style:italic}
-/* copyable slug line on service card */
 .slugline{display:flex;align-items:center;gap:8px;font-size:.78rem;color:#7d8686;margin-top:4px}
 .slugline .prefix{opacity:.6}
 .slugline button{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.72rem;color:var(--g);background:transparent;border:0;padding:0;cursor:pointer;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -270,7 +268,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   <div class="top">
     <div>
       <h1>Overview</h1>
-      <p class="sub">Here's what's happening across your services today.</p>
+      <p class="sub">Here's what's cumming in your services today.</p>
     </div>
   </div>
   <div class="grid stats">
@@ -349,7 +347,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 </div>
 </main>
 
-<!-- ==================== SERVICE MODAL ==================== -->
 <div class="modal-bg" id="svcbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2 id="svcTitle">Create service</h2>
@@ -371,7 +368,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   </div>
 </div>
 
-<!-- ==================== LINK SERVER MODAL ==================== -->
 <div class="modal-bg" id="linkbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2>Link a Discord server</h2>
@@ -382,7 +378,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   </div>
 </div>
 
-<!-- ==================== INTEGRATION MODAL ==================== -->
 <div class="modal-bg" id="intbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2 id="intTitle">Add integration</h2>
@@ -425,7 +420,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   </div>
 </div>
 
-<!-- ==================== BLOCK MODAL ==================== -->
 <div class="modal-bg" id="blbg">
   <div class="modal" role="dialog" aria-modal="true">
     <h2>Add block</h2>
@@ -532,7 +526,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
 
   var servicesCache = [];
 
-  /* ---------- nav ---------- */
   var busy = false;
   document.querySelectorAll('aside nav a').forEach(function(el){
     el.addEventListener('click', function(){
@@ -561,7 +554,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     bg.addEventListener('click', function(e){ if (e.target === bg) closeM(bg); });
   });
 
-  /* ---------- overview ---------- */
   var range = 7;
   var chart = document.getElementById('chart');
   var xl = document.getElementById('xl');
@@ -633,7 +625,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     loadOverview();
   });
 
-  /* ---------- services ---------- */
   var svcGrid = document.getElementById('svcGrid');
   var svcbg = document.getElementById('svcbg');
   var svcName = document.getElementById('svcName');
@@ -686,7 +677,7 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     openM(svcbg);
     setTimeout(function(){ svcName.focus(); }, 50);
   }
-  // Auto-fill slug from name on create only, if user hasn't typed one
+
   svcName.addEventListener('input', function(){
     if (!editingSvc && !svcSlug.dataset.touched) {
       svcSlug.value = slugify(svcName.value);
@@ -849,7 +840,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     }
   });
 
-  /* ---------- keys ---------- */
   var kRows = document.getElementById('kRows');
   var kStats = document.getElementById('kStats');
   var kSearch = document.getElementById('kSearch');
@@ -929,7 +919,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     }
   });
 
-  /* ---------- integrations ---------- */
   var intGrid = document.getElementById('intGrid');
   var intbg = document.getElementById('intbg');
   var intProv = document.getElementById('intProv');
@@ -964,7 +953,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
   }
   intSw.addEventListener('click', function(){ setIntOn(!intOn); });
 
-  // Update the read-only slug preview when a service is selected
   document.getElementById('intSvc').addEventListener('change', function(){
     var sid = this.value;
     if (!sid) {
@@ -998,7 +986,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
       var optLabel = s.name + (s.slug ? '  (/go/' + s.slug + ')' : '');
       return '<option value="' + s.id + '"' + (i && i.server_id === s.id ? ' selected' : '') + '>' + esc(optLabel) + '</option>';
     }).join('');
-    // Populate the preview based on current selection
     var pre = document.getElementById('intSvc').value;
     if (pre) {
       var sv = servicesCache.filter(function(x){ return String(x.id) === String(pre); })[0];
@@ -1108,7 +1095,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     }
   });
 
-  /* ---------- blocklists ---------- */
   var bRows = document.getElementById('bRows');
   var blbg = document.getElementById('blbg');
   var blErr = document.getElementById('blErr');
@@ -1202,7 +1188,6 @@ document.getElementById('kfLogout').addEventListener('click', function (e) {
     catch (err) { alert('Remove failed: ' + (err.message || err)); }
   });
 
-  /* ---------- wiring ---------- */
   document.addEventListener('kf:view', function(e){
     closeMenus();
     if (e.detail === 'Overview') loadOverview();
